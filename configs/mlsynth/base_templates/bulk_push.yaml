@@ -2,7 +2,6 @@ model:
   name: "bulk_push"
   num_layers: 8
   hidden_size: 4096
-  sequence_len: 8192
   vocab_size: 32000
   bytes_per_val: 2      # fp16/bf16
   scale: 1.0
