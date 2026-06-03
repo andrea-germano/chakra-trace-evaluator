@@ -1,0 +1,27 @@
+model: 
+  name: "bulk_push"
+  num_layers: 8
+  hidden_size: 4096
+  sequence_len: 8192
+  vocab_size: 32000
+  bytes_per_val: 2      # fp16/bf16
+  scale: 1.0
+ 
+prefill_parallelism:
+  tp_size: 1
+  pp_size: 1
+ 
+decode_parallelism:
+  tp_size: 1
+  pp_size: 1
+ 
+inference:
+  serialize_decode_iterations: true
+ 
+  kv_transfer:
+    mode: bulk
+    direction: push
+    explicit_request: false
+ 
+  requests:
+    - { prompt_len: 4096, gen_len: 8 }
