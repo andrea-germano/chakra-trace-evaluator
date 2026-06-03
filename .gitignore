@@ -1,3 +1,6 @@
 astra_logs/
 mlsynth_traces/
 results/
+
+configs/astra_sim/auto_generated/
+configs/mlsynth/auto_generated/
