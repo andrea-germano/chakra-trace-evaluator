@@ -6,7 +6,7 @@ echo "==================================================="
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MLSYNTH_SCRIPT="$BASE_DIR/../mlsynth/synthesise_inference.py"
-ASTRA_BIN="$BASE_DIR/../astra-sim/build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Unaware"
+ASTRA_BIN="$BASE_DIR/../astra-sim/build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Aware"
 
 AUTO_GEN_MLSYNTH_DIR="$BASE_DIR/configs/mlsynth/auto_generated"
 AUTO_GEN_ASTRASIM_DIR="$BASE_DIR/configs/astra_sim/auto_generated"
