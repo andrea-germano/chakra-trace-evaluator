@@ -1,6 +1,8 @@
 astra_logs/
 mlsynth_traces/
 results/
+__pycache__/
 
 configs/astra_sim/auto_generated/
 configs/mlsynth/auto_generated/
+compare_results/
