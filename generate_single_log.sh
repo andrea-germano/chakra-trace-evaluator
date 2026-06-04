@@ -18,7 +18,7 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Absolute paths for the executables
 MLSYNTH_SCRIPT="$BASE_DIR/../mlsynth/synthesise_inference.py"
-ASTRA_BIN="$BASE_DIR/../astra-sim/build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Unaware"
+ASTRA_BIN="$BASE_DIR/../astra-sim/build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Aware"
 
 # 3. Define paths for base configurations
 MLSYNTH_CFG_PATH="$BASE_DIR/configs/mlsynth/base_templates/$MLSYNTH_CFG_NAME"
