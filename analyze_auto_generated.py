@@ -129,6 +129,8 @@ def collect_runs() -> pd.DataFrame:
         bandwidth = read_bandwidth(scenario_id)
 
         pm = a.get("pool_means", {})
+        
+        # FIX: Adjusted keys to match the new analytical backend dictionary schema 
         rows.append({
             "scenario_id": scenario_id,
             # --- swept parameters ---
@@ -141,10 +143,10 @@ def collect_runs() -> pd.DataFrame:
             # --- headline metrics ---
             "ttft_ms": a["ttft_ms"],
             "prefill_compute_ms": a["prefill_compute_ms"],
-            "kv_transfer_ms": a["kv_transfer_ms"],
+            "prefill_comm_ms": a["prefill_comm_ms"],
             "ttft_first_step_ms": a["ttft_first_step_ms"],
-            "kv_share_pct": a["kv_share_of_ttft_pct"],
-            "kv_in_tokens": a["kv_in_tokens"],
+            "comm_share_pct": a["comm_share_of_ttft_pct"],
+            "comm_in_tokens": a["prefill_comm_in_tokens"],
             "avg_itl_ms": a["avg_itl_ms"],
             "decode_total_ms": a["decode_total_ms"],
             "decode_wait_ms": a["decode_wait_ms"],
@@ -225,7 +227,8 @@ def plot_ttft_vs_bandwidth(df):
 
 
 def plot_kv_share_vs_bandwidth(df):
-    p = _line_vs_x(df, "bandwidth_gbps", "kv_share_pct",
+    # FIX: Updated column reference to match the new naming
+    p = _line_vs_x(df, "bandwidth_gbps", "comm_share_pct",
                    "KV-transfer share of TTFT vs bandwidth\n(when does the transfer stop dominating?)",
                    "KV transfer as % of TTFT", "kv_share_vs_bandwidth.png")
     return p
@@ -241,7 +244,8 @@ def plot_itl_vs_bandwidth(df):
 def plot_kv_transfer_vs_prompt(df):
     """KV transfer time vs prompt length, a line per (bandwidth, kv_mode).
     Shows the (roughly linear) growth of the KV volume to move."""
-    sub = df.dropna(subset=["prompt_len", "kv_transfer_ms"])
+    # FIX: Updated column reference to match the new naming
+    sub = df.dropna(subset=["prompt_len", "prefill_comm_ms"])
     if sub.empty or sub["prompt_len"].nunique() < 2:
         return None
     bws = sorted(b for b in sub["bandwidth_gbps"].dropna().unique())
@@ -253,7 +257,7 @@ def plot_kv_transfer_vs_prompt(df):
             if g.empty:
                 continue
             g = g.sort_values("prompt_len")
-            ax.plot(g["prompt_len"], g["kv_transfer_ms"],
+            ax.plot(g["prompt_len"], g["prefill_comm_ms"],
                     marker=MARKERS[bi % len(MARKERS)],
                     linestyle=LINESTYLES[mi % len(LINESTYLES)],
                     color=_mode_color(mode, mi), lw=2, ms=7,
@@ -275,7 +279,8 @@ def plot_ttft_breakdown(df):
         return None
     labels = d["scenario_id"].tolist()
     pf = d["prefill_compute_ms"].to_numpy()
-    kv = d["kv_transfer_ms"].to_numpy()
+    # FIX: Updated column reference to match the new naming
+    kv = d["prefill_comm_ms"].to_numpy()
     fs = d["ttft_first_step_ms"].to_numpy()
     x = np.arange(len(d))
     fig, ax = plt.subplots(figsize=(max(9, 0.5 * len(d) + 4), 6))
@@ -304,15 +309,16 @@ def plot_streaming_vs_bulk(df):
     transfer with prefill compute, so its exposed transfer should be smaller."""
     if set(df["kv_mode"].unique()) < {"bulk", "streaming"}:
         return None
+    # FIX: Updated column reference to match the new naming
     piv = df.pivot_table(index=["bandwidth_gbps", "prompt_len"], columns="kv_mode",
-                         values=["kv_transfer_ms", "ttft_ms"], aggfunc="mean")
+                         values=["prefill_comm_ms", "ttft_ms"], aggfunc="mean")
     if piv.empty:
         return None
     pairs = [idx for idx in piv.index]
     labels = [f"bw{int(b)}\np{int(p)}" for (b, p) in pairs]
     x = np.arange(len(pairs)); w = 0.38
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(max(10, 0.7 * len(pairs) + 5), 5))
-    for ax, metric, ttl in [(ax1, "kv_transfer_ms", "KV transfer (ms)"),
+    for ax, metric, ttl in [(ax1, "prefill_comm_ms", "KV transfer (ms)"),
                             (ax2, "ttft_ms", "TTFT (ms)")]:
         bulk = [piv.loc[idx, (metric, "bulk")] if (metric, "bulk") in piv.columns else np.nan
                 for idx in pairs]
@@ -350,8 +356,9 @@ def main():
     print("=" * 70)
     print(f"  CROSS-RUN COMPARISON — {len(df)} scenarios")
     print("=" * 70)
+    # FIX: Output column references reflect the refactored DF naming schema
     cols = ["scenario_id", "bandwidth_gbps", "prompt_len", "kv_mode",
-            "ttft_ms", "kv_transfer_ms", "kv_share_pct", "avg_itl_ms"]
+            "ttft_ms", "prefill_comm_ms", "comm_share_pct", "avg_itl_ms"]
     with pd.option_context("display.max_rows", None, "display.width", 200):
         print(df[cols].to_string(index=False))
     print("=" * 70)
