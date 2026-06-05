@@ -19,5 +19,6 @@
   "roofline-enabled": 1,
   "peak-perf": 989,
   "local-mem-bw": 3350,
-  "boost-mode": 0
+  "boost-mode": 0,
+  "trace-enabled": 1
 }

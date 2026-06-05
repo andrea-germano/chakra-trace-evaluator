@@ -14,6 +14,7 @@ ASTRA_LOGS_DIR="$BASE_DIR/astra_logs/auto_generated"
 TRACES_BASE_DIR="$BASE_DIR/mlsynth_traces/auto_generated"
 
 REMOTE_MEM_CFG="$BASE_DIR/configs/astra_sim/base_templates/remote_memory_base.json"
+LOGGING_CFG="$BASE_DIR/configs/astra_sim/logging_config.toml"
 
 # --- GLOBAL CLEANUP ---
 echo "=> Cleaning up old simulation traces and logs..."
@@ -64,7 +65,8 @@ for MLSYNTH_CFG_PATH in "${CONFIG_FILES[@]}"; do
       --system-configuration="$SYSTEM_CFG" \
       --network-configuration="$NETWORK_CFG" \
       --remote-memory-configuration="$REMOTE_MEM_CFG" \
-      --comm-group-configuration="$COMM_GROUPS" > /dev/null 2>&1
+      --comm-group-configuration="$COMM_GROUPS" \
+      --logging-configuration="$LOGGING_CFG" > /dev/null 2>&1
 
     # --- C: Log Management ---
     if [ -d "$BASE_DIR/log" ]; then

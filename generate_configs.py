@@ -36,7 +36,9 @@ base_system = {
     "all-reduce": "ring",
     "reduce-scatter": "ring",
     "all-gather": "ring",
-    "roofline-enabled": 1
+    "roofline-enabled": 1,
+    "boost-mode": 0,
+    "trace-enabled": 1
 }
 
 base_network = {

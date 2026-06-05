@@ -25,6 +25,7 @@ MLSYNTH_CFG_PATH="$BASE_DIR/configs/mlsynth/base_templates/$MLSYNTH_CFG_NAME"
 SYSTEM_CFG="$BASE_DIR/configs/astra_sim/base_templates/system_base.json"
 NETWORK_CFG="$BASE_DIR/configs/astra_sim/base_templates/network_base.yml"
 REMOTE_MEM_CFG="$BASE_DIR/configs/astra_sim/base_templates/remote_memory_base.json"
+LOGGING_CFG="$BASE_DIR/configs/astra_sim/logging_config.toml"
 
 # ESSENTIAL CHECK 2: Verify the MLSynth config file actually exists
 if [ ! -f "$MLSYNTH_CFG_PATH" ]; then
@@ -62,7 +63,8 @@ echo "==> [2/2] Starting ASTRA-sim simulation..."
   --system-configuration="$SYSTEM_CFG" \
   --network-configuration="$NETWORK_CFG" \
   --remote-memory-configuration="$REMOTE_MEM_CFG" \
-  --comm-group-configuration="$COMM_GROUPS"
+  --comm-group-configuration="$COMM_GROUPS" \
+  --logging-configuration="$LOGGING_CFG"
 
 # Step 3: Log management
 # ESSENTIAL CHECK 4: Verify ASTRA-sim succeeded by checking if 'log' folder exists

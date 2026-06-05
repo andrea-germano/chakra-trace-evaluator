@@ -1,0 +1,23 @@
+[[sink]]
+name = "trace_file"
+type = "basic_file_sink_mt"      # synchronous: survives ns3 exit(0)
+filename = "log/workload_trace.log"
+level = "debug"
+truncate = true                  # fresh file per run (good for sweeps)
+
+[[sink]]
+name = "stats_file"
+type = "basic_file_sink_mt"
+filename = "log/statistics.log"
+level = "info"
+truncate = true
+
+[[logger]]
+name = "workload"
+sinks = ["trace_file"]
+level = "debug"
+
+[[logger]]
+name = "statistics"
+sinks = ["stats_file"]
+level = "info"
