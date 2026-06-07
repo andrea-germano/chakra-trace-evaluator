@@ -3,13 +3,13 @@ USE_DYNAMIC_PFC_THRESHOLD 1
 
 PACKET_PAYLOAD_SIZE 1000
 
-TOPOLOGY_FILE @TOPOLOGY_FILE@
-FLOW_FILE @FLOW_FILE@
-TRACE_FILE @TRACE_FILE@
-TRACE_OUTPUT_FILE @OUT_DIR@/mix.tr
-FCT_OUTPUT_FILE @OUT_DIR@/fct.txt
-PFC_OUTPUT_FILE @OUT_DIR@/pfc.txt
-QLEN_MON_FILE @OUT_DIR@/qlen.txt
+TOPOLOGY_FILE /home/andre/tesi/trace_evaluator/configs/astra_sim/ns3_templates/simple_topology.txt
+FLOW_FILE /home/andre/tesi/trace_evaluator/configs/astra_sim/ns3_templates/flow.txt
+TRACE_FILE /home/andre/tesi/trace_evaluator/configs/astra_sim/ns3_templates/trace.txt
+TRACE_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/mix.tr
+FCT_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/fct.txt
+PFC_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/pfc.txt
+QLEN_MON_FILE /home/andre/tesi/trace_evaluator/output/ns3/qlen.txt
 QLEN_MON_START 0
 QLEN_MON_END 20000
 
