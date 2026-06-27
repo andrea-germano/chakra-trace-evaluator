@@ -1,0 +1,9 @@
+# NPU layout (da MLSynth): 0-7 = pool prefill (TP4xPP2), 8-15 = pool decode (TP8xPP1).
+# La singola dimensione Switch a 450 GB/s e' corretta per TTFT/TPOT: il tempo di un ring
+# all-reduce dipende solo dalla dimensione del gruppo TP (4 o 8) e dalla banda, non dal
+# numero totale di NPU nella dimensione.
+
+topology:   [ FullyConnected, Switch  ]  #FullyConnected
+npus_count: [ 8, 2 ]      # 8 prefill (NPU 0-7) + 8 decode (NPU 8-15)
+bandwidth:  [ 450.0, 25 ]   # GB/s per direzione = intra_node_bw (TP all-reduce + PP P2P)
+latency:    [ 100, 2000 ]       # ns. SOL ignora la latenza. Valore reale H200 = 10000 ns (p2p_latency):

@@ -1,0 +1,18 @@
+{
+  "scheduling-policy": "FIFO",
+  "intra-dimension-scheduling": "FIFO",
+  "inter-dimension-scheduling": "baseline",
+  "endpoint-delay": 10,
+  "active-chunks-per-dimension": 2,
+  "preferred-dataset-splits": 4,
+  "all-reduce-implementation": ["direct"],
+  "all-gather-implementation": ["ring"],
+  "reduce-scatter-implementation": ["ring"],
+  "all-to-all-implementation": ["ring"],
+  "collective-optimization": "localBWAware",
+  "roofline-enabled": 1,
+  "peak-perf": 1979,
+  "local-mem-bw": 3350,
+  "boost-mode": 1,
+  "trace-enabled": 1  
+}

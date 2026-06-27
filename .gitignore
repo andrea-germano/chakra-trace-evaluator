@@ -4,3 +4,6 @@ __pycache__/
 configs/astra_sim/auto_generated/
 configs/mlsynth/auto_generated/
 output/
+
+temp/
+log/
