@@ -1,0 +1,13 @@
+{
+  "tag": "T1_bx100_dcqcn_buf16",
+  "topo": "T1",
+  "num_nodes": 8,
+  "bx_gbps": "100",
+  "cc": "dcqcn",
+  "cc_mode": 1,
+  "buffer_size": "16",
+  "enable_trace": "0",
+  "qlen_start": "0",
+  "qlen_end": "0",
+  "generated": "2026-06-28T21:17:58"
+}
