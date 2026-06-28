@@ -1,6 +1,6 @@
 # Architettura copiata 1:1 dal config.json ufficiale (GQA + SwiGLU, bf16).
 model:
-  name: "llama31_70b_stream_ptp4_ppp2_dtp8_dpp1"
+  name: "llama31_70b_p-tp4pp2_d-tp8pp1_stream"
   num_layers: 80
   hidden_size: 8192
   num_attention_heads: 64
@@ -22,11 +22,8 @@ decode_parallelism:
 
 inference:
   serialize_decode_iterations: true
-  kv_transfer:
-    mode: streaming         # bulk | streaming
-    direction: push         # push | pull
-    explicit_request: false
-
+  kv_transfer: streaming   # bulk | streaming
+  
   requests:
     - { prompt_len: 10000, gen_len: 8 }
     - { prompt_len: 10000, gen_len: 8 }

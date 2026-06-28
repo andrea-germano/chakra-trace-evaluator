@@ -1,5 +1,5 @@
 model:
-  name: "llama2_13b_stream_ptp2_ppp2_dtp2_dpp2"
+  name: "llama2_13b_p-tp2pp2_d-tp2pp2_bulk"
   num_layers: 40
   hidden_size: 5120
   vocab_size: 32000
@@ -21,9 +21,7 @@ decode_parallelism:
 
 inference:
   serialize_decode_iterations: true
-  kv_transfer:
-    mode: streaming         # bulk | streaming
-    direction: push         # push | pull
+  kv_transfer: bulk        # bulk | streaming
 
   num_requests: 64
   prompt_len: 512
