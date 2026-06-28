@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# 1. User input
-read -p "Enter the model folder name (e.g., bert, gpt3): " MODEL_FOLDER
-read -p "Enter the config file name without extension (e.g., config_base): " CONFIG_FILE
-read -p "Enter the name of the ns3 configuration subdirectory: " NS3_SUBDIR
-read -p "Enter the output directory name (leave blank to use <model>_<ns3subdir>): " OUTPUT_DIR
+MODEL_FOLDER="$1"
+CONFIG_FILE="$2"
+NS3_SUBDIR="$3"
+OUTPUT_DIR_NAME="$4"
+
+[ -z "$MODEL_FOLDER" ] && read -p "Enter the model folder name (e.g., bert, gpt3): " MODEL_FOLDER
+[ -z "$CONFIG_FILE" ] && read -p "Enter the config file name without extension (e.g., config_base): " CONFIG_FILE
+[ -z "$NS3_SUBDIR" ] && read -p "Enter the name of the ns3 configuration subdirectory: " NS3_SUBDIR
+[ $# -lt 4 ] && read -p "Enter the output directory name (leave blank to use <model>_<ns3subdir>): " OUTPUT_DIR_NAME
 
 if [ -z "$MODEL_FOLDER" ] || [ -z "$CONFIG_FILE" ] || [ -z "$NS3_SUBDIR" ]; then
   echo "ERROR: Model folder, config file name, and ns3 subdirectory are required. Exiting."
@@ -12,9 +16,9 @@ fi
 
 MODEL_NAME="${MODEL_FOLDER}_${CONFIG_FILE}"
 
-if [ -z "$OUTPUT_DIR" ]; then
-  OUTPUT_DIR="${MODEL_NAME}_${NS3_SUBDIR}"
-  echo "Output directory not specified, using: $OUTPUT_DIR"
+if [ -z "$OUTPUT_DIR_NAME" ]; then
+  OUTPUT_DIR_NAME="${MODEL_NAME}_${NS3_SUBDIR}"
+  echo "Output directory not specified, using: $OUTPUT_DIR_NAME"
 fi
 
 echo "---------------------------------------------------"
@@ -69,6 +73,11 @@ TRACES_DIR="$BASE_DIR/output/mlsynth"
 WORKLOAD_PREFIX="$TRACES_DIR/$MODEL_NAME/et/$MODEL_NAME"
 COMM_GROUPS="$TRACES_DIR/$MODEL_NAME/comm_groups.json"
 NS3_OUT_DIR="$BASE_DIR/output/ns3/$NS3_SUBDIR"
+OUTPUT_DIR="$BASE_DIR/output/astra_logs/${OUTPUT_DIR_NAME}"
+if [ -d "$OUTPUT_DIR" ]; then
+  rm -rf "$OUTPUT_DIR"
+  echo "Existing output directory $OUTPUT_DIR removed."
+fi
 mkdir -p "$NS3_OUT_DIR"
 
 # --- EXECUTION ---
@@ -98,31 +107,19 @@ echo "==> [2/2] Starting ASTRA-sim (ns-3 backend)..."
   --remote-memory-configuration="$REMOTE_MEM_CFG" \
   --logical-topology-configuration="$LOGICAL_TOPO" \
   --comm-group-configuration="$COMM_GROUPS" \
-  --logging-configuration="$LOGGING_CFG"
+  --logging-folder="$OUTPUT_DIR" 
+  # --logging-configuration="$LOGGING_CFG" \
 RC=$?
 
 if [ $RC -ne 0 ]; then
   echo "==> ERROR: ASTRA-sim ns-3 backend exited with code $RC."
   echo "    Check the terminal output above for the failing argument/file."
-  if [ -d "$BASE_DIR/log" ]; then
-    rm -rf "$BASE_DIR/log"
+  if [ -d "$OUTPUT_DIR" ]; then
+    rm -rf "$OUTPUT_DIR"
     echo "==> NOTE: Removed the 'log' folder produced by ASTRA-sim due to the error."
   fi
   exit 1
 fi
-
-# Step 4: Log management (same logic as the analytical script)
-echo "==> Simulation finished. Moving logs..."
-if [ -d "$BASE_DIR/log" ]; then
-  if [ -d "$BASE_DIR/output/astra_logs/${OUTPUT_DIR}" ]; then
-    rm -rf "$BASE_DIR/output/astra_logs/${OUTPUT_DIR}"
-  fi
-  mkdir -p "$BASE_DIR/output/astra_logs"
-  mv "$BASE_DIR/log" "$BASE_DIR/output/astra_logs/${OUTPUT_DIR}"
-  echo "==> SUCCESS: System-layer logs saved in $BASE_DIR/output/astra_logs/${OUTPUT_DIR}"
-else
-  echo "==> NOTE: no 'log' folder was produced in $BASE_DIR."
-fi
-
+echo "==> SUCCESS: System-layer logs saved in $OUTPUT_DIR"
 echo "==> ns-3 packet-level outputs: $NS3_OUT_DIR"
 echo "---------------------------------------------------"

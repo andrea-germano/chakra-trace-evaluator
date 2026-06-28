@@ -25,7 +25,7 @@ inference:
   kv_transfer:
     mode: streaming         # bulk | streaming
     direction: push         # push | pull
-    explicit_request: true
+    explicit_request: false
 
   requests:
     - { prompt_len: 10000, gen_len: 8 }
