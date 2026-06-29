@@ -4,6 +4,6 @@
 # numero totale di NPU nella dimensione.
 
 topology:   [ FullyConnected, Switch  ]  #FullyConnected
-npus_count: [ 8, 2 ]      # 8 prefill (NPU 0-7) + 8 decode (NPU 8-15)
+npus_count: [ 2, 4 ]     
 bandwidth:  [ 450.0, 25 ]   # GB/s per direzione = intra_node_bw (TP all-reduce + PP P2P)
 latency:    [ 100, 2000 ]       # ns. SOL ignora la latenza. Valore reale H200 = 10000 ns (p2p_latency):
