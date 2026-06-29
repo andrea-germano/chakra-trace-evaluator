@@ -5,7 +5,7 @@ MODEL_FILE_NAME="$1"
 OUTPUT_DIR_NAME="$2"
 
 [ -z "$MODEL_FILE_NAME" ] && read -p "Enter the model config file name without extension (e.g., bert_base): " MODEL_FILE_NAME
-[ $# -lt 2 ] && read -p "Enter the output directory name (leave blank to use analytical_<model>): " OUTPUT_DIR_NAME
+[ $# -lt 2 ] && read -p "Enter the output directory name (leave blank to use analytical/<model>): " OUTPUT_DIR_NAME
 
 # ESSENTIAL CHECK 1: Ensure inputs are not empty
 if [ -z "$MODEL_FILE_NAME" ]; then
@@ -14,7 +14,7 @@ if [ -z "$MODEL_FILE_NAME" ]; then
 fi
 
 if [ -z "$OUTPUT_DIR_NAME" ]; then
-  OUTPUT_DIR_NAME="analytical_${MODEL_FILE_NAME}"
+  OUTPUT_DIR_NAME="analytical/${MODEL_FILE_NAME}"
   echo "Output directory not specified, using: $OUTPUT_DIR_NAME"
 fi
 
