@@ -40,7 +40,6 @@ Changes vs the previous revision (see CHANGELOG block):
 ------------------------------------------------------------------------------
 """
 
-import sys
 import os
 import re
 import json
@@ -69,7 +68,7 @@ RESULT_DIR = "./result_graphs"
 # signalling traffic (the "serialize" / 8-byte FIRSTTOK messages).  They are
 # excluded from the bandwidth / impact analysis and from the timeline clutter,
 # but FIRSTTOK is still used as a marker for the first-token instant.
-CONTROL_MAX_BYTES = 1024
+CONTROL_MAX_BYTES = 128
 
 # Colours (kept consistent between the HTML timeline and the PNG charts).
 CAT_COLORS = {
@@ -376,11 +375,49 @@ def compute_metrics(df: pd.DataFrame, roles: dict) -> dict:
     prefill_fwd = _fwd_ops("p")
     decode_fwd = _fwd_ops("d")
 
-    # --- prefill end = first token produced by prefill (== TTFT) --------------
-    # Max end over the prefill forward set = end of the final TP all-reduce on
-    # the last pipeline stage (the latest forward op), i.e. the instant the first
-    # token is actually ready.
+    # --- prefill "first token" instant ---------------------------------------
+    # The first token leaves the LAST pipeline stage, after its final layer's
+    # forward (incl. the TP all-reduce that reassembles the partial sums).
+    #
+    # The simulator reports the two TP shards of that final all-reduce finishing
+    # a little apart (per-rank reporting skew of a collective that is logically a
+    # barrier). Two instants are therefore meaningful:
+    #   * first_token_ready = the EARLIEST the token exists / is handed off
+    #     (min over the final-stage final-layer forward ends, i.e. the instant
+    #     the first FIRSTTOK can be sent). This is the value that gates -- and is
+    #     causally consistent with -- the decode side, so it is what TTFT and the
+    #     KV-exposure / 2nd-token waterfall are built on.
+    #   * prefill_all_ready = the LATEST shard's reported completion (max). Kept
+    #     as a secondary "first token fully materialised across all TP shards"
+    #     diagnostic only; it must NOT be mixed with the (min-based) decode start,
+    #     or the exposed-handoff gap goes spuriously negative.
     m["prefill_compute_end"] = int(prefill_fwd["end_tick"].max()) if len(prefill_fwd) else None
+    m["prefill_all_ready_tick"] = m["prefill_compute_end"]
+    m["prefill_all_ready_ns"] = ((m["prefill_compute_end"] - t0)
+                                 if m["prefill_compute_end"] is not None else None)
+
+    def _first_token_ready() -> int | None:
+        # Prefer the FIRSTTOK send instant: send start == the moment prefill has
+        # produced the first token for that decode peer. The earliest such send
+        # is the first time the token exists anywhere.
+        ft = df[df["cls"] == "FIRSTTOK"]
+        if len(ft):
+            send = ft[ft["comm_role"] == "send"] if "comm_role" in ft.columns else ft.iloc[0:0]
+            if len(send):
+                return int(send["start_tick"].min())
+            # no role tagging -> the send is the one that is NOT pre-posted at t0
+            non_origin = ft[ft["start_tick"] > t0]
+            if len(non_origin):
+                return int(non_origin["start_tick"].min())
+        # Fallback: final-stage, final-layer forward end (earliest shard).
+        if len(prefill_fwd):
+            ss_num = pd.to_numeric(prefill_fwd["ss"], errors="coerce")
+            fin = prefill_fwd[ss_num == ss_num.max()] if ss_num.notna().any() else prefill_fwd
+            L_num = pd.to_numeric(fin["L"], errors="coerce")
+            if L_num.notna().any():
+                fin = fin[L_num == L_num.max()]
+            return int(fin["end_tick"].min())
+        return None
 
     # --- decode-start instant (decode it=0 begins) ---------------------------
     # This is gated by the KV-cache transfer + the first-token handoff, i.e. it
@@ -394,23 +431,34 @@ def compute_metrics(df: pd.DataFrame, roles: dict) -> dict:
     m["decode_start_tick"] = decode_start_tick
     m["decode_start_ns"] = (decode_start_tick - t0) if decode_start_tick is not None else None
 
-    # --- TTFT = first token = prefill end (network-insensitive) --------------
-    firsttok = df[df["cls"] == "FIRSTTOK"]
-    ttft_tick = m["prefill_compute_end"]
-    if ttft_tick is None and len(firsttok):
-        # FIRSTTOK send completes right after the prefill tail; .min() picks the
-        # send side rather than a (possibly eager) recv.
-        ttft_tick = int(firsttok["end_tick"].min())
+    # --- TTFT = first token produced (network-insensitive) -------------------
+    # Built on first_token_ready (min) so it is causally consistent with the
+    # decode start it feeds: TTFT <= decode_start by construction.
+    ttft_tick = _first_token_ready()
     if ttft_tick is None:
         ttft_tick = decode_start_tick
     m["ttft_tick"] = ttft_tick
     m["ttft_ns"] = (ttft_tick - t0) if ttft_tick is not None else None
 
-    # --- KV transfer + handoff exposed on the path to the 2nd token ----------
+    # --- first-token handoff exposed on the path to the 2nd token ------------
+    # decode_start - first_token_ready: the prefill->decode FIRST-TOKEN handoff
+    # latency that is not hidden behind prefill compute. This is a small,
+    # specific quantity -- NOT the cost of moving the KV cache itself (that is
+    # kv_transfer_exposed_ns below). Both instants live on the same causal chain,
+    # so the gap is >= 0 (clamped for robustness).
     if decode_start_tick is not None and ttft_tick is not None:
-        m["kv_exposure_ns"] = decode_start_tick - ttft_tick
+        m["kv_handoff_exposed_ns"] = max(0, decode_start_tick - ttft_tick)
     else:
-        m["kv_exposure_ns"] = None
+        m["kv_handoff_exposed_ns"] = None
+
+    # --- KV-cache transfer exposed (the headline "KV transfer exposed") -------
+    # Time the KV-cache transfer is actually on the wire with nothing hiding it
+    # (no compute, no other real transfer). See kv_exposed_time(). In a run where
+    # the KV transfer overlaps prefill compute it is small; when it serialises
+    # into the pipeline (slow links / large cache) it dominates TTFT.
+    m.update(kv_exposed_time(df, roles))
+    # Back-compat alias: the headline metric is the exposed KV-cache transfer.
+    m["kv_exposure_ns"] = m["kv_transfer_exposed_ns"]
 
     # --- second-token instant + TPOT -----------------------------------------
     # Each decode iteration's token is ready at the end of that iteration's last
@@ -440,29 +488,38 @@ def compute_metrics(df: pd.DataFrame, roles: dict) -> dict:
     m["n_decode_iters"] = len(it_end)
 
     # --- synchronisation skew of KV readiness across decode ranks -------------
+    # The first decode all-reduce is a TP collective *within one pipeline stage*
+    # (it never spans stages), so the skew it must absorb is the spread of
+    # per-rank KV-ready instants WITHIN a stage -- not the global min..max, which
+    # is dominated by the inter-stage pipeline offset (stage 1 receives its KV
+    # cache much later than stage 0) and is therefore not a synchronisation tax.
     kv_ready = kv_ready_per_decode_npu(df, roles)
     m["kv_ready_per_npu"] = kv_ready
-    if len(kv_ready) >= 2:
-        readies = [r["kv_ready_tick"] for r in kv_ready]
-        m["sync_skew_ns"] = max(readies) - min(readies)
-    else:
-        m["sync_skew_ns"] = None
-    # skew within the head decode stage (the group that gates the FIRST decode
-    # all-reduce); falls back to global skew if stage info is unavailable.
-    head = [r for r in kv_ready if str(r["stage"]) == "0"]
-    if len(head) >= 2:
-        hr = [r["kv_ready_tick"] for r in head]
-        m["sync_skew_head_ns"] = max(hr) - min(hr)
-    else:
-        m["sync_skew_head_ns"] = m["sync_skew_ns"]
 
-    # --- KV-cache "tail": how late the last KV chunk completes vs the instant
-    #     decode actually needs it (= decode start). Positive => KV exposed. ---
-    kv = df[(df["cls"] == "KV") & ~df["is_control"]]
-    ref_tick = decode_start_tick if decode_start_tick is not None else ttft_tick
-    if len(kv) and ref_tick is not None:
-        m["kv_last_end"] = int(kv["end_tick"].max())
-        m["kv_tail_vs_decode_start_ns"] = int(kv["end_tick"].max()) - ref_tick
+    def _stage_spreads(rows):
+        by_stage = {}
+        for r in rows:
+            by_stage.setdefault(str(r["stage"]), []).append(r["kv_ready_tick"])
+        return {s: (max(v) - min(v)) for s, v in by_stage.items() if len(v) >= 2}
+
+    spreads = _stage_spreads(kv_ready)
+    m["sync_skew_per_stage_ns"] = spreads
+    # the binding skew = the worst per-stage spread (what the slowest stage's
+    # first all-reduce has to absorb).
+    m["sync_skew_ns"] = max(spreads.values()) if spreads else None
+    # spread within the head decode stage (stage 0), which gates the very first
+    # decode all-reduce; falls back to the binding skew if stage info is absent.
+    m["sync_skew_head_ns"] = spreads.get("0", m["sync_skew_ns"])
+
+    # --- KV-cache "tail": how late the last KV chunk *arrives on the decode
+    #     side* vs the instant decode actually needs it (= decode start).
+    #     Use the receive (decode-pool) arrivals only -- a KV send completing on
+    #     the prefill side is not what decode waits for. Positive => KV exposed
+    #     (decode stalled on a late chunk); negative => KV fully prefetched. -----
+    if kv_ready and decode_start_tick is not None:
+        last_kv_arrival = max(r["kv_ready_tick"] for r in kv_ready)
+        m["kv_last_end"] = int(last_kv_arrival)
+        m["kv_tail_vs_decode_start_ns"] = int(last_kv_arrival) - decode_start_tick
     else:
         m["kv_last_end"] = None
         m["kv_tail_vs_decode_start_ns"] = None
@@ -490,6 +547,46 @@ def interval_union_len(intervals):
     return total
 
 
+def interval_union(intervals):
+    """Merge a list of (start, end) into a sorted list of disjoint intervals."""
+    iv = sorted((s, e) for s, e in intervals if e > s)
+    if not iv:
+        return []
+    out = [list(iv[0])]
+    for s, e in iv[1:]:
+        if s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return [(s, e) for s, e in out]
+
+
+def interval_subtract(a, b):
+    """a minus b, where a and b are unions of intervals. Returns the parts of a
+    not covered by b."""
+    if not a:
+        return []
+    b = interval_union(b)
+    res = []
+    for s, e in interval_union(a):
+        cur = s
+        for bs, be in b:
+            if be <= cur or bs >= e:
+                continue
+            if bs > cur:
+                res.append((cur, min(bs, e)))
+            cur = max(cur, be)
+            if cur >= e:
+                break
+        if cur < e:
+            res.append((cur, e))
+    return res
+
+
+def interval_total(intervals):
+    return sum(e - s for s, e in intervals)
+
+
 def interval_overlap_len(a, b):
     """Length of overlap between two unions of intervals a and b."""
     if not a or not b:
@@ -508,6 +605,87 @@ def interval_overlap_len(a, b):
         else:
             j += 1
     return total
+
+
+def kv_exposed_time(df: pd.DataFrame, roles: dict) -> dict:
+    """Time the KV-cache transfer is genuinely EXPOSED -- i.e. on the wire while
+    no other useful work hides it.
+
+    A KV chunk only adds to end-to-end latency for the part of its transfer that
+    is NOT overlapped by something else making forward progress: GPU compute, or
+    another *real* transfer. So `exposed = union(KV on-wire) - union(compute U
+    real-other-comm)`.
+
+    Two subtleties make this correct rather than degenerate:
+      * On-wire KV = the SEND side only. A receive sits pre-posted and blocked
+        until the data is produced upstream; counting its long blocked span as
+        "KV in flight" would massively over-count.
+      * The hiding set excludes pre-posted / blocked receives for the same
+        reason -- a peer sitting blocked on a recv is NOT doing work that hides
+        our KV transfer. Including every recv is what collapses the metric to 0
+        (the blocked PP recvs span almost the whole run). We therefore subtract
+        only compute and SEND-side non-KV communication.
+
+    The headline number is computed on the prefill pool (the KV source): it is a
+    subset of [t0, TTFT] by construction, so it composes cleanly with the TTFT /
+    2nd-token waterfall. A per-sys breakdown (send-side exposure for prefill
+    ranks; blocked recv-wait for decode ranks) is returned for transparency."""
+    has_role = "comm_role" in df.columns
+
+    def send_mask(frame):
+        if has_role:
+            return frame["comm_role"] == "send"
+        return ~frame["wait_dominated"] if "wait_dominated" in frame.columns \
+            else pd.Series(True, index=frame.index)
+
+    # --- headline: prefill-pool exposed KV ---
+    # KV/PP node names carry no pl= field, so the prefill pool is identified by
+    # each sys's role (from roles), not by a name field.
+    prefill_sids = {sid for sid, info in roles.items() if info.get("role") == "prefill"}
+    pf = df[df["sys_id"].isin(prefill_sids)]
+    kv = pf[(pf["cls"] == "KV") & ~pf["is_control"]]
+    kv = kv[send_mask(kv)]
+    kv_iv = interval_union(list(zip(kv["start_tick"], kv["end_tick"])))
+
+    comp = list(zip(pf[pf["is_compute"]]["start_tick"], pf[pf["is_compute"]]["end_tick"]))
+    othc = pf[pf["is_comm"] & ~pf["is_control"] & (pf["cls"] != "KV")]
+    othc = othc[send_mask(othc)]
+    oth = list(zip(othc["start_tick"], othc["end_tick"]))
+    hide = interval_union(comp + oth)
+
+    exposed_iv = interval_subtract(kv_iv, hide)
+    exposed_ns = interval_total(exposed_iv)
+    onwire_ns = interval_total(kv_iv)
+
+    # --- per-sys breakdown (uses each node's own compute + other-comm) ---
+    per = []
+    for sid, g in df.groupby("sys_id"):
+        k = g[(g["cls"] == "KV") & ~g["is_control"]]
+        if not len(k):
+            continue
+        sid = int(sid)
+        role = roles.get(sid, {}).get("role", "?")
+        # prefill ranks send; decode ranks only have the blocked recv-wait
+        kiv = interval_union(list(zip(k["start_tick"], k["end_tick"])))
+        b = interval_union(
+            list(zip(g[g["is_compute"]]["start_tick"], g[g["is_compute"]]["end_tick"])) +
+            list(zip(g[g["is_comm"] & ~g["is_control"] & (g["cls"] != "KV")]["start_tick"],
+                     g[g["is_comm"] & ~g["is_control"] & (g["cls"] != "KV")]["end_tick"])))
+        per.append({
+            "sys_id": sid,
+            "role": role,
+            "kv_onwire_ns": interval_total(kiv),
+            "kv_exposed_ns": interval_total(interval_subtract(kiv, b)),
+            "kind": "send" if role == "prefill" else "recv-wait",
+        })
+    per.sort(key=lambda r: (r["role"], r["sys_id"]))
+
+    return {
+        "kv_transfer_exposed_ns": exposed_ns,
+        "kv_onwire_ns": onwire_ns,
+        "kv_exposed_intervals": exposed_iv,
+        "kv_exposed_per_sys": per,
+    }
 
 
 def per_sys_utilisation(df: pd.DataFrame, roles: dict) -> list:
@@ -612,15 +790,26 @@ def chart_latency_breakdown(df, metrics, roles, out):
     ttft = metrics["ttft_ns"]
     dstart = metrics["decode_start_ns"]
     second = metrics["second_token_ns"]
-    kv_exp = metrics.get("kv_exposure_ns")
+    kv_tx = metrics.get("kv_transfer_exposed_ns") or 0   # exposed KV-cache transfer
+    handoff = metrics.get("kv_handoff_exposed_ns") or 0  # first-token handoff gap
+    all_ready = metrics.get("prefill_all_ready_ns")
 
-    # --- left: TTFT / decode-start / 2nd-token composition ----------------- #
+    # --- left: critical-path composition, tiling [0, second] --------------- #
+    #   prefill region [0, ttft] is split into the part hidden/served by
+    #     compute+pipeline and the part that is EXPOSED KV-cache transfer;
+    #   then the first-token handoff gap [ttft, decode_start];
+    #   then decode step 1 -> 2nd token.
     segs = []  # (label, start_ns, len_ns, color)
     if ttft is not None:
-        segs.append(("Prefill compute\n(\u2192 first token)", 0, ttft, "#5b8def"))
-    if ttft is not None and dstart is not None and dstart > ttft:
-        segs.append(("KV transfer +\nhandoff (exposed)", ttft, dstart - ttft, EXPOSED_COLOR))
-    base_decode = dstart if (dstart is not None) else ttft
+        kv_part = min(kv_tx, ttft)
+        base_part = max(0, ttft - kv_part)
+        segs.append(("Prefill compute\n+ pipeline", 0, base_part, "#5b8def"))
+        if kv_part > 0:
+            segs.append(("Exposed KV-cache\ntransfer", base_part, kv_part, "#ff6b6b"))
+    exp_len = max(0, (dstart or 0) - (ttft or 0))
+    if exp_len > 0:
+        segs.append(("First-token\nhandoff", ttft, exp_len, EXPOSED_COLOR))
+    base_decode = max(ttft or 0, dstart or 0) if (ttft is not None or dstart is not None) else None
     if base_decode is not None and second is not None and second > base_decode:
         segs.append(("Decode step 1\n(\u2192 2nd token)", base_decode,
                      second - base_decode, "#7c5cff"))
@@ -636,7 +825,10 @@ def chart_latency_breakdown(df, metrics, roles, out):
         axL.axvline(ttft, color="#ff6b6b", lw=2, ls="--")
         axL.text(ttft, 0.42, f"TTFT\n{fmt_time(ttft)}", color="#ff6b6b",
                  ha="center", va="bottom", fontsize=9.5, fontweight="bold")
-    if dstart is not None and (ttft is None or dstart > ttft):
+    # the slowest TP shard's reported finish (only annotate if meaningfully later)
+    if all_ready is not None and ttft is not None and (all_ready - ttft) > scale_ref * 0.01:
+        axL.axvline(all_ready, color="#ff6b6b", lw=1, ls=":", alpha=0.6)
+    if dstart is not None and exp_len > 0:
         axL.axvline(dstart, color="#d97706", lw=2, ls="--")
         axL.text(dstart, 0.42, f"decode start\n{fmt_time(dstart)}", color="#b45309",
                  ha="center", va="bottom", fontsize=9, fontweight="bold")
@@ -649,10 +841,13 @@ def chart_latency_breakdown(df, metrics, roles, out):
     axL.set_yticks([])
     axL.set_xlabel("time since request start (ms)")
     _ms_axis(axL)
-    sub = ""
-    if kv_exp is not None:
-        sub = f"\nKV transfer exposed on 2nd-token path: {fmt_time(kv_exp)}"
-    axL.set_title("Critical path to first & second token" + sub, fontsize=11)
+    parts = []
+    if ttft:
+        parts.append(f"exposed KV-cache transfer {fmt_time(kv_tx)} "
+                     f"({100.0 * kv_tx / ttft:.0f}% of TTFT)")
+    parts.append(f"first-token handoff {fmt_time(handoff)}")
+    axL.set_title("Critical path to first & second token\n" + "  \u00b7  ".join(parts),
+                  fontsize=10.5)
     axL.margins(x=0.02)
 
     # --- right: per-iteration decode latency (TPOT) ------------------------ #
@@ -962,18 +1157,27 @@ def chart_sync_skew(df, metrics, roles, out):
     ax.hlines(y, x_min, xs, color="#cbd5e1", lw=1.2, zorder=1)
     ax.scatter(xs, y, s=70, color=cols, zorder=3, edgecolor="white", linewidth=0.8)
 
-    # shade the head-stage skew band
+    # shade each stage's within-stage skew band (this is the spread that stage's
+    # first decode all-reduce must absorb); highlight the head stage (== '0').
+    for st in stages:
+        sx = [(r["kv_ready_tick"] - t0) / 1e6 for r in ready_sorted
+              if str(r["stage"]) == st]
+        if len(sx) < 2:
+            continue
+        is_head = (st == "0")
+        ax.axvspan(min(sx), max(sx), color="#ff6b6b" if is_head else "#9aa5b1",
+                   alpha=0.12 if is_head else 0.07, zorder=0)
     head = [r for r in ready_sorted if str(r["stage"]) == "0"]
     if len(head) >= 2:
         hx = [(r["kv_ready_tick"] - t0) / 1e6 for r in head]
-        ax.axvspan(min(hx), max(hx), color="#ff6b6b", alpha=0.10, zorder=0)
         ax.axvline(min(hx), color="#ff6b6b", lw=1, ls=":", alpha=0.7)
         ax.axvline(max(hx), color="#ff6b6b", lw=1.4, ls="--",
                    label=f"head-stage skew = {fmt_time(metrics.get('sync_skew_head_ns'))}")
 
     dstart = metrics.get("decode_start_ns")
     if dstart is not None:
-        ax.axvline(dstart, color="#d97706", lw=2, ls="--",
+        # x-axis is in ms (data points are /1e6); convert the marker too.
+        ax.axvline(dstart / 1e6, color="#d97706", lw=2, ls="--",
                    label=f"decode start ({fmt_time(dstart)})")
 
     ax.set_yticks(y)
@@ -982,8 +1186,8 @@ def chart_sync_skew(df, metrics, roles, out):
     ax.set_xlabel("KV-ready instant since request start (ms)")
     skew = metrics.get("sync_skew_ns")
     ax.set_title("Per-rank KV-ready skew on the decode side\n"
-                 f"global skew = {fmt_time(skew)}  "
-                 f"(absorbed by the first decode all-reduce)", fontsize=11)
+                 f"worst within-stage skew = {fmt_time(skew)}  "
+                 f"(absorbed by that stage's first decode all-reduce)", fontsize=11)
 
     # stage legend
     from matplotlib.lines import Line2D
@@ -1463,8 +1667,10 @@ def main():
     print(f"  roles: " + ", ".join(
         f"sys{s}={r['role']}" for s, r in sorted(roles.items())))
     print(f"  TTFT={fmt_time(metrics['ttft_ns'])}  "
-          f"decode-start={fmt_time(metrics['decode_start_ns'])}  "
-          f"KV-exposed={fmt_time(metrics['kv_exposure_ns'])}")
+          f"decode-start={fmt_time(metrics['decode_start_ns'])}")
+    print(f"  KV-cache transfer exposed={fmt_time(metrics['kv_transfer_exposed_ns'])}"
+          f" (of {fmt_time(metrics['kv_onwire_ns'])} on-wire)  "
+          f"first-token handoff={fmt_time(metrics['kv_handoff_exposed_ns'])}")
     print(f"  2nd-token={fmt_time(metrics['second_token_ns'])}  "
           f"TPOT={fmt_time(metrics['tpot_ns'])}  "
           f"TPOT(steady)={fmt_time(metrics['tpot_steady_ns'])}  "
@@ -1498,10 +1704,19 @@ def main():
         "roles": {str(k): v for k, v in roles.items()},
         "ttft_ns": metrics["ttft_ns"],
         "ttft_human": fmt_time(metrics["ttft_ns"]),
+        "prefill_all_ready_ns": metrics.get("prefill_all_ready_ns"),
+        "prefill_all_ready_human": fmt_time(metrics.get("prefill_all_ready_ns")),
         "decode_start_ns": metrics["decode_start_ns"],
         "decode_start_human": fmt_time(metrics["decode_start_ns"]),
         "kv_exposure_ns": metrics["kv_exposure_ns"],
         "kv_exposure_human": fmt_time(metrics["kv_exposure_ns"]),
+        "kv_transfer_exposed_ns": metrics["kv_transfer_exposed_ns"],
+        "kv_transfer_exposed_human": fmt_time(metrics["kv_transfer_exposed_ns"]),
+        "kv_onwire_ns": metrics["kv_onwire_ns"],
+        "kv_onwire_human": fmt_time(metrics["kv_onwire_ns"]),
+        "kv_handoff_exposed_ns": metrics["kv_handoff_exposed_ns"],
+        "kv_handoff_exposed_human": fmt_time(metrics["kv_handoff_exposed_ns"]),
+        "kv_exposed_per_sys": metrics["kv_exposed_per_sys"],
         "second_token_ns": metrics["second_token_ns"],
         "second_token_human": fmt_time(metrics["second_token_ns"]),
         "tpot_ns": metrics["tpot_ns"],
@@ -1512,6 +1727,7 @@ def main():
         "sync_skew_human": fmt_time(metrics["sync_skew_ns"]),
         "sync_skew_head_ns": metrics["sync_skew_head_ns"],
         "sync_skew_head_human": fmt_time(metrics["sync_skew_head_ns"]),
+        "sync_skew_per_stage_ns": metrics.get("sync_skew_per_stage_ns"),
         "makespan_ns": metrics["makespan_ns"],
         "makespan_human": fmt_time(metrics["makespan_ns"]),
         "n_decode_iters": metrics["n_decode_iters"],
@@ -1526,13 +1742,17 @@ def main():
     with open(os.path.join(out_dir, "summary.txt"), "w") as f:
         f.write(f"Run: {title}\n")
         f.write(f"Events: {len(df):,}   sys instances: {df['sys_id'].nunique()}\n\n")
-        f.write(f"TTFT (first token, prefill)   : {fmt_time(metrics['ttft_ns'])}\n")
+        f.write(f"TTFT (first token produced)   : {fmt_time(metrics['ttft_ns'])}\n")
+        if metrics.get("prefill_all_ready_ns") is not None:
+            f.write(f"  (all TP shards materialised) : {fmt_time(metrics['prefill_all_ready_ns'])}\n")
         f.write(f"Decode start (KV-gated)       : {fmt_time(metrics['decode_start_ns'])}\n")
-        f.write(f"KV transfer exposed           : {fmt_time(metrics['kv_exposure_ns'])}\n")
+        f.write(f"KV-cache transfer exposed     : {fmt_time(metrics['kv_transfer_exposed_ns'])}"
+                f"  (of {fmt_time(metrics['kv_onwire_ns'])} on-wire)\n")
+        f.write(f"First-token handoff exposed   : {fmt_time(metrics['kv_handoff_exposed_ns'])}\n")
         f.write(f"2nd token (prefill+KV+decode1): {fmt_time(metrics['second_token_ns'])}\n")
         f.write(f"TPOT (per output token)       : {fmt_time(metrics['tpot_ns'])}\n")
         f.write(f"TPOT steady-state             : {fmt_time(metrics['tpot_steady_ns'])}\n")
-        f.write(f"Sync skew (decode KV-ready)   : {fmt_time(metrics['sync_skew_ns'])}\n")
+        f.write(f"Sync skew (worst per-stage)   : {fmt_time(metrics['sync_skew_ns'])}\n")
         f.write(f"Sync skew (head stage)        : {fmt_time(metrics['sync_skew_head_ns'])}\n")
         f.write(f"Total makespan                : {fmt_time(metrics['makespan_ns'])}\n")
         f.write(f"Decode iterations             : {metrics['n_decode_iters']}\n")
