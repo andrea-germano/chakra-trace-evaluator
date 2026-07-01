@@ -1,5 +1,5 @@
 {
-  "scheduling-policy": "FIFO",
+  "scheduling-policy": "LIFO",
   "intra-dimension-scheduling": "FIFO",
   "inter-dimension-scheduling": "baseline",
   "endpoint-delay": 10,
@@ -14,5 +14,9 @@
   "peak-perf": 1979,
   "local-mem-bw": 3350,
   "boost-mode": 1,
-  "trace-enabled": 1  
+  "trace-enabled": 1,
+  
+  "qos-enabled": 0,
+  "unlimited-in-flight-comm-ops": 0,
+  "csv-output-enabled": 1
 }

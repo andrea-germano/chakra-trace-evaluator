@@ -19,7 +19,7 @@ CC_MODE = {"dcqcn": 1, "hpcc": 3, "timely": 7, "dctcp": 8, "hpcc-pint": 10, "non
 KNOWN_BX = {"200", "100", "50", "40", "25"}
 
 # Defaults that, when unchanged, are omitted from the tag to keep names short.
-BUFFER_DEFAULT = "32"
+BUFFER_DEFAULT = "16"
 
 
 def ask(prompt: str, default: str) -> str:
@@ -36,8 +36,7 @@ def ask_topo() -> str:
 
 def build_fabric_tag(topo_token: str, bx: str, cc: str, buf: str) -> str:
     parts = [topo_token, f"bx{bx}", cc]
-    if buf != BUFFER_DEFAULT:
-        parts.append(f"buf{buf}")
+    parts.append(f"buf{buf}")
     return "_".join(parts)
 
 

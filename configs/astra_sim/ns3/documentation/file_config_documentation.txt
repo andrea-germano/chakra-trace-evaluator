@@ -43,7 +43,8 @@ PINT_PROB 1.0 {for HPCC-PINT: the fraction of packets that carries PINT. 1.0 mea
 
 RATE_BOUND 1 {0: no rate limitor, 1: use rate limitor}
 
-ACK_HIGH_PRIO 0 {0: ACK has same priority with data packet, 1: prioritize ACK}
+ACK_HIGH_PRIO 0 {0: ACK has same priority with default data packet, 1: prioritize ACK}
+STRICT_PRIORITY 0 {0: send in round robin for each queue, 1: send based on the priority queue }
 
 LINK_DOWN 0 0 0 {a b c: take down link between b and c at time a. 0 0 0 mean no link down}
 
