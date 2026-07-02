@@ -14,7 +14,7 @@
   "peak-perf": 1979,
   "local-mem-bw": 3350,
   "boost-mode": 1,
-  "trace-enabled": 0,
+  "trace-enabled": 1,
 
   "qos-enabled": 1,
   "unlimited-in-flight-comm-ops": 1,

@@ -1,45 +1,4 @@
 #!/usr/bin/env python3
-"""
-analyze_sim.py  --  Disaggregated prefill/decode LLM-serving timeline & network analyzer.
-
-Reads every *.csv produced by the simulator inside an input folder (one CSV per
-"sys" instance = one GPU/TP-shard), reconstructs the combined execution timeline of
-the whole distributed system for a single request, and produces:
-
-  1. timeline.html      -> interactive, canvas-based (raster) Gantt chart of ALL
-                           sys instances in one view. Pan / zoom / hover-for-name.
-                           TTFT, decode-start and 2nd-token latency drawn as marker
-                           lines + big numbers in the header.
-  2. *.png              -> static charts characterising the impact of the different
-                           communication types (KV-cache transfer, TP, PP, ...) on
-                           the serving metrics (TTFT / TPOT), plus network-bandwidth
-                           / congestion / synchronisation-skew views.
-  3. summary.json/.txt  -> the headline numbers.
-
-Node types are characterised using the naming convention in `naming.py`
-(re-implemented here so the script is self-contained and does not need to import it).
-
-Usage:
-    python analyze_sim.py <input_folder> <output_folder>
-
-------------------------------------------------------------------------------
-Changes vs the previous revision (see CHANGELOG block):
-  * TTFT is now the PREFILL-side first-token instant (network-insensitive by
-    construction). The instant decode actually begins -- gated by the KV-cache
-    transfer and the first-token handoff -- is reported separately as
-    `decode_start`, and the gap `kv_exposure = decode_start - ttft` is surfaced
-    as a first-class metric. The latency waterfall labels that gap as KV-transfer
-    exposure rather than "sampling".
-  * New `sync_skew` metric and chart: the spread of per-rank KV-ready instants on
-    the decode side, which the first decode all-reduce must absorb.
-  * Communication rows are tagged SEND vs RECV by pool role, so the effective-
-    bandwidth / congestion view uses the transmit side and the simulator-reported
-    bandwidth when available, instead of size/duration on blocked receives.
-  * TPOT is reported both as a full mean and as a steady-state mean that excludes
-    the first decode gap (the one carrying the first-all-reduce warm-up artefact).
-------------------------------------------------------------------------------
-"""
-
 import os
 import re
 import json
@@ -85,7 +44,6 @@ CAT_COLORS = {
     "OTHER":        "#9aa5b1",
 }
 
-# Accent used for the network-exposed (KV transfer + handoff) part of the path.
 EXPOSED_COLOR = "#ff9f43"
 
 CSV_COLUMNS = [
@@ -1238,11 +1196,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .metric.kvexp .v{color:var(--dstart)}
   .metric.second .v{color:var(--second)}
   .metric.tpot .v{color:#7c5cff}
+  .metric.kvpeak .v{color:#ff6b6b}
   #toolbar{display:flex;gap:10px;align-items:center;padding:8px 18px;
            border-bottom:1px solid var(--line);background:var(--panel2);flex-wrap:wrap}
   #toolbar button{background:#26314d;color:var(--ink);border:1px solid var(--line);
            border-radius:6px;padding:5px 11px;cursor:pointer;font:inherit;font-size:12px}
   #toolbar button:hover{background:#30406a}
+  #toolbar button.toggle.active{background:#ff6b6b22;border-color:#ff6b6b;color:#ffd0d0}
+  #toolbar button.toggle.active:hover{background:#ff6b6b33}
   #toolbar .hint{color:var(--muted);font-size:11.5px}
   .legend{display:flex;gap:14px;flex-wrap:wrap;margin-left:auto}
   .legend span{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted)}
@@ -1269,6 +1230,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="metric kvexp"><span class="v">__KVEXP__</span><span class="k">KV transfer exposed</span></div>
     <div class="metric second"><span class="v">__SECOND__</span><span class="k">2nd token (prefill+KV+decode 1)</span></div>
     <div class="metric tpot"><span class="v">__TPOT__</span><span class="k">TPOT (per token)</span></div>
+    <div class="metric kvpeak"><span class="v">__KVPEAK__</span><span class="k">peak concurrent KV transfers</span></div>
     <div class="metric"><span class="v">__MAKESPAN__</span><span class="k">total makespan</span></div>
   </div>
 </header>
@@ -1277,6 +1239,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <button id="zin">Zoom +</button>
   <button id="zout">Zoom &minus;</button>
   <button id="fit">Fit width</button>
+  <button id="stack" class="toggle active" title="Show or hide concurrent communication by splitting overlapping transfers into separate tracks">Show concurrent comms</button>
   <span class="hint">drag = pan &nbsp;&middot;&nbsp; wheel = zoom (x) &nbsp;&middot;&nbsp; shift+wheel = scroll &nbsp;&middot;&nbsp; hover = node name</span>
   <div class="legend" id="legend"></div>
 </div>
@@ -1294,25 +1257,60 @@ const tip = document.getElementById('tip');
 
 const COLORS = DATA.colors;          // catName -> hex
 const CATS   = DATA.cats;            // index -> catName
-const LANES  = DATA.lanes;           // [{label, role}]
-const BARS   = DATA.bars;            // {l,a,b,c,n,s,w,d}
+const LANES  = DATA.lanes;           // [{label, role, depth}]
+const BARS   = DATA.bars;            // {l,a,b,c,n,s,w,d,k}
 const t0 = DATA.t0, tEnd = DATA.tEnd;
 const ttftX = DATA.ttft, secondX = DATA.second; // absolute ticks or null
 const decodeStartX = DATA.decodeStart;          // absolute tick or null
 
 // layout constants
-const LANE_H = 16, LANE_PAD = 2, LEFT = 168, TOP = 26, ROW = LANE_H + LANE_PAD;
-const contentH = LANES.length * ROW + TOP + 20;
+const LEFT = 168, TOP = 26, PLOT_TOP = TOP;
+const FLAT_H = 16, LANE_GAP = 6, BASE_SUB = 14, MIN_SUB = 4, TARGET = 150;
+
+// view / display state
+let stacked = true;      // show concurrent transfers as separate stacked tracks
+
+// per-lane vertical layout, recomputed whenever `stacked` flips
+let laneY = [], laneH = [], subH = [], contentH = 0;
+function computeLayout(){
+  laneY = new Array(LANES.length);
+  laneH = new Array(LANES.length);
+  subH  = new Array(LANES.length);
+  let acc = 0;
+  for(let i=0;i<LANES.length;i++){
+    const d = Math.max(1, LANES[i].depth || 1);
+    let sh, inner;
+    if(stacked && d > 1){
+      sh = Math.max(MIN_SUB, Math.min(BASE_SUB, Math.floor(TARGET / d)));
+      inner = d * sh;
+    }else{
+      sh = FLAT_H; inner = FLAT_H;
+    }
+    subH[i] = sh;
+    laneY[i] = acc;
+    laneH[i] = inner + LANE_GAP;
+    acc += laneH[i];
+  }
+  contentH = acc + 20;
+}
+computeLayout();
+
+// build per-lane bar buckets for faster hit-testing
+const laneBars = LANES.map(()=>[]);
+for(const bar of BARS){ laneBars[bar.l].push(bar); }
 
 // view transform (x only zoom/pan; y = vertical scroll)
 let scaleX, offX, offY = 0;
 let dpr = Math.max(1, window.devicePixelRatio || 1);
+
+function maxScroll(){ return Math.max(0, contentH - (cv.clientHeight - PLOT_TOP)); }
 
 function resize(){
   dpr = Math.max(1, window.devicePixelRatio || 1);
   const w = cv.clientWidth, h = cv.clientHeight;
   cv.width = Math.floor(w*dpr); cv.height = Math.floor(h*dpr);
   ctx.setTransform(dpr,0,0,dpr,0,0);
+  offY = Math.max(0, Math.min(offY, maxScroll()));
   draw();
 }
 function fitWidth(){
@@ -1326,11 +1324,8 @@ function fitWidth(){
 function tickToX(t){ return offX + (t - t0)*scaleX; }
 function xToTick(x){ return t0 + (x - offX)/scaleX; }
 
-// build per-lane bar buckets for faster hit-testing
-const laneBars = LANES.map(()=>[]);
-for(const bar of BARS){ laneBars[bar.l].push(bar); }
-
 function colorFor(b){ return COLORS[CATS[b.c]] || '#888'; }
+function isKV(b){ return CATS[b.c] === 'KV'; }
 
 function fmtTime(ns){
   if(ns==null||!isFinite(ns)) return 'n/a';
@@ -1364,38 +1359,61 @@ function draw(){
   ctx.restore();
 
   // --- lane backgrounds + labels ---
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0,PLOT_TOP,w,h-PLOT_TOP); ctx.clip();
   ctx.font='11px ui-monospace,monospace';
   for(let i=0;i<LANES.length;i++){
-    const y = TOP + i*ROW - offY;
-    if(y+ROW<0||y>h) continue;
+    const y = PLOT_TOP + laneY[i] - offY;
+    const lh = laneH[i];
+    if(y+lh<PLOT_TOP||y>h) continue;
     ctx.fillStyle = (i%2)? '#121829':'#0f1422';
-    ctx.fillRect(0,y,w,ROW);
+    ctx.fillRect(0,y,w,lh);
     const ln = LANES[i];
     ctx.fillStyle = ln.role==='decode' ? '#9fb4d8' : (ln.role==='prefill'?'#cdb88c':'#8a96ab');
-    ctx.fillText(ln.label, 8, y+LANE_H-3);
+    ctx.fillText(ln.label, 8, y + Math.min(lh-4, 12));
+    // concurrency badge for lanes that fan out (depth > 1)
+    if((ln.depth||1) > 1){
+      ctx.fillStyle = '#ff8f8f';
+      ctx.font='10px ui-monospace,monospace';
+      ctx.fillText('\u00d7'+ln.depth+(stacked?'':' \u26a0'), 8, y + Math.min(lh-4, 12) + 12);
+      ctx.font='11px ui-monospace,monospace';
+    }
   }
+  ctx.restore();
   // separator under labels
   ctx.strokeStyle='#2a3550'; ctx.beginPath(); ctx.moveTo(LEFT,0); ctx.lineTo(LEFT,h); ctx.stroke();
 
   // --- bars ---
   ctx.save();
-  ctx.beginPath(); ctx.rect(LEFT,TOP-6,w-LEFT,h); ctx.clip();
+  ctx.beginPath(); ctx.rect(LEFT,PLOT_TOP,w-LEFT,h-PLOT_TOP); ctx.clip();
   for(let i=0;i<LANES.length;i++){
-    const y = TOP + i*ROW - offY;
-    if(y+ROW<0||y>h) continue;
+    const y = PLOT_TOP + laneY[i] - offY;
+    const lh = laneH[i];
+    if(y+lh<PLOT_TOP||y>h) continue;
+    const sh = subH[i];
     for(const b of laneBars[i]){
       let x0 = tickToX(b.a), x1 = tickToX(b.b);
       if(x1<LEFT||x0>w) continue;
       let bw = Math.max(1, x1-x0);
-      const col = colorFor(b);
+      const kv = isKV(b);
+      // sub-row placement: stacked -> each track its own slot; flat -> overlap
+      const k = stacked ? (b.k||0) : 0;
+      const by = y + k*sh + 1;
+      const bh = sh - 2;
+      let col = colorFor(b);
       if(b.w){ // wait-dominated -> hollow/light to show it's mostly blocked
         ctx.fillStyle = col+'33';
-        ctx.fillRect(x0, y+1, bw, LANE_H-2);
+        ctx.fillRect(x0, by, bw, bh);
         ctx.strokeStyle = col; ctx.lineWidth=1;
-        ctx.strokeRect(x0+0.5, y+1.5, Math.max(1,bw-1), LANE_H-3);
+        ctx.strokeRect(x0+0.5, by+0.5, Math.max(1,bw-1), Math.max(1,bh-1));
       }else{
         ctx.fillStyle = col;
-        ctx.fillRect(x0, y+1, bw, LANE_H-2);
+        ctx.fillRect(x0, by, bw, bh);
+        // outline KV transfers when stacked so adjacent tracks stay distinct
+        if(kv && stacked && bh>=5){
+          ctx.strokeStyle='#0e1320'; ctx.lineWidth=1;
+          ctx.strokeRect(x0+0.5, by+0.5, Math.max(1,bw-1), bh-1);
+        }
       }
     }
   }
@@ -1404,10 +1422,10 @@ function draw(){
     if(tick==null) return;
     const x=tickToX(tick); if(x<LEFT||x>w) return;
     ctx.strokeStyle=color; ctx.lineWidth=2; ctx.setLineDash([5,4]);
-    ctx.beginPath(); ctx.moveTo(x,TOP-6); ctx.lineTo(x,h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x,PLOT_TOP); ctx.lineTo(x,h); ctx.stroke();
     ctx.setLineDash([]);
     ctx.fillStyle=color; ctx.font='bold 11px ui-monospace,monospace';
-    const ty = TOP+10 + (tier||0)*15;
+    const ty = PLOT_TOP+14 + (tier||0)*15;
     ctx.fillText(label, x+4, ty);
   }
   marker(ttftX,'#ff6b6b','TTFT '+fmtTime(ttftX!=null?ttftX-t0:null), 0);
@@ -1416,25 +1434,36 @@ function draw(){
   ctx.restore();
 }
 
+
 // --- hit testing for tooltip ---
+function laneAt(py){
+  const yl = py - PLOT_TOP + offY;         // y within lane content space
+  if(yl < 0) return -1;
+  // laneY is sorted ascending; small N so linear scan is fine
+  for(let i=0;i<LANES.length;i++){
+    if(yl >= laneY[i] && yl < laneY[i] + laneH[i]) return i;
+  }
+  return -1;
+}
 function hit(px,py){
-  if(px<LEFT) return null;
-  const i = Math.floor((py + offY - TOP)/ROW);
-  if(i<0||i>=LANES.length) return null;
-  const y = TOP + i*ROW - offY;
-  if(py<y+1||py>y+LANE_H-1) return null;
+  if(px<LEFT || py<PLOT_TOP) return null;
+  const i = laneAt(py);
+  if(i<0) return null;
+  const laneTop = laneY[i];
+  const within = (py - PLOT_TOP + offY) - laneTop;   // offset inside the lane
+  const sh = subH[i];
+  const k = stacked ? Math.floor(within / sh) : -1;  // -1 = any sub-row (flat)
   const t = xToTick(px);
-  // search bars in lane; prefer the narrowest containing bar (so thin bars win)
+  // prefer the narrowest containing bar (thin bars win); restrict to sub-row k
   let best=null, bestW=Infinity;
   for(const b of laneBars[i]){
+    if(stacked && (b.k||0)!==k) continue;
+    const bwT=b.b-b.a;
     if(t>=b.a && t<=b.b){
-      // also require pixel proximity for zero-width
-      const w=b.b-b.a;
-      if(w<bestW){best=b;bestW=w;}
+      if(bwT<bestW){best=b;bestW=bwT;}
     } else {
-      // allow clicking a sub-pixel bar within 4px
       const x0=tickToX(b.a),x1=tickToX(b.b);
-      if(px>=x0-3 && px<=x1+3){ if((b.b-b.a)<bestW){best=b;bestW=b.b-b.a;} }
+      if(px>=x0-3 && px<=x1+3){ if(bwT<bestW){best=b;bestW=bwT;} }
     }
   }
   return best ? {bar:best, lane:LANES[i]} : null;
@@ -1448,6 +1477,9 @@ function showTip(h, px, py){
   html += '<div class="row">duration: <span>'+fmtTime(b.b-b.a)+'</span></div>';
   if(b.s!=null && b.s>0){
     html += '<div class="row">payload: <span>'+(b.s/1e6).toFixed(2)+' MB</span> &middot; eff.bw: <span>'+(b.d!=null?b.d.toFixed(2)+' GB/s':'n/a')+'</span></div>';
+  }
+  if(isKV(b) && stacked && (ln.depth||1)>1){
+    html += '<div class="row">concurrent transfers in this lane: <span style="color:#ff9a9a">'+ln.depth+'</span></div>';
   }
   if(b.w){ html += '<div class="warn">&#9888; wait-dominated &mdash; scheduled early, mostly blocked; reported bandwidth unreliable</div>'; }
   tip.innerHTML=html;
@@ -1470,7 +1502,7 @@ window.addEventListener('mousemove',e=>{
     moved=true;
     offX += e.clientX-lastX;
     offY -= e.clientY-lastY;
-    offY = Math.max(0, Math.min(offY, Math.max(0, contentH - cv.clientHeight)));
+    offY = Math.max(0, Math.min(offY, maxScroll()));
     lastX=e.clientX; lastY=e.clientY;
     tip.style.display='none';
     draw();
@@ -1487,7 +1519,7 @@ cv.addEventListener('wheel',e=>{
   const px=e.clientX-rect.left, py=e.clientY-rect.top;
   if(e.shiftKey){
     offY += e.deltaY;
-    offY = Math.max(0, Math.min(offY, Math.max(0, contentH - cv.clientHeight)));
+    offY = Math.max(0, Math.min(offY, maxScroll()));
   }else{
     const tAtCursor = xToTick(px);
     const factor = Math.exp(-e.deltaY*0.0015);
@@ -1503,6 +1535,17 @@ document.getElementById('reset').onclick=fitWidth;
 document.getElementById('fit').onclick=fitWidth;
 document.getElementById('zin').onclick=()=>{ scaleX*=1.4; draw(); };
 document.getElementById('zout').onclick=()=>{ scaleX/=1.4; draw(); };
+
+const stackBtn=document.getElementById('stack');
+stackBtn.onclick=()=>{
+  stacked=!stacked;
+  stackBtn.classList.toggle('active',stacked);
+  stackBtn.textContent = stacked ? 'Hide concurrent comms' : 'Show concurrent comms';
+  computeLayout();
+  offY=Math.max(0, Math.min(offY, maxScroll()));
+  draw();
+};
+stackBtn.textContent='Hide concurrent comms';   // starts shown (stacked)
 
 // legend
 const lg=document.getElementById('legend');
@@ -1574,6 +1617,62 @@ def build_timeline_html(df, metrics, roles, title):
             bar["w"] = bool(r.wait_dominated)
         bars.append(bar)
 
+    # ---- sub-row packing --------------------------------------------------- #
+    # Within a single lane many communications can be *in flight at the same
+    # time* (this is exactly the concurrent KV-cache transfer behaviour we want
+    # to expose).  Drawn flat, they stack on top of each other and look like one
+    # solid block.  We greedily partition each lane's bars into the minimum
+    # number of non-overlapping tracks ("sub-rows"), so every concurrent
+    # transfer gets its own visible slot.  `k` = sub-row index, and the lane's
+    # `depth` = how many transfers are concurrent at its busiest instant.
+    from collections import defaultdict
+    lane_bar_idx = defaultdict(list)
+    for bi, b in enumerate(bars):
+        lane_bar_idx[b["l"]].append(bi)
+
+    for li in range(len(lanes)):
+        idxs = lane_bar_idx.get(li, [])
+        idxs.sort(key=lambda i: (bars[i]["a"], bars[i]["b"]))
+        track_end = []                       # last end tick per open track
+        for i in idxs:
+            a, bnd = bars[i]["a"], bars[i]["b"]
+            slot = None
+            for k in range(len(track_end)):
+                if track_end[k] <= a:        # this track is free again
+                    slot = k
+                    break
+            if slot is None:
+                slot = len(track_end)
+                track_end.append(bnd)
+            else:
+                track_end[slot] = bnd
+            bars[i]["k"] = slot
+        lanes[li]["depth"] = max(1, len(track_end))
+
+    # ---- peak concurrent KV transfers (header metric) ---------------------- #
+    # Count how many KV-cache transfers are simultaneously on the wire at the
+    # busiest instant.  Prefer the SEND side (real transmit-side transfers) so
+    # paired send/recv rows are not double counted.
+    kv_vis = vis[vis["category"] == "KV"]
+    if "comm_role" in kv_vis.columns and (kv_vis["comm_role"] == "send").any():
+        kv_prof_rows = kv_vis[kv_vis["comm_role"] == "send"]
+    else:
+        kv_prof_rows = kv_vis
+
+    kv_peak = 0
+    if not kv_prof_rows.empty:
+        evs = []
+        for a, b in zip(kv_prof_rows["start_tick"], kv_prof_rows["end_tick"]):
+            a, b = int(a), int(b)
+            if b > a:
+                evs.append((a, 1))
+                evs.append((b, -1))
+        evs.sort(key=lambda e: e[0])
+        cur = 0
+        for _, d in evs:
+            cur += d
+            kv_peak = max(kv_peak, cur)
+
     data = {
         "t0": metrics["t0"],
         "tEnd": metrics["t_end"],
@@ -1584,6 +1683,7 @@ def build_timeline_html(df, metrics, roles, title):
         "cats": cats,
         "colors": {c: CAT_COLORS.get(c, "#888") for c in cats},
         "bars": bars,
+        "kvPeak": int(kv_peak),
     }
 
     html = (HTML_TEMPLATE
@@ -1593,6 +1693,7 @@ def build_timeline_html(df, metrics, roles, title):
             .replace("__KVEXP__", fmt_time(metrics.get("kv_exposure_ns")))
             .replace("__SECOND__", fmt_time(metrics["second_token_ns"]))
             .replace("__TPOT__", fmt_time(metrics["tpot_ns"]))
+            .replace("__KVPEAK__", f"{data['kvPeak']}\u00d7")
             .replace("__MAKESPAN__", fmt_time(metrics["makespan_ns"])))
     return html
 
