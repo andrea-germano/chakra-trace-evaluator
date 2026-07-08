@@ -5,7 +5,7 @@
   "endpoint-delay": 10,
   "active-chunks-per-dimension": 2,
   "preferred-dataset-splits": 4,
-  "all-reduce-implementation": ["direct"],
+  "all-reduce-implementation": ["ring"],
   "all-gather-implementation": ["ring"],
   "reduce-scatter-implementation": ["ring"],
   "all-to-all-implementation": ["ring"],
