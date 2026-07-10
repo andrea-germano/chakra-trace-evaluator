@@ -26,7 +26,8 @@ qlen.txt  (writer: monitor_buffer, common.h:159)
     - a port is only emitted when its occupancy >= 1000 B.
     - switch_node_id == node id (nodes are created in order 0..N-1).
 
-topology (optional, --topology): enables port -> neighbor labelling.
+topology (enables port -> neighbour labelling): auto-detected at
+    configs/astra_sim/ns3/<run>/physical_topology.txt (override with --topology).
     line1: node_num switch_num link_num
     line2: <switch node ids ...>
     then link_num lines: src dst rate delay error
@@ -34,7 +35,12 @@ topology (optional, --topology): enables port -> neighbor labelling.
     so a switch port j maps to the j-th link (file order) that touches that switch.
     A host-facing switch port is where incast lands.
 
-BUFFER_SIZE in the config is per-switch, in MiB (common.h:746 -> *1024*1024).
+BUFFER_SIZE is per-switch, in MiB (common.h:746 -> *1024*1024).  Crucially it is a
+    SHARED pool across all ports and queues of the switch: switch-mmu.cc keeps a
+    single shared_used_bytes counter and the dynamic PFC threshold is
+    (buffer_size - headroom - reserve - shared_used_bytes) >> a_shift.  So the metric
+    that governs PFC is the per-SWITCH aggregate occupancy (sum of its ports at each
+    sample = one qlen.txt line), NOT any single port versus the full buffer.
 
 --------------------------------------------------------------------------------
 USAGE
@@ -60,6 +66,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 from collections import defaultdict
 
@@ -223,15 +230,26 @@ def parse_fct(path, bulk_bytes):
     d = dict(n=0, sizes=[], starts=[], fcts=[], sfcts=[], slow=[], slow_bulk=[],
              sd_size=[], sd_start=[], worst=[], run_end=0,
              per_dst_bulk=defaultdict(int), per_dst_bytes=defaultdict(int),
-             per_dst_slow=defaultdict(list))
+             per_dst_slow=defaultdict(list),
+             # --- sanity / self-diagnosis ---
+             raw_lines=0, skipped_short=0, skipped_badnum=0, sfct_nonpos=0,
+             slow_lt1=0, ncols=None, sample=None, ncol_hist=defaultdict(int))
     with open(path) as f:
         for line in f:
+            if not line.strip():
+                continue
+            d["raw_lines"] += 1
             p = line.split()
+            d["ncol_hist"][len(p)] += 1
+            if d["sample"] is None:
+                d["sample"] = line.rstrip("\n"); d["ncols"] = len(p)
             if len(p) < 8:
+                d["skipped_short"] += 1
                 continue
             try:
                 size = int(p[4]); start = int(p[5]); fct = int(p[6]); sfct = int(p[7])
             except ValueError:
+                d["skipped_badnum"] += 1
                 continue
             d["n"] += 1
             d["sizes"].append(size); d["starts"].append(start); d["fcts"].append(fct)
@@ -240,6 +258,8 @@ def parse_fct(path, bulk_bytes):
             src = ip_to_node(p[0]); dst = ip_to_node(p[1])
             if sfct > 0:
                 sd = fct / sfct
+                if sd < 0.999:
+                    d["slow_lt1"] += 1
                 d["slow"].append(sd); d["sd_size"].append(size); d["sd_start"].append(start)
                 d["worst"].append((sd, size, src, dst, fct, start))
                 d["per_dst_slow"][dst].append(sd)
@@ -247,6 +267,8 @@ def parse_fct(path, bulk_bytes):
                     d["slow_bulk"].append(sd)
                     d["per_dst_bulk"][dst] += 1
                     d["per_dst_bytes"][dst] += size
+            else:
+                d["sfct_nonpos"] += 1
     return d
 
 def parse_pfc(path):
@@ -292,10 +314,20 @@ def pfc_intervals(ev, clamp_end):
 
 def parse_qlen(path):
     """Full parse into per-(switch,port) time series (for plots) plus histograms
-    (for robust percentiles on huge files)."""
-    series = defaultdict(lambda: ([], []))         # key -> (times[], bytes[])
-    hist = defaultdict(lambda: defaultdict(int))   # key -> {kb: count}
+    (robust percentiles on huge files).
+
+    The switch buffer is a single SHARED pool (switch-mmu.cc: shared_used_bytes is
+    switch-wide, and GetPfcThreshold subtracts it from buffer_size).  Each qlen.txt
+    line is one switch at one timestamp listing all its congested ports, so the sum
+    over that line is the switch's shared-pool occupancy at that sample.  We track
+    that aggregate per switch as well as the per-port detail."""
+    series = defaultdict(lambda: ([], []))         # (sw,port) -> (times[], bytes[])
+    hist = defaultdict(lambda: defaultdict(int))   # (sw,port) -> {kb: count}
     mx = defaultdict(int); cnt = defaultdict(int); ssum = defaultdict(int)
+    # per-switch shared-pool aggregate (sum over ports per sample):
+    sw_series = defaultdict(lambda: ([], []))      # sw -> (times[], total_bytes[])
+    sw_hist = defaultdict(lambda: defaultdict(int))
+    sw_mx = defaultdict(int); sw_cnt = defaultdict(int); sw_ssum = defaultdict(int)
     tmin = None; tmax = 0
     with open(path) as f:
         for line in f:
@@ -307,7 +339,7 @@ def parse_qlen(path):
             except ValueError:
                 continue
             tmin = t if tmin is None else min(tmin, t); tmax = max(tmax, t)
-            i = 3
+            i = 3; line_total = 0
             while i + 2 <= len(p):
                 if p[i] == "j":
                     try:
@@ -320,10 +352,19 @@ def parse_qlen(path):
                     cnt[key] += 1; ssum[key] += b
                     if b > mx[key]:
                         mx[key] = b
+                    line_total += b
                     i += 3
                 else:
                     i += 1
+            # record the switch-wide shared-pool sample
+            sts, sbs = sw_series[sw]; sts.append(t); sbs.append(line_total)
+            sw_hist[sw][line_total // 1000] += 1
+            sw_cnt[sw] += 1; sw_ssum[sw] += line_total
+            if line_total > sw_mx[sw]:
+                sw_mx[sw] = line_total
     return dict(series=series, hist=hist, mx=mx, cnt=cnt, ssum=ssum,
+                sw_series=sw_series, sw_hist=sw_hist, sw_mx=sw_mx,
+                sw_cnt=sw_cnt, sw_ssum=sw_ssum,
                 tmin=tmin or 0, tmax=tmax)
 
 def hpct(h, total, pp):
@@ -355,6 +396,39 @@ class Report:
 #  TEXT REPORT
 # ============================================================================ #
 def report_fct(say, d, bulk_bytes):
+    # ---- parse sanity: catch a wrong column layout before trusting anything ----
+    say("  --- parse sanity (fct.txt layout is the astra-sim frontend's, not this "
+        "repo's) ---")
+    cols = sorted(d["ncol_hist"].items(), key=lambda x: -x[1])
+    col_desc = ", ".join(f"{c}c×{n}" for c, n in cols[:4]) if cols else "-"
+    say(f"    lines read {d['raw_lines']} | parsed {d['n']} | "
+        f"skipped(<8 cols) {d['skipped_short']} | skipped(non-numeric) "
+        f"{d['skipped_badnum']} | column-counts: {col_desc}")
+    if d["sample"]:
+        say(f"    first line: {d['sample']}")
+        say("    expected  : sip  dip  sport dport size(B) start(ns) fct(ns) "
+            "standalone_fct(ns)")
+    if d["sizes"]:
+        say(f"    ranges: size [{min(d['sizes'])}..{max(d['sizes'])}] B | "
+            f"fct [{min(d['fcts'])}..{max(d['fcts'])}] ns | "
+            f"sfct [{min(d['sfcts'])}..{max(d['sfcts'])}] ns")
+    warned = False
+    if d["slow_lt1"] > 0.02 * max(d["n"], 1):
+        say(f"    [!] {d['slow_lt1']} flows have slowdown < 1 (fct < standalone_fct). "
+            "Slowdown < 1 is physically impossible, so columns 5-8 (size/start/fct/"
+            "standalone) are likely NOT where I expect — check the first line above.")
+        warned = True
+    if d["skipped_short"] > 0.5 * max(d["raw_lines"], 1):
+        say("    [!] more than half the lines have <8 columns: the fct.txt format "
+            "differs from what I parse. Send me one line and I'll adjust the indices.")
+        warned = True
+    if d["sfct_nonpos"] > 0:
+        say(f"    note: {d['sfct_nonpos']} flows had standalone_fct <= 0 "
+            "(excluded from slowdown).")
+    if not warned:
+        say("    OK: columns look consistent and slowdown >= 1 as expected.")
+    say("")
+
     if d["n"] == 0:
         say("  (no valid flows)"); return
     say(f"  total flows          : {d['n']}")
@@ -418,28 +492,49 @@ def report_pfc(say, pfcd, totals, run_span, portmap, switch_ids):
 def report_qlen(say, qd, buffer_bytes, portmap, switch_ids, top):
     if not qd["cnt"]:
         say("  (no congested port recorded — queues always < 1KB: DCQCN regime)")
-        return dict(ports=0, max_pct=0.0, near_buffer=0)
-    say(f"  buffer per switch    : {fmt_bytes(buffer_bytes)}")
-    say(f"  congested ports      : {len(qd['cnt'])}")
-    say("\n  Egress queue occupancy per (switch,port), sorted by MAX:")
-    say(f"    {'switch':>6} {'port':>16}  {'max':>10} {'% buf':>6}  {'mean':>10}  {'p99':>10}")
+        return dict(ports=0, switches=0, max_pct=0.0, near_buffer=0)
+    say(f"  buffer per switch    : {fmt_bytes(buffer_bytes)}  (SHARED across all ports)")
+    say(f"  switches with traffic: {len(qd['sw_cnt'])}   congested ports: {len(qd['cnt'])}")
+    win = qd["tmax"] - qd["tmin"]
+    say(f"  sampled window       : {fmt_ns(qd['tmin'])} .. {fmt_ns(qd['tmax'])}  "
+        f"(span {fmt_ns(win)})")
+    say("    NB: only ports with >= 1KB are logged, and only within "
+        "[QLEN_MON_START, QLEN_MON_END]. A short window or a well-behaved DCQCN run "
+        "both make this look sparse.")
+
+    # --- primary view: switch-wide shared-pool occupancy (drives PFC) --------
+    say("\n  Shared-pool occupancy per SWITCH (sum of all ports = what PFC watches):")
+    say(f"    {'switch':>6}  {'max':>10} {'% buf':>6}  {'mean':>10}  {'p99':>10}")
     near_buffer = 0; max_pct = 0.0
+    for sw in sorted(qd["sw_cnt"], key=lambda s: -qd["sw_mx"][s]):
+        m = qd["sw_mx"][sw]; av = qd["sw_ssum"][sw] / qd["sw_cnt"][sw]
+        p99 = hpct(qd["sw_hist"][sw], qd["sw_cnt"][sw], 0.99)
+        pctbuf = 100 * m / buffer_bytes; max_pct = max(max_pct, pctbuf)
+        flag = "  <== pool near buffer (PFC/overshoot)" if pctbuf >= 80 else ""
+        if pctbuf >= 80:
+            near_buffer += 1
+        say(f"    {sw:>6}  {fmt_bytes(m):>10} {pctbuf:5.1f}%  "
+            f"{fmt_bytes(av):>10}  {fmt_bytes(p99):>10}{flag}")
+
+    # --- secondary view: which ports fill the pool ---------------------------
+    say("\n  Per-port occupancy (share of the switch's shared buffer), sorted by MAX:")
+    say(f"    {'switch':>6} {'port':>16}  {'max':>10} {'% buf':>6}  {'mean':>10}  {'p99':>10}")
     for key in sorted(qd["cnt"], key=lambda k: -qd["mx"][k])[:max(top, 15)]:
         sw, port = key
         m = qd["mx"][key]; av = qd["ssum"][key] / qd["cnt"][key]
         p99 = hpct(qd["hist"][key], qd["cnt"][key], 0.99)
-        pctbuf = 100 * m / buffer_bytes; max_pct = max(max_pct, pctbuf)
+        pctbuf = 100 * m / buffer_bytes
         lbl = port_label(sw, port, portmap, switch_ids)
-        flag = "  <== close to buffer limit (PFC)" if pctbuf >= 80 else ""
-        if pctbuf >= 80:
-            near_buffer += 1
+        flag = "  <== dominates the pool" if pctbuf >= 50 else ""
         say(f"    {sw:>6} {lbl:>16}  {fmt_bytes(m):>10} {pctbuf:5.1f}%  "
             f"{fmt_bytes(av):>10}  {fmt_bytes(p99):>10}{flag}")
-    say(f"\n  Ports with max >= 80% of buffer : {near_buffer}  "
-        f"(many => PFC/overshoot regime; zero => DCQCN regime)")
-    say("  NB: the monitor only logs a port when the queue >= 1KB, so 'mean'")
-    say("      is over the active phase, not the whole run. MAX remains reliable.")
-    return dict(ports=len(qd["cnt"]), max_pct=max_pct, near_buffer=near_buffer)
+
+    say(f"\n  Switches whose shared pool hit >= 80% of buffer : {near_buffer}  "
+        f"(>=1 => PFC/overshoot regime; zero => DCQCN regime)")
+    say("  NB: the monitor logs a port only when its queue >= 1KB, so 'mean' is over")
+    say("      the active phase, not the whole run. MAX remains reliable.")
+    return dict(ports=len(qd["cnt"]), switches=len(qd["sw_cnt"]),
+                max_pct=max_pct, near_buffer=near_buffer)
 
 # ============================================================================ #
 #  REGIME VERDICT  (quantitative DCQCN vs PFC classification)
@@ -648,93 +743,135 @@ def plot_pfc(pfcd, intervals, totals, run_span, portmap, switch_ids, top, out, d
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     return _finish(fig, out, dpi)
 
+def _downsample(ts, ys, n=3000):
+    ts = np.asarray(ts, float); ys = np.asarray(ys, float)
+    order = np.argsort(ts); ts, ys = ts[order], ys[order]
+    if len(ts) > n:
+        idx = np.linspace(0, len(ts) - 1, n).astype(int)
+        ts, ys = ts[idx], ys[idx]
+    return ts, ys
+
 def plot_qlen(qd, buffer_bytes, portmap, switch_ids, top, out, dpi):
-    """per-port max/p99/mean vs buffer + occupancy time-series + heatmap."""
-    fig = plt.figure(figsize=(13, 9.5))
-    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.15])
-    fig.suptitle("QLEN — egress queue occupancy vs buffer",
-                 fontsize=15, fontweight="bold")
+    """The switch buffer is a SHARED pool, so the decisive view is per-switch
+    aggregate occupancy vs buffer.  Panels:
+      (a) per-switch shared-pool max/p99/mean vs buffer
+      (b) per-switch shared-pool occupancy over time
+      (c) hottest switch: how its ports compose the shared pool over time
+      (d) per-port occupancy heatmap (locate the exact hot port)."""
+    fig = plt.figure(figsize=(13.5, 10))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.12], hspace=0.34, wspace=0.22)
+    fig.suptitle("QLEN — shared-buffer occupancy (buffer is per-switch, shared "
+                 "across ports)", fontsize=15, fontweight="bold")
+    buf_kb = buffer_bytes / 1024
+    t0 = qd["tmin"]; span = max(qd["tmax"] - qd["tmin"], 1)
 
-    ranked = sorted(qd["cnt"], key=lambda k: -qd["mx"][k])[:top]
-    labels = [f"sw{sw}:{port_label(sw, port, portmap, switch_ids)}"
-              for (sw, port) in ranked]
+    sw_ranked = sorted(qd["sw_cnt"], key=lambda s: -qd["sw_mx"][s])
+    port_ranked = sorted(qd["cnt"], key=lambda k: -qd["mx"][k])[:top]
 
-    # (a) max / p99 / mean vs buffer -----------------------------------------
-    ax = fig.add_subplot(gs[0, :])
-    if ranked:
-        mx = np.array([qd["mx"][k] for k in ranked]) / 1024
-        p99 = np.array([hpct(qd["hist"][k], qd["cnt"][k], 0.99) for k in ranked]) / 1024
-        av = np.array([qd["ssum"][k] / qd["cnt"][k] for k in ranked]) / 1024
-        x = np.arange(len(ranked)); w = 0.26
+    # (a) per-switch shared-pool vs buffer -----------------------------------
+    ax = fig.add_subplot(gs[0, 0])
+    if sw_ranked:
+        sws = sw_ranked[:max(top, 8)]
+        mx = np.array([qd["sw_mx"][s] for s in sws]) / 1024
+        p99 = np.array([hpct(qd["sw_hist"][s], qd["sw_cnt"][s], 0.99) for s in sws]) / 1024
+        av = np.array([qd["sw_ssum"][s] / qd["sw_cnt"][s] for s in sws]) / 1024
+        x = np.arange(len(sws)); w = 0.26
         ax.bar(x - w, mx, w, color=CORAL, label="max")
         ax.bar(x, p99, w, color=AMBER, label="p99")
         ax.bar(x + w, av, w, color=COOL, label="mean (active)")
-        buf_kb = buffer_bytes / 1024
         ax.axhline(buf_kb, color=INK, ls="--", lw=1.4)
-        ax.text(len(ranked) - 0.5, buf_kb, " buffer", va="bottom", ha="right",
+        ax.text(len(sws) - 0.5, buf_kb, " buffer", va="bottom", ha="right",
                 fontsize=9, color=INK)
         ax.axhline(0.8 * buf_kb, color=CORAL, ls=":", lw=1)
-        ax.text(len(ranked) - 0.5, 0.8 * buf_kb, " 80% (PFC risk)", va="bottom",
+        ax.text(len(sws) - 0.5, 0.8 * buf_kb, " 80% (PFC risk)", va="bottom",
                 ha="right", fontsize=8, color=CORAL)
-        ax.set_xticks(x); ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=8)
-        ax.set_ylabel("queue occupancy (KB)")
-        ax.set_title("(a) per-port occupancy vs shared buffer  (bars near the dashed "
-                     "line => overshoot => PFC)")
+        ax.set_xticks(x); ax.set_xticklabels([f"sw{s}" for s in sws], fontsize=9)
+        ax.set_ylabel("shared-pool occupancy (KB)")
+        ax.set_title("(a) per-switch pool vs buffer — bars near the line = overshoot")
         ax.legend(loc="upper right")
     else:
-        _empty_panel(ax, "no congested ports (DCQCN regime)")
+        _empty_panel(ax, "no congested switches (DCQCN regime)")
 
-    # (b) occupancy time-series ----------------------------------------------
+    # (b) per-switch shared-pool over time -----------------------------------
+    ax = fig.add_subplot(gs[0, 1])
+    if sw_ranked:
+        for s in sw_ranked[:8]:
+            ts, bs = _downsample(*qd["sw_series"][s])
+            ax.plot((ts - t0) / 1e3, bs / 1024, lw=1.3, label=f"sw{s}")
+        ax.axhline(buf_kb, color=INK, ls="--", lw=1.2)
+        ax.text((span) / 1e3, buf_kb, " buffer", va="bottom", ha="right",
+                fontsize=8, color=INK)
+        ax.set_xlabel("time since first sample (us)")
+        ax.set_ylabel("shared-pool occupancy (KB)")
+        ax.set_title("(b) pool fill over time — standing vs transient")
+        ax.legend(fontsize=8, ncol=2, loc="upper right")
+    else:
+        _empty_panel(ax, "no queue samples")
+
+    # (c) composition of the hottest switch's shared pool --------------------
     ax = fig.add_subplot(gs[1, 0])
-    if ranked:
-        t0 = qd["tmin"]
-        for k, lab in list(zip(ranked, labels))[:6]:
-            ts, bs = qd["series"][k]
-            ts = np.asarray(ts, float); bs = np.asarray(bs, float) / 1024
-            order = np.argsort(ts); ts, bs = ts[order], bs[order]
-            if len(ts) > 3000:                     # downsample for readability
-                idx = np.linspace(0, len(ts) - 1, 3000).astype(int)
-                ts, bs = ts[idx], bs[idx]
-            ax.plot((ts - t0) / 1e3, bs, lw=1.1, label=lab)
-        ax.axhline(buffer_bytes / 1024, color=INK, ls="--", lw=1.2)
+    if sw_ranked:
+        hot = sw_ranked[0]
+        ports = [k for k in port_ranked if k[0] == hot]
+        if not ports:
+            ports = sorted([k for k in qd["cnt"] if k[0] == hot],
+                           key=lambda k: -qd["mx"][k])
+        ports = ports[:8]
+        nb = 200
+        edges = np.linspace(t0, t0 + span, nb + 1)
+        ctr = (edges[:-1] + edges[1:]) / 2
+        stacks = []
+        for k in ports:
+            ts = np.asarray(qd["series"][k][0], float)
+            bs = np.asarray(qd["series"][k][1], float)
+            idx = np.clip(np.digitize(ts, edges) - 1, 0, nb - 1)
+            binned = np.zeros(nb)
+            for b, v in zip(idx, bs):
+                if v > binned[b]:
+                    binned[b] = v            # max per bin
+            stacks.append(binned / 1024)
+        palette = [CORAL, AMBER, TEAL, COOL, VIOLET, OKGREEN, "#b07aa1", "#9c755f"]
+        labs = [port_label(hot, p, portmap, switch_ids) for (_, p) in ports]
+        ax.stackplot((ctr - t0) / 1e3, *stacks, labels=labs,
+                     colors=[palette[i % len(palette)] for i in range(len(stacks))],
+                     alpha=0.9)
+        ax.axhline(buf_kb, color=INK, ls="--", lw=1.2)
         ax.set_xlabel("time since first sample (us)")
         ax.set_ylabel("occupancy (KB)")
-        ax.set_title("(b) occupancy over time — standing queue vs transient burst")
+        ax.set_title(f"(c) sw{hot}: which ports fill the shared pool")
         ax.legend(fontsize=7, ncol=2, loc="upper right")
     else:
         _empty_panel(ax, "no queue samples")
 
-    # (c) heatmap: port x time -----------------------------------------------
+    # (d) per-port occupancy heatmap -----------------------------------------
     ax = fig.add_subplot(gs[1, 1])
-    if ranked:
-        t0 = qd["tmin"]; span = max(qd["tmax"] - qd["tmin"], 1)
+    if port_ranked:
         nb = 160
         edges = np.linspace(t0, t0 + span, nb + 1)
-        rows = ranked[:min(len(ranked), 16)]
+        rows = port_ranked[:min(len(port_ranked), 16)]
         M = np.full((len(rows), nb), np.nan)
         for r, k in enumerate(rows):
-            ts, bs = qd["series"][k]
-            ts = np.asarray(ts, float); bs = np.asarray(bs, float)
+            ts = np.asarray(qd["series"][k][0], float)
+            bs = np.asarray(qd["series"][k][1], float)
             idx = np.clip(np.digitize(ts, edges) - 1, 0, nb - 1)
-            for b, val in zip(idx, bs):            # max per bin
+            for b, val in zip(idx, bs):
                 cur = M[r, b]
                 M[r, b] = val if (np.isnan(cur) or val > cur) else cur
         cmap = _heat_cmap(); cmap.set_bad(PANEL)
         im = ax.imshow(M / 1024, aspect="auto", cmap=cmap, origin="upper",
                        extent=[0, span / 1e3, len(rows), 0],
-                       norm=Normalize(vmin=0, vmax=buffer_bytes / 1024))
+                       norm=Normalize(vmin=0, vmax=buf_kb))
         ax.set_yticks(np.arange(len(rows)) + 0.5)
         ax.set_yticklabels([f"sw{sw}:{port_label(sw, p, portmap, switch_ids)}"
                             for (sw, p) in rows], fontsize=7)
         ax.set_xlabel("time since first sample (us)")
-        ax.set_title("(c) occupancy heatmap (KB) — hot rows are bottleneck ports")
+        ax.set_title("(d) per-port heatmap — hot rows are the bottleneck ports")
         cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
         cb.set_label("KB (full scale = buffer)", fontsize=8)
         ax.grid(False)
     else:
         _empty_panel(ax, "no queue samples")
 
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
     return _finish(fig, out, dpi)
 
 def plot_overview(regime, fct_s, pfc_s, qlen_s, run_name, out, dpi):
@@ -767,7 +904,7 @@ def plot_overview(regime, fct_s, pfc_s, qlen_s, run_name, out, dpi):
                 transform=ax.transAxes, va="center")
 
     mb = regime["max_buf_pct"]
-    tile(0.02, "peak queue vs buffer", f"{mb:.0f}%",
+    tile(0.02, "peak shared pool / buffer", f"{mb:.0f}%",
          "≥80% → overshoot/PFC",
          "good" if mb < 50 else ("warn" if mb < 80 else "bad"))
     pf = regime["pause_frac"]
@@ -793,6 +930,14 @@ def plot_overview(regime, fct_s, pfc_s, qlen_s, run_name, out, dpi):
 # ============================================================================ #
 #  MAIN
 # ============================================================================ #
+def buffer_mb_from_name(run_name):
+    """Extract the per-switch buffer (MiB) from the run name, e.g.
+    'T1_bx200_dcqcn_buf2' -> 2.0.  The token always follows 'buf' but is not
+    necessarily at the end; 'bx200' etc. are ignored because we anchor on 'buf'
+    immediately followed by digits.  Returns None if absent."""
+    m = re.search(r"buf(\d+(?:\.\d+)?)", run_name, re.IGNORECASE)
+    return float(m.group(1)) if m else None
+
 def resolve_input(folder):
     if os.path.isdir(folder):
         return os.path.abspath(folder)
@@ -802,6 +947,43 @@ def resolve_input(folder):
         return os.path.abspath(cand)
     return None
 
+def resolve_topology(explicit, run_name, folder):
+    """Locate the physical topology file automatically (no flag needed).  Priority:
+      1. --topology (explicit override);
+      2. configs/astra_sim/ns3/<run_name>/physical_topology.txt under any ancestor
+         of the run folder — the run lives at <root>/output/ns3/<run> and configs
+         at <root>/configs/..., so they share a project root; we also try the CWD
+         and this script's directory as fallback roots;
+      3. physical_topology.txt sitting inside the run folder itself."""
+    if explicit:
+        return explicit if os.path.isfile(explicit) else None
+    rel = os.path.join("configs", "astra_sim", "ns3", run_name, "physical_topology.txt")
+
+    def ancestors(start, depth=8):
+        d = os.path.abspath(start)
+        for _ in range(depth):
+            yield d
+            nd = os.path.dirname(d)
+            if nd == d:
+                break
+            d = nd
+
+    roots, seen = [], set()
+    # run folder first (most reliable), then CWD, then the script's directory
+    for base in (folder, os.getcwd(), os.path.dirname(os.path.abspath(__file__))):
+        for d in ancestors(base):
+            if d not in seen:
+                seen.add(d); roots.append(d)
+
+    for root in roots:
+        cand = os.path.join(root, rel)
+        if os.path.isfile(cand):
+            return cand
+    inside = os.path.join(folder, "physical_topology.txt")
+    if os.path.isfile(inside):
+        return inside
+    return None
+
 def main():
     ap = argparse.ArgumentParser(
         description="Analyze & visualize ns-3 output (fct/pfc/qlen) for one run.")
@@ -809,12 +991,15 @@ def main():
                     help="run subdir under output/ns3/, or a direct path to the run folder")
     ap.add_argument("--out-dir", default=None,
                     help="output directory (default: ./ns3_graphs/<run basename>)")
-    ap.add_argument("--buffer-mb", type=float, default=16.0,
-                    help="per-switch BUFFER_SIZE in MiB (default 16)")
+    ap.add_argument("--buffer-mb", type=float, default=None,
+                    help="per-switch BUFFER_SIZE in MiB. If omitted, taken from the "
+                         "run name (the number after 'buf', e.g. ...buf2 -> 2 MiB); "
+                         "falls back to 16 if the name has no 'buf' token.")
     ap.add_argument("--bulk-mb", type=float, default=1.0,
                     help="threshold in MB for a 'bulk' flow (KV/PP) (default 1)")
     ap.add_argument("--topology", default=None,
-                    help="topology file to label switch ports with their neighbour")
+                    help="topology file for port->neighbour labels. If omitted, "
+                         "auto-detected at configs/astra_sim/ns3/<run>/physical_topology.txt")
     ap.add_argument("--top", type=int, default=10,
                     help="how many worst links/ports to show (default 10)")
     ap.add_argument("--dpi", type=int, default=130, help="figure DPI (default 130)")
@@ -831,12 +1016,23 @@ def main():
     out_dir = args.out_dir or os.path.join(os.getcwd(), "ns3_graphs", run_name)
     os.makedirs(out_dir, exist_ok=True)
 
-    buffer_bytes = int(args.buffer_mb * 1024 * 1024)
+    # buffer size: explicit flag wins; else parse the 'buf<N>' token in the name;
+    # else fall back to 16 MiB.
+    if args.buffer_mb is not None:
+        buffer_mb, buf_src = args.buffer_mb, "--buffer-mb"
+    else:
+        parsed = buffer_mb_from_name(run_name)
+        if parsed is not None:
+            buffer_mb, buf_src = parsed, f"run name ('buf' token)"
+        else:
+            buffer_mb, buf_src = 16.0, "default (no 'buf' in name)"
+    buffer_bytes = int(buffer_mb * 1024 * 1024)
     bulk_bytes = int(args.bulk_mb * 1024 * 1024)
 
     portmap, switch_ids = {}, set()
-    if args.topology and os.path.isfile(args.topology):
-        switch_ids, portmap, _ = parse_topology(args.topology)
+    topo_path = resolve_topology(args.topology, run_name, folder)
+    if topo_path:
+        switch_ids, portmap, _ = parse_topology(topo_path)
 
     make_plots = HAVE_MPL and not args.no_plots
     if not HAVE_MPL and not args.no_plots:
@@ -847,7 +1043,13 @@ def main():
 
     say = Report()
     say(f"\nRun: {folder}")
+    say(f"Buffer: {buffer_mb:g} MiB per switch  (source: {buf_src})")
     say(f"Output: {out_dir}")
+    if topo_path:
+        say(f"Topology: {topo_path}  ({len(switch_ids)} switches)")
+    else:
+        say("Topology: not found — ports shown by index "
+            "(pass --topology or place it at configs/astra_sim/ns3/<run>/physical_topology.txt)")
 
     # ---- FCT ----------------------------------------------------------------
     say.header("FCT  (fct.txt) — per-flow slowdown, tail, incast")
@@ -899,7 +1101,7 @@ def main():
     # ---- write report + machine-readable summary ----------------------------
     say.save(os.path.join(out_dir, "report.txt"))
     summary = dict(run=run_name, folder=folder,
-                   buffer_mb=args.buffer_mb, bulk_mb=args.bulk_mb,
+                   buffer_mb=buffer_mb, buffer_source=buf_src, bulk_mb=args.bulk_mb,
                    fct=fct_s, pfc=pfc_s, qlen=qlen_s, regime=regime)
     with open(os.path.join(out_dir, "summary.json"), "w") as jf:
         json.dump(summary, jf, indent=2, default=lambda o: None)
