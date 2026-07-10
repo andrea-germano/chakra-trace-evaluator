@@ -5,9 +5,17 @@ MODEL_FILE_NAME="$1"
 NS3_SUBDIR="$2"
 OUTPUT_DIR_NAME="$3"
 
-[ -z "$MODEL_FILE_NAME" ] && read -p "Enter the model config file name without extension (e.g., bert_base): " MODEL_FILE_NAME
-[ -z "$NS3_SUBDIR" ] && read -p "Enter the name of the ns3 configuration subdirectory: " NS3_SUBDIR
-[ $# -lt 3 ] && read -p "Enter the output directory name (leave blank to use <model>/<ns3subdir>): " OUTPUT_DIR_NAME
+if [ -t 0 ]; then
+  [ -z "$MODEL_FILE_NAME" ] && read -p "Enter the model config file name without extension (e.g., bert_base): " MODEL_FILE_NAME
+  [ -z "$NS3_SUBDIR" ] && read -p "Enter the name of the ns3 configuration subdirectory: " NS3_SUBDIR
+  [ $# -lt 3 ] && read -p "Enter the output directory name (leave blank to use <model>/<ns3subdir>): " OUTPUT_DIR_NAME
+else
+  if [ -z "$MODEL_FILE_NAME" ] || [ -z "$NS3_SUBDIR" ]; then
+    echo "ERROR: No terminal attached to prompt for input, and required arguments are missing."
+    echo "Usage: $0 <model_file_name> <ns3_subdir> [output_dir_name]"
+    exit 1
+  fi
+fi
 
 # ESSENTIAL CHECK 1: Ensure inputs are not empty
 if [ -z "$MODEL_FILE_NAME" ] || [ -z "$NS3_SUBDIR" ]; then

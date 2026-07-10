@@ -16,7 +16,7 @@ CC_MODE = {"dcqcn": 1, "hpcc": 3, "timely": 7, "dctcp": 8, "hpcc-pint": 10, "non
 # Bandwidths covered by the ECN maps in the template (Gbps). The script only
 # *warns* if you pick something outside this set, since you write the physical
 # topology by hand; it does not block you.
-KNOWN_BX = {"200", "100", "50", "40", "25"}
+KNOWN_BX = {"400", "200", "100", "50", "40", "25"}
 
 # Defaults that, when unchanged, are omitted from the tag to keep names short.
 BUFFER_DEFAULT = "16"
