@@ -16,7 +16,7 @@
   "boost-mode": 1,
   "trace-enabled": 1,
 
-  "qos-enabled": 1,
+  "qos-enabled": 0,
   "unlimited-in-flight-comm-ops": 1,
   "csv-output-enabled": 1
 }
