@@ -42,6 +42,7 @@ def build_fabric_tag(topo_token: str, bx: str, cc: str, buf: str) -> str:
 
 def main() -> int:
     # --- experiment parameters (these decide the tag) ---
+    subdir = ask("subdirectory under ns3 default directory (leave empty for none)", "")
     topo_token = ask_topo()
 
     num_nodes = ask("number of NPUs (compute nodes, = number of .et files)", "8")
@@ -69,10 +70,15 @@ def main() -> int:
     tag = build_fabric_tag(topo_token, bx, cc, buffer_size)
     print(f"\n==> derived tag: {tag}")
 
+    # path segment used wherever the template appends the tag to a base dir
+    # (__CONF_DIR__/__TAG__, __OUT_DIR__/__TAG__); must include subdir when set
+    # so it matches the folder actually created below.
+    tag_path = f"{subdir}/{tag}" if subdir else tag
+
     repl = {
         "__CONF_DIR__":     str(CONF_DIR),
         "__OUT_DIR__":      str(OUT_DIR),
-        "__TAG__":          tag,
+        "__TAG__":          tag_path,
         "__CC_MODE__":      str(CC_MODE[cc]),
         "__BUFFER_SIZE__":  buffer_size,
         "__ENABLE_TRACE__": enable_trace,
@@ -84,7 +90,7 @@ def main() -> int:
     for k, v in repl.items():
         txt = txt.replace(k, v)
 
-    folder = Path(CONF_DIR) / tag
+    folder = Path(CONF_DIR) / subdir / tag if subdir else Path(CONF_DIR) / tag
     folder.mkdir(parents=True, exist_ok=True)
     out = folder / "config.txt"
     out.write_text(txt)

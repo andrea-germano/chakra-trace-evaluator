@@ -1,4 +1,3 @@
-result_graphs/
 old_graphs/
 __pycache__/
 
@@ -9,4 +8,7 @@ output/
 temp/
 log/
 experiments.txt
+experiments.log
 ns3_graphs/
+result_graphs/
+sweep_results/
