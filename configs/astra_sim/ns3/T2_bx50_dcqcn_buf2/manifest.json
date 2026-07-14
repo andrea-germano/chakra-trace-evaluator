@@ -1,13 +1,13 @@
 {
-  "tag": "T2_bx100_dcqcn_buf16",
+  "tag": "T2_bx50_dcqcn_buf2",
   "topo": "T2",
   "num_nodes": 8,
-  "bx_gbps": "100",
+  "bx_gbps": "50",
   "cc": "dcqcn",
   "cc_mode": 1,
-  "buffer_size": "16",
+  "buffer_size": "2",
   "enable_trace": "0",
   "qlen_start": "0",
   "qlen_end": "0",
-  "generated": "2026-06-28T23:38:05"
+  "generated": "2026-07-11T02:56:20"
 }
