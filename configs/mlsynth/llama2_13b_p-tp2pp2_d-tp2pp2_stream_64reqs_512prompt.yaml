@@ -1,5 +1,5 @@
 model:
-  name: "llama2_13b_p-tp4pp2_d-tp2pp2_stream"
+  name: "llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt"
   num_layers: 40
   hidden_size: 5120
   vocab_size: 32000
@@ -12,7 +12,7 @@ model:
   ffn_type: "swiglu"        # Llama usa SwiGLU
 
 prefill_parallelism:
-  tp_size: 4
+  tp_size: 2
   pp_size: 2
 
 decode_parallelism:

@@ -1,5 +1,5 @@
 model:
-  name: "llama2_13b_p-tp8pp2_d-tp2pp2_stream"
+  name: "llama2_13b_p-tp2pp2_d-tp2pp2_stream_1reqs_32768prompt"
   num_layers: 40
   hidden_size: 5120
   vocab_size: 32000
@@ -12,7 +12,7 @@ model:
   ffn_type: "swiglu"        # Llama usa SwiGLU
 
 prefill_parallelism:
-  tp_size: 8
+  tp_size: 2
   pp_size: 2
 
 decode_parallelism:
@@ -23,6 +23,6 @@ inference:
   serialize_decode_iterations: true
   kv_transfer: streaming        # bulk | streaming
 
-  num_requests: 64
-  prompt_len: 512
+  num_requests: 1
+  prompt_len: 32768
   gen_len: 8
