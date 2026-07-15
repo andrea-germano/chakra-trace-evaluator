@@ -3,9 +3,14 @@
 utils.plots — the plotting mechanics both sweeps repeat, and nothing about
 what is being plotted.
 
-`plot_series` is the one that matters: both analyzers drew the same
-"one line per variant, x = the swept axis, drop NaNs" loop, differing only in the
-name of the x column. Here that name is an argument.
+`plot_series` is the one that matters: the sweeps drew the same "one line per
+variant, x = the swept axis, drop NaNs" loop, differing only in the name of the
+x column. Here that name is an argument.
+
+`relative_range` used to live here. It normalised two series onto 0-1 so they
+could share an axis, which made a 7.4% effect look the same size as a 26% one.
+The plot that used it is gone and so is it: if two series need one axis, they
+need two axes.
 
 Decoration (titles, reference lines, twin axes, regime bands) stays in the
 analyzers: it is where the two sweeps actually differ, and merging it would be
@@ -62,12 +67,3 @@ def save_fig(fig, outdir: Path, name: str, written: list[Path] | None = None) ->
     if written is not None:
         written.append(path)
     return path
-
-
-def relative_range(data: pd.DataFrame, col: str) -> tuple[float, float, float]:
-    """(min, max, range/mean). Min-max normalisation maps ANY range onto 0-1, so a
-    1% wiggle renders as a full-scale trend; callers use this to refuse to
-    normalise a series that carries no trend."""
-    v = data[col].to_numpy(float)
-    lo, hi, mean = np.nanmin(v), np.nanmax(v), np.nanmean(v)
-    return lo, hi, ((hi - lo) / mean if mean else 0.0)

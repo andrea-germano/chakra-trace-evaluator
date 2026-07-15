@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
 """
-bandwidth_analyzer.py
-=====================
+bandwidth_sweep — how does the run scale with link bandwidth?
 
-Summarise an ASTRA-sim bandwidth sweep for MLSynth disaggregated-inference traces.
-
-The sweep root contains one sub-directory per simulated run, e.g.
-
-    T2_bx25_dcqcn_buf32/
-        stats_sys0.csv
-        stats_sys1.csv
-        ...
-
-The number after ``bx`` in the directory name is the simulated per-link bandwidth.
+Paths come from utils.paths: `--sweep bandwidth_sweep` and everything else is
+derived. The number after ``bx`` in each run-dir name is the simulated per-link
+bandwidth (utils.paths.BANDWIDTH_AXIS).
 Every CSV inside a run directory is one node's stats trace, in the format:
 
     sys_id,node_id,name,type,comm_size,start_tick,end_tick,duration,
@@ -45,16 +37,31 @@ from buffer_analyzer.py, which has to cross into the ns-3 outputs because the
 buffer changes the congestion *regime* and not the drain rate. Different questions,
 different tools; they share readers, not conclusions -- see utils/__init__.py.
 
-Outputs (written to <root>/bandwidth_analysis/ by default):
+Outputs (results/sweep_analysis/bandwidth/<sweep>/<workload>/ by default):
   * summary.csv            one row per run with all aggregated metrics
   * per_node.csv           per-node / per-class breakdown (long format)
-  * a set of PNG graphs
+  * six PNG graphs
+
+Nine used to be six + three derivations of the other six, which is a way of
+showing the same number three times and calling it corroboration:
+
+    01_makespan            a subset of 02, which already draws makespan_ns
+    08_speedup             makespan[0] / makespan -- 01, renormalised
+    09_kv_bound_ratio      kv_completion / makespan -- two curves of 02, divided
+
+and the metric behind the last one did not measure its own name. `makespan` is
+max(end) over ALL rows, and under disaggregation decode runs AFTER the KV
+transfer, so kv_completion/makespan measures what fraction of the run had
+elapsed when KV finished -- which is set by how many decode steps you simulate.
+Double the tokens and KV becomes "less of a bottleneck". The comparison that
+answers the question is kv_completion vs prefill_comp_completion: does decode
+wait on the fabric, or on the prefill it is fed by? Both columns already
+existed; `kv_over_prefill_compute` is their ratio and 02 draws both curves.
 
 Usage
 -----
-    python3 analyze_bandwidth_sweep.py [ROOT] [-o OUTDIR] [--pattern '*.csv']
-
-If ROOT is omitted the hard-coded sweep path above is used.
+    python3 bandwidth_sweep.py --sweep bandwidth_sweep
+    python3 bandwidth_sweep.py --sweep bandwidth_sweep --workload other_model -o /tmp/x
 
 Counting each transfer once
 ---------------------------
@@ -97,24 +104,21 @@ import matplotlib
 matplotlib.use("Agg")          # headless: no display needed
 import matplotlib.pyplot as plt
 
-from utils import astra
+from utils import astra, paths
+from utils.paths import BANDWIDTH_AXIS
 from utils.plots import plot_series, save_fig
-from utils.sweep import (BANDWIDTH_AXIS, discover_runs, order_columns,
-                            resolve_outdir, write_table)
+
+KIND = "bandwidth"
 
 
-# --------------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------------- #
-DEFAULT_ROOT = (
-    "/home/andre/tesi/trace_evaluator/output/astra_logs/"
-    "llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt/bandwidth_sweep"
-)
+class Abort(Exception):
+    pass
 
-# Where results (summary.csv, per_node.csv, the PNG graphs) are written by
-# default. Edit this constant to change the default output location.
-# Set it to None to fall back to "<root>/bandwidth_analysis" instead.
-DEFAULT_OUTDIR = ("/home/andre/tesi/trace_evaluator/results/sweep_analysis/bandwidth/llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt")
+
+def need(cond, msg: str) -> None:
+    if not cond:
+        raise Abort(msg)
+
 
 def _phase_of(pl) -> str:
     return {"p": "prefill", "d": "decode"}.get(pl, "other")
@@ -189,10 +193,13 @@ def summarise_run(df: pd.DataFrame) -> dict:
     out["prefill_comp_completion_ns"] = last_end(comp_mask & (df["phase"] == "prefill"))
     out["decode_comp_completion_ns"] = last_end(comp_mask & (df["phase"] == "decode"))
 
-    # gating indicator: fraction of makespan at which KV finishes
-    out["kv_bound_ratio"] = (
-        out["kv_completion_ns"] / makespan if makespan and makespan > 0 else np.nan
-    )
+    # Does decode wait on the fabric, or on the prefill that feeds it? >1 means
+    # the KV transfer outlasts prefill compute, i.e. the fabric gates the handover.
+    # NOT kv_completion/makespan: makespan includes every decode step, so that
+    # ratio shrinks when you simulate more tokens and says nothing about the link.
+    pc = out["prefill_comp_completion_ns"]
+    out["kv_over_prefill_compute"] = (
+        out["kv_completion_ns"] / pc if pd.notna(pc) and pc > 0 else np.nan)
 
     # ---- KV-cache transfer ------------------------------------------------- #
     kv = astra.sends(df, kv_mask)
@@ -285,35 +292,25 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
     outdir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     s = summary.sort_values("bandwidth")
-    multi = s["variant"].nunique() > 1
 
     def save(fig, name):
         save_fig(fig, outdir, name, written)
-
-    # 1) Makespan vs bandwidth ---------------------------------------------- #
-    fig, ax = plt.subplots(figsize=(8, 5))
-    plot_series(ax, s, "bandwidth", "makespan_ms", "Makespan")
-    ax.set_xlabel("Simulated link bandwidth (bx)")
-    ax.set_ylabel("Makespan (ms)")
-    ax.set_title("Total simulated execution time vs bandwidth")
-    ax.grid(True, alpha=0.3)
-    if multi or True:
-        ax.legend()
-    save(fig, "01_makespan_vs_bandwidth.png")
 
     # 2) Phase completion crossover ----------------------------------------- #
     fig, ax = plt.subplots(figsize=(8, 5))
     for col, lbl, mk in (
         ("makespan_ns", "Makespan (overall)", "o"),
         ("kv_completion_ns", "KV transfer completion", "s"),
-        ("comp_completion_ns", "Compute completion", "^"),
+        ("comp_completion_ns", "Compute completion (all)", "^"),
+        ("prefill_comp_completion_ns", "Prefill compute completion", "v"),
         ("pp_completion_ns", "PP transfer completion", "d"),
     ):
         if col in s and s[col].notna().any():
             plot_series(ax, s, "bandwidth", col, lbl, marker=mk, scale=1e-6)
     ax.set_xlabel("Simulated link bandwidth (bx)")
     ax.set_ylabel("Completion time (ms)")
-    ax.set_title("Which phase gates the makespan?\n(KV above compute => KV-bound)")
+    ax.set_title("What gates the handover to decode?\n"
+                 "(KV completion above prefill compute => the fabric gates it)")
     ax.grid(True, alpha=0.3)
     ax.legend()
     save(fig, "02_phase_completion_vs_bandwidth.png")
@@ -404,35 +401,6 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
         ax.legend(ncol=2, fontsize=8)
         save(fig, "07_busy_time_breakdown.png")
 
-    # 8) Speedup vs slowest run --------------------------------------------- #
-    fig, ax = plt.subplots(figsize=(8, 5))
-    tmp = s.copy()
-    for variant, grp in tmp.groupby("variant"):
-        grp = grp.dropna(subset=["makespan_ns"]).sort_values("bandwidth")
-        if grp.empty:
-            continue
-        base = grp["makespan_ns"].iloc[0]  # lowest bandwidth = baseline
-        speedup = base / grp["makespan_ns"]
-        lbl = "Speedup vs lowest bw" if tmp["variant"].nunique() == 1 else f"[{variant}]"
-        ax.plot(grp["bandwidth"], speedup, marker="o", label=lbl)
-    ax.set_xlabel("Simulated link bandwidth (bx)")
-    ax.set_ylabel("Speedup (makespan at lowest bw / makespan)")
-    ax.set_title("Makespan speedup vs bandwidth (normalised to lowest bw)")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    save(fig, "08_speedup_vs_bandwidth.png")
-
-    # 9) KV-bound ratio ----------------------------------------------------- #
-    fig, ax = plt.subplots(figsize=(8, 5))
-    plot_series(ax, s, "bandwidth", "kv_bound_ratio", "KV completion / makespan", marker="o")
-    ax.axhline(1.0, color="k", linestyle=":", alpha=0.6)
-    ax.set_xlabel("Simulated link bandwidth (bx)")
-    ax.set_ylabel("KV completion / makespan")
-    ax.set_title("How tightly KV transfer gates the run\n(\u22481 => KV is the bottleneck)")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    save(fig, "09_kv_bound_ratio.png")
-
     return written
 
 
@@ -442,83 +410,74 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("root", nargs="?", default=DEFAULT_ROOT,
-                    help="Sweep root containing the per-bandwidth run sub-directories.")
-    ap.add_argument("-o", "--out", default=None,
-                    help="Output directory. If omitted, uses the DEFAULT_OUTDIR "
-                         "constant (or <root>/bandwidth_analysis when that is None).")
+    paths.add_arguments(ap, KIND)
     ap.add_argument("--pattern", default="*.csv",
-                    help="Glob for the per-node CSVs inside each run dir (default '*.csv').")
-    args = ap.parse_args(argv)
+                    help="glob for the per-node CSVs inside each run dir")
+    a = ap.parse_args(argv)
 
-    root = Path(args.root)
-    if not root.is_dir():
-        print(f"ERROR: root directory not found: {root}", file=sys.stderr)
+    try:
+        p, outdir = paths.from_arguments(a, KIND)
+        need(p.astra_root.is_dir(),
+             f"derived ASTRA root does not exist:\n    {p.astra_root}\n"
+             f"  --sweep {a.sweep!r} or --workload {a.workload!r} is wrong.")
+        tags = p.tags("astra")
+        need(tags, f"no run sub-directory under {p.astra_root}")
+        print(p.describe())
+        print(f"  out      {outdir}\n\nScanning {len(tags)} runs:")
+
+        rows, per_node_frames = [], []
+        for tag in tags:
+            bw = BANDWIDTH_AXIS.value(tag)
+            need(bw is not None,
+                 f"{tag}: no 'bx<num>' token in the directory name; the swept "
+                 f"axis is unreadable.")
+            df = load_run(p.astra_run(tag), a.pattern)
+            need(df is not None,
+                 f"{tag}: no readable {a.pattern} under {p.astra_run(tag)}")
+            summ = summarise_run(df)
+            summ.update(run_dir=tag, variant=BANDWIDTH_AXIS.variant(tag), bandwidth=bw)
+            rows.append(summ)
+            per_node_frames.append(build_per_node(df, bw, summ["variant"]))
+            print(f"  + {tag:<28} bw={bw:<7g} nodes={summ['n_nodes']:<3} "
+                  f"makespan={summ['makespan_ms']:.2f} ms  "
+                  f"KV/prefill_comp={summ['kv_over_prefill_compute']:.2f}")
+
+        summary = pd.DataFrame(rows).sort_values("bandwidth").reset_index(drop=True)
+        # Every figure draws one line through summary. That is only a line if one
+        # knob moves: with two, plot_series joins points from different fabrics in
+        # bandwidth order and draws a zigzag that looks like a measurement. Only
+        # the old speedup plot grouped by variant -- the other eight did not, and
+        # said nothing.
+        need(summary["variant"].nunique() == 1,
+             f"this sweep moves more than one knob: variants "
+             f"{sorted(summary['variant'].unique())}. Every figure here draws a "
+             f"single line through summary.csv, so the runs would be joined across "
+             f"fabrics in bandwidth order. Split the runs into one sweep per variant.")
+
+        front = ["run_dir", "variant", "bandwidth", "n_nodes", "makespan_ms",
+                 "kv_over_prefill_compute"]
+        summary = summary[[c for c in front if c in summary.columns]
+                          + [c for c in summary.columns if c not in front]]
+        outdir.mkdir(parents=True, exist_ok=True)
+        summary.to_csv(outdir / "summary.csv", index=False)
+        pd.concat(per_node_frames, ignore_index=True).to_csv(
+            outdir / "per_node.csv", index=False)
+        plots = make_plots(summary, outdir)
+
+        pd.set_option("display.width", 180)
+        report = [c for c in ["bandwidth", "makespan_ms", "kv_over_prefill_compute",
+                              "kv_agg_bw_bytes_per_ns", "kv_mean_duration_ns",
+                              "pp_prefill_agg_bw_bytes_per_ns",
+                              "pp_decode_agg_bw_bytes_per_ns"] if c in summary.columns]
+        print("\n================ BANDWIDTH SWEEP ================")
+        print(summary[report].to_string(index=False))
+        print(f"\nWrote {outdir}:")
+        for f in ["summary.csv", "per_node.csv", *[q.name for q in plots]]:
+            print(f"  {f}")
+        return 0
+    except Abort as e:
+        print(f"\nABORT: {e}", file=sys.stderr)
         return 2
-
-    outdir = resolve_outdir(args.out, DEFAULT_OUTDIR, root, "bandwidth_analysis")
-    run_dirs = discover_runs(root, outdir, skip_names=("bandwidth_analysis",))
-    if not run_dirs:
-        print(f"ERROR: no run sub-directories found under {root}", file=sys.stderr)
-        return 2
-
-    print(f"Scanning {len(run_dirs)} run directories under:\n  {root}\n")
-
-    rows: list[dict] = []
-    per_node_frames: list[pd.DataFrame] = []
-
-    for d in run_dirs:
-        bw = BANDWIDTH_AXIS.value(d.name)
-        if bw is None:
-            print(f"  - skip {d.name!r}: no 'bx<num>' bandwidth token", file=sys.stderr)
-            continue
-        df = load_run(d, args.pattern)
-        if df is None:
-            print(f"  - skip {d.name!r}: no readable CSVs", file=sys.stderr)
-            continue
-
-        variant = BANDWIDTH_AXIS.variant(d.name)
-        summ = summarise_run(df)
-        summ["run_dir"] = d.name
-        summ["variant"] = variant
-        summ["bandwidth"] = bw
-        rows.append(summ)
-        per_node_frames.append(build_per_node(df, bw, variant))
-
-        print(f"  + {d.name:<28} bw={bw:<7g} nodes={summ['n_nodes']:<3} "
-              f"makespan={summ['makespan_ms']:.2f} ms  "
-              f"KV/makespan={summ['kv_bound_ratio']:.2f}")
-
-    if not rows:
-        print("ERROR: no valid runs parsed.", file=sys.stderr)
-        return 2
-
-    summary = pd.DataFrame(rows).sort_values(["variant", "bandwidth"]).reset_index(drop=True)
-
-    # nice column ordering: identifiers first
-    summary = order_columns(summary, ["run_dir", "variant", "bandwidth", "n_nodes",
-                                      "makespan_ms", "kv_bound_ratio"])
-    summary_path = write_table(summary, outdir, "summary.csv")
-    per_node = pd.concat(per_node_frames, ignore_index=True)
-    per_node_path = write_table(per_node, outdir, "per_node.csv")
-
-    plots = make_plots(summary, outdir)
-
-    # console report
-    pd.set_option("display.width", 160)
-    pd.set_option("display.max_columns", 30)
-    report_cols = ["bandwidth", "makespan_ms", "kv_bound_ratio",
-                   "kv_agg_bw_bytes_per_ns", "kv_mean_duration_ns",
-                   "pp_prefill_agg_bw_bytes_per_ns", "pp_decode_agg_bw_bytes_per_ns"]
-    report_cols = [c for c in report_cols if c in summary.columns]
-    print("\n================ SUMMARY ================")
-    print(summary[report_cols].to_string(index=False))
-    print("\nWrote:")
-    print(f"  {summary_path}")
-    print(f"  {per_node_path}")
-    for p in plots:
-        print(f"  {p}")
-    return 0
 
 
 if __name__ == "__main__":

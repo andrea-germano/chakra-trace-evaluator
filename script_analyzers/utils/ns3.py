@@ -53,8 +53,16 @@ def read_fct(path: Path) -> pd.DataFrame | None:
     if not path.is_file():
         return None
     rows = []
+    # `slow_min` replaces a `fct/sfct < 0.999` counter that fired on 1694 of the
+    # 2994 flows of the T1 reference run and would have reported the columns as
+    # misparsed. They are not: entry.h computes standalone_fct over total_bytes
+    # (payload + per-packet headers) while the size column is the payload alone,
+    # so an uncongested flow legitimately lands a percent or two below 1. A wrong
+    # column layout does not miss by 1.3% -- it misses by orders of magnitude.
+    # So: report the minimum, and flag only what physics cannot explain.
     diag = dict(raw_lines=0, skipped_short=0, skipped_badnum=0, sfct_nonpos=0,
-                slow_lt1=0, ncols=None, sample=None, ncol_hist=defaultdict(int))
+                slow_min=float("inf"), slow_lt09=0, ncols=None, sample=None,
+                ncol_hist=defaultdict(int))
     for line in path.open():
         if not line.strip():
             continue
@@ -73,8 +81,10 @@ def read_fct(path: Path) -> pd.DataFrame | None:
             continue
         if sfct <= 0:
             diag["sfct_nonpos"] += 1
-        elif fct / sfct < 0.999:
-            diag["slow_lt1"] += 1
+        else:
+            diag["slow_min"] = min(diag["slow_min"], fct / sfct)
+            if fct / sfct < 0.9:
+                diag["slow_lt09"] += 1
         rows.append((ip_to_node(p[0]), ip_to_node(p[1]), size, start, fct, sfct))
     if not rows:
         return None
@@ -136,6 +146,43 @@ class PfcLog:
                 tot += max(clamp_to, start) - start
             totals[key] = tot
         return totals, unclosed
+
+    def pause_intervals_flagged(self, clamp_to: int) -> dict[tuple, list[tuple[int, int, bool]]]:
+        """Closed intervals as `pause_totals` pairs them, each flagged suspect or
+        not. This is the honest answer to "is pfc.txt without qIndex usable".
+
+        Without qIndex, PAUSE and RESUME of different queues land on the same
+        (node, ifindex) key and this state machine mis-pairs them -- but only
+        where the two queues' sequences actually interleave, which is a property
+        of the run, not of the format. An interleaving leaves a fingerprint:
+        two same-type events in a row. So instead of declaring the whole file
+        unusable a priori, flag the intervals adjacent to a fingerprint and let
+        the caller report a bound: [total - suspect, total] brackets the truth.
+
+        Flagged when:
+          * a second PAUSE arrives while one is open (its RESUME will close the
+            wrong interval, stretching it to the later queue's release), or
+          * a RESUME arrives with nothing open (a PAUSE was swallowed earlier)."""
+        out: dict[tuple, list] = {}
+        for key, events in self.events.items():
+            events.sort()
+            iv: list[tuple[int, int, bool]] = []
+            start, suspect = None, False
+            for t, typ in events:
+                if typ == 1:
+                    if start is None:
+                        start, suspect = t, False
+                    else:
+                        suspect = True
+                elif start is not None:
+                    iv.append((start, t, suspect))
+                    start = None
+                elif iv:
+                    iv[-1] = (iv[-1][0], iv[-1][1], True)
+            if start is not None:
+                iv.append((start, max(clamp_to, start), True))
+            out[key] = iv
+        return out
 
     def pause_intervals(self, clamp_to: int) -> dict[tuple, list[tuple[int, int]]]:
         """Closed [start, end] pause intervals per (node, node_type, ifindex, qIndex),

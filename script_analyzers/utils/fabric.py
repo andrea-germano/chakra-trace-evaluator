@@ -80,6 +80,7 @@ class Ns3Config:
     path: Path | None = None
     buffer_mb: float | None = None
     cc_mode: int | None = None
+    payload: int = 1000          # PACKET_PAYLOAD_SIZE; an MTU-sized flow is one packet
     enable_qcn: int | None = None
     dynamic_pfc: int | None = None
     headroom_factor: int = DEFAULT_HEADROOM_FACTOR
@@ -116,6 +117,8 @@ def parse_ns3_config(path: Path) -> Ns3Config:
         try:
             if key == "BUFFER_SIZE":
                 cfg.buffer_mb = float(p[1])
+            elif key == "PACKET_PAYLOAD_SIZE":
+                cfg.payload = int(p[1])
             elif key == "CC_MODE":
                 cfg.cc_mode = int(p[1])
             elif key == "ENABLE_QCN":
@@ -345,8 +348,10 @@ class FabricModel:
         """SwitchMmu::GetPfcThreshold
                (buffer_size - total_hdrm - total_rsrv - shared_used_bytes) >> pfc_a_shift
 
-        Called with shared_used=0 this is the MAXIMUM: the real threshold shrinks
-        as the shared pool fills, so PFC is entered earlier than predicted here.
+        shared_used_bytes is a switch-GLOBAL scalar (switch-mmu.h:57), not a
+        per-port one, so this is a moving target: every port filling the pool
+        lowers every other port's threshold. Called with shared_used=0 it is the
+        transient value at t=0, NOT the steady state -- use steady_threshold().
         Note that ``buffer/8`` is not an acceptable approximation: on a leaf whose
         host ports are fast (large rate*delay headroom) the subtracted terms can
         be ~half the buffer at small sizes, exactly where the regime flips."""
@@ -354,12 +359,29 @@ class FabricModel:
         avail = buffer_bytes - self.topo.total_hdrm[sw] - self.topo.total_rsrv[sw] - shared_used
         return max(0, int(avail) >> self.topo.shift[sw][bn.egress_port])
 
+    def steady_threshold(self, bn: Bottleneck, buffer_bytes: int) -> int:
+        """The fixed point of the dynamic threshold, which is where PAUSE
+        actually fires.
+
+        CheckShouldPause tests GetSharedUsed(port,q) >= GetPfcThreshold(port),
+        and GetPfcThreshold subtracts the switch-GLOBAL shared_used_bytes. With
+        F symmetric ingress ports each holding x shared bytes, S = F*x, so
+
+            x >= (A - F*x) >> s   ->   x = A / (2**s + F)
+
+        not A / 2**s. At F=2, s=3 that is a 25% overestimate -- and it moves the
+        predicted band, which is the claim the sweep is testing."""
+        sw = bn.switch
+        avail = buffer_bytes - self.topo.total_hdrm[sw] - self.topo.total_rsrv[sw]
+        return max(0, int(avail) // ((1 << self.topo.shift[sw][bn.egress_port])
+                                     + bn.f_ports))
+
     def egress_equivalent_threshold(self, bn: Bottleneck, buffer_bytes: int) -> int:
         """PFC watches per-ingress-port occupancy; ECN watches per-egress-port
         occupancy. The same bytes sit on F_ports ingress counters but on one
         egress counter, so comparing the threshold against KMIN/KMAX requires
         multiplying by the number of ingress ports."""
-        eq = self.pfc_threshold(bn, buffer_bytes) * bn.f_ports
+        eq = self.steady_threshold(bn, buffer_bytes) * bn.f_ports
         if eq > buffer_bytes:
             raise ValueError(
                 f"egress-equivalent threshold ({eq/1e6:.1f} MB) exceeds the physical "
@@ -378,7 +400,7 @@ class FabricModel:
         what limits. Note the ceiling can exceed KMAX on its own when the ingress
         headroom is large -- in which case a PFC-only regime is unreachable and
         ECN marks at every buffer size."""
-        thr = self.pfc_threshold(bn, buffer_bytes)
+        thr = self.steady_threshold(bn, buffer_bytes)
         return sum(RESERVE_BYTES + thr + self.topo.hdrm[bn.switch][p]
                    for p in bn.ingress_ports)
 
@@ -401,9 +423,9 @@ class FabricModel:
         return "MIXED"
 
     def flip_band(self, bn: Bottleneck) -> tuple[float, float] | None:
-        """Buffers (MiB) where F_ports*threshold crosses KMIN and KMAX:
-               F * ((B - hdrm - rsrv) >> shift) == K
-           ->  B = K * 2^shift / F + hdrm + rsrv
+        """Buffers (MiB) where F_ports*steady_threshold crosses KMIN and KMAX:
+               F * (B - hdrm - rsrv) / (2^shift + F) == K
+           ->  B = K * (2^shift + F) / F + hdrm + rsrv
         Below the KMIN crossing the fabric is PFC-dominated, above the KMAX one
         it is ECN-dominated, and in between mixed. A band, not a line."""
         kmin, kmax = self.ecn_band(bn)
@@ -411,6 +433,7 @@ class FabricModel:
             return None
         base = self.topo.total_hdrm[bn.switch] + self.topo.total_rsrv[bn.switch]
         mul = 1 << self.topo.shift[bn.switch][bn.egress_port]
+        mul += bn.f_ports
         return ((kmin * mul / bn.f_ports + base) / 2**20,
                 (kmax * mul / bn.f_ports + base) / 2**20)
 
@@ -425,8 +448,9 @@ def _main(argv: list[str] | None = None) -> int:
     ap.add_argument("topology")
     ap.add_argument("config", nargs="?")
     ap.add_argument("--buffers", default="2,4,8,16,32", help="MiB, comma separated")
-    ap.add_argument("--bottleneck", help="'sw->peer', e.g. '8->12'. Default: the "
-                                        "most oversubscribed switch egress link.")
+    ap.add_argument("--bottleneck", required=True, metavar="SW->PEER",
+                    help="the congested directed link, e.g. '8->12'. Required: "
+                         "there is no honest default (see _main).")
     ap.add_argument("--headroom-factor", type=int, default=DEFAULT_HEADROOM_FACTOR)
     a = ap.parse_args(argv)
 
@@ -447,16 +471,21 @@ def _main(argv: list[str] | None = None) -> int:
             f"if{i}->n{p.peer} @{p.rate/1e9:g}G" for i, p in sorted(topo.ports[h].items())))
 
     # pick the bottleneck: switch egress link with the worst in:out rate ratio
-    if a.bottleneck:
-        sw, peer = (int(x) for x in a.bottleneck.split("->"))
-    else:
-        cand = []
-        for sw in topo.switches:
-            for idx, port in topo.ports[sw].items():
-                other = sum(p.rate for i, p in topo.ports[sw].items() if i != idx)
-                cand.append((other / port.rate, sw, port.peer))
-        _, sw, peer = max(cand)
+    # --bottleneck is required. The heuristic that used to default it -- the link
+    # with the worst in:out rate ratio -- picks a leaf uplink in EVERY leaf-spine
+    # (2 x 1024 into 200 = 10.24, against 3 x 200 into 200 = 3 at the spine), so
+    # it can never point at the many-to-one incast, which is the one thing a
+    # disaggregated-inference fabric is built around. A default that is wrong by
+    # construction on the topology class you care about is worse than no default.
+    sw, peer = (int(x) for x in a.bottleneck.split("->"))
     egress = topo.port_facing(sw, peer)
+    if egress is None:
+        raise SystemExit(f"--bottleneck {a.bottleneck}: switch {sw} has no link to "
+                         f"{peer}. Its ports: "
+                         f"{[topo.port_label(sw, i) for i in topo.ports.get(sw, {})]}")
+    # Every other port of the switch. Without an fct.txt there are no flow paths,
+    # so this is the upper bound on F_ports, not the measured one: the analyzers
+    # derive it from the KV paths and can only get a smaller number.
     ingress = tuple(i for i in topo.ports[sw] if i != egress)
     bn = Bottleneck(sw, egress, peer, topo.ports[sw][egress].rate, ingress)
     model = FabricModel(topo, cfg)
@@ -473,11 +502,11 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"  predicted flip band: PFC below {band[0]:.2f} MiB, "
               f"DCQCN above {band[1]:.2f} MiB")
 
-    print(f"\n{'buf MiB':>8} {'threshold':>11} {'x F_ports':>11} {'buffer/8':>11} "
+    print(f"\n{'buf MiB':>8} {'steady thr':>11} {'x F_ports':>11} {'buffer/8':>11} "
           f"{'PFC ceiling':>12} {'hdrm+rsrv':>10} {'regime':>7}")
     for b in (float(x) for x in a.buffers.split(",")):
         B = int(b * 1024 * 1024)
-        thr = model.pfc_threshold(bn, B)
+        thr = model.steady_threshold(bn, B)
         eq = model.egress_equivalent_threshold(bn, B)
         ceil = model.pfc_egress_ceiling(bn, B)
         pct = 100 * (topo.total_hdrm[sw] + topo.total_rsrv[sw]) / B

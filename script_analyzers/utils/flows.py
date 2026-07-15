@@ -14,12 +14,12 @@ gives CV 0.17.
 
 The taxonomy, used verbatim by every analyzer:
 
-    bulk     size >= a threshold          a real transfer, not an ACK
-    fabric   hops > 1                     traverses at least one switch
-    direct   hops == 1                    host-to-host link: never congested, so
-                                          slowdown ~1 by construction
-    incast   bulk AND fabric              the population every *_incast statistic
-                                          is computed over
+    hops == 1                            host-to-host link: never congested, so
+                                         slowdown ~1 by construction. Class 'tp'.
+    hops  > 1                            traverses at least one switch.
+    flow_class                           structural, from utils.roles: the
+                                         declared placement says what a flow is,
+                                         so no size threshold has to be tuned.
 
 What slowdown means
 --------------------------------------------------------------------------------
@@ -39,27 +39,33 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from . import roles
 from .fabric import Bottleneck, Topology
+from .roles import Placement
 
 
-def annotate(fct: pd.DataFrame, topo: Topology | None, bulk_bytes: int) -> pd.DataFrame:
-    """Attach hops / path / bulk / fabric / incast.
+def annotate(fct: pd.DataFrame, topo: Topology, placement: Placement,
+             mtu: int) -> pd.DataFrame:
+    """Attach hops / path / flow_class.
 
-    With no topology every flow is optimistically 'fabric' and nothing is
-    filtered: that is the degraded mode, and callers are expected to say so out
-    loud rather than quietly report a mixture."""
+    Both arguments are required. Without the topology there are no hop counts,
+    so a TP collective on a dedicated host-to-host link is indistinguishable
+    from a congested KV transfer -- and mixing them is not a rounding error, it
+    is a bimodal mixture whose mean and CV describe the mixing ratio rather than
+    the fabric. On the reference T1 run that is 2880 direct flows against 82
+    fabric ones: the statistics could not move no matter what the buffer did.
+    Without the placement there is no class. Neither has a default."""
     f = fct.copy()
-    f["bulk"] = f["size"] >= bulk_bytes
-    if topo is None:
-        f["hops"] = np.nan
-        f["path"] = None
-        f["fabric"] = True
-    else:
-        f["hops"] = [topo.dist.get(s, {}).get(d, np.nan) for s, d in zip(f["src"], f["dst"])]
-        f["path"] = [topo.path(s, d) for s, d in zip(f["src"], f["dst"])]
-        f["fabric"] = f["hops"] > 1
-    f["incast"] = f["bulk"] & f["fabric"]
+    f["hops"] = [topo.dist.get(s, {}).get(d, np.nan) for s, d in zip(f["src"], f["dst"])]
+    f["path"] = [topo.path(s, d) for s, d in zip(f["src"], f["dst"])]
+    f["flow_class"] = roles.classify(f, placement, mtu)
     return f
+
+
+def crosses(flows: pd.DataFrame, bn: Bottleneck) -> pd.Series:
+    """Whether each flow's path traverses the bottleneck's directed link."""
+    return pd.Series([bool(p) and (bn.switch, bn.peer) in p for p in flows["path"]],
+                     index=flows.index)
 
 
 def concurrency_stats(intervals: list[tuple[int, int]]) -> tuple[float, float]:
@@ -91,52 +97,45 @@ def concurrency_stats(intervals: list[tuple[int, int]]) -> tuple[float, float]:
     return float(peak), (float(np.mean(means)) if means else float("nan"))
 
 
-def find_bottleneck(topo: Topology | None, port_max: dict[tuple[int, int], int] | None,
-                    flows: pd.DataFrame | None) -> Bottleneck | None:
+def find_bottleneck(topo: Topology, port_max: dict[tuple[int, int], int],
+                    congesting: pd.DataFrame) -> Bottleneck:
     """The congested directed link, plus the ingress ports feeding it.
 
-    Ground truth is qlen.txt: the port that actually built a queue. Falls back to
-    the directed link carrying the most incast bytes when qlen is unavailable.
+    Ground truth is qlen.txt: the port that actually built the deepest queue.
+    There is no fallback -- an empty qlen.txt is a broken run, not a reason to
+    guess from flow volumes.
 
-    The ingress ports come from the flows' paths and are returned as a tuple of
-    PORT indices, which is what the PFC threshold is compared against: SwitchMmu
-    keys ingress accounting on (port, qIndex), not on flows. Dozens of flows
-    entering through two host ports load two ingress counters."""
-    if topo is None:
-        return None
-    sw = port = None
-    if port_max:
-        (sw, port) = max(port_max.items(), key=lambda kv: kv[1])[0]
-        if port not in topo.ports.get(sw, {}):
-            sw = port = None
-    if sw is None and flows is not None and "path" in flows.columns:
-        load: dict[tuple[int, int], int] = {}
-        for path, size, inc in zip(flows["path"], flows["size"], flows["incast"]):
-            if path and inc:
-                for a, b in path:
-                    if topo.is_switch(a):
-                        load[(a, b)] = load.get((a, b), 0) + size
-        if load:
-            (a, b), _ = max(load.items(), key=lambda kv: kv[1])
-            sw, port = a, topo.port_facing(a, b)
-    if sw is None or port is None:
-        return None
+    `congesting` is the flow population whose paths define the ingress set: pass
+    the class that is meant to congest this link (kv), not everything, or an
+    unrelated flow that happens to share the egress inflates F_ports.
 
+    The ingress ports are returned as a tuple of PORT indices, which is what the
+    PFC threshold is compared against: SwitchMmu keys ingress accounting on
+    (port, qIndex), not on flows. Dozens of flows entering through two host ports
+    load two ingress counters, not dozens."""
+    if not port_max:
+        raise ValueError("qlen.txt has no port samples: cannot locate the "
+                         "bottleneck. Check QLEN_MON_START against the run.")
+    (sw, port) = max(port_max.items(), key=lambda kv: kv[1])[0]
+    if port not in topo.ports.get(sw, {}):
+        raise ValueError(
+            f"qlen.txt reports the deepest queue on port {port} of switch {sw}, "
+            f"which the topology says does not exist (it has ports "
+            f"{sorted(topo.ports.get(sw, {}))}). physical_topology.txt and this "
+            f"run's ns-3 output do not describe the same fabric.")
     peer = topo.ports[sw][port].peer
     ingress: set[int] = set()
-    if flows is not None and "path" in flows.columns:
-        for path, inc in zip(flows["path"], flows["incast"]):
-            if not path or not inc:
-                continue
-            for i, (a, b) in enumerate(path):
-                if (a, b) == (sw, peer) and i > 0:
-                    if (p := topo.port_facing(sw, path[i - 1][0])) is not None:
-                        ingress.add(p)
+    for path in congesting["path"]:
+        if not path:
+            continue
+        for i, (x, y) in enumerate(path):
+            if (x, y) == (sw, peer) and i > 0:
+                if (q := topo.port_facing(sw, path[i - 1][0])) is not None:
+                    ingress.add(q)
     return Bottleneck(sw, port, peer, topo.ports[sw][port].rate, tuple(sorted(ingress)))
 
 
-def bottleneck_intervals(flows: pd.DataFrame, bn: Bottleneck) -> list[tuple[int, int]]:
-    """(start, arrival) of every incast flow crossing the bottleneck link."""
-    return [(s, a) for path, s, a, inc in
-            zip(flows["path"], flows["start"], flows["arrival"], flows["incast"])
-            if path and inc and (bn.switch, bn.peer) in path]
+def intervals(flows: pd.DataFrame) -> list[tuple[int, int]]:
+    """(start, arrival) per flow, for concurrency_stats. The caller decides the
+    population; this does not filter."""
+    return list(zip(flows["start"].astype(int), flows["arrival"].astype(int)))

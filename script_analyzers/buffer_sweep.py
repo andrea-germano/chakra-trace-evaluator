@@ -1,75 +1,62 @@
 #!/usr/bin/env python3
 """
-buffer_analyzer — per-switch buffer sweep for MLSynth disaggregated-inference traces.
+buffer_sweep — per-switch buffer sweep, MLSynth disaggregated inference.
 
 The question
 --------------------------------------------------------------------------------
-Does the size of the switch buffer change when disaggregated decode can start?
+Does the switch buffer change when disaggregated decode can start?
 
-It cannot be answered from the ASTRA-sim CSVs alone. At steady state the congested
-link drains at line rate whatever the buffer is, so mean KV completion is flat and
-the CSVs say "nothing happens". What the buffer actually changes is the
-*congestion-control regime* -- whether the queue is held by PFC backpressure or by
-DCQCN rate control -- and that lives in the ns-3 outputs. So this analyzer works on
-two levels:
+It cannot be answered from the ASTRA-sim CSVs, so this analyzer does not read
+them: at steady state the congested link drains at line rate whatever the buffer
+is, and the CSVs say "nothing happens". What the buffer changes is the
+*congestion-control regime* -- whether the queue is held by PFC backpressure or
+by DCQCN rate control -- and that lives entirely in the ns-3 outputs. This is an
+ns-3 question and the tool is an ns-3 tool.
 
-    predicted   from physical_topology.txt + config.txt ALONE, ns3_fabric computes
-                where the regime flips (a band in MiB). No simulation involved.
-    observed    from fct.txt / pfc.txt / qlen.txt, where the flip actually was.
+Two levels, kept physically apart:
 
-The two agreeing is the result. That is the co-design claim: the tool tells you what
-the fabric will do before you build it.
+    MODEL       from physical_topology.txt + config.txt ALONE, utils.fabric
+                computes where the regime must flip (a band, in MiB). No
+                simulation involved. Figure 05, and only figure 05.
+    MEASURED    from fct.txt / pfc.txt / qlen.txt. Figures 01-04. Every number
+                on them is read, none is fitted or estimated.
 
-How to read the output
+The two agreeing is the result: the tool says what the fabric will do before you
+build it. Disagreeing is also a result -- see `headroom_factor` below.
+
+Declared, never inferred
 --------------------------------------------------------------------------------
-The decisive regime test is `qlen_peak_over_pfc_ceiling`. The PFC ceiling is the
-egress occupancy once every ingress port is paused and its headroom has absorbed
-the in-flight packets. At the ceiling (~1.0) the queue is held by backpressure;
-below it, rate control is what limits. Everything else corroborates.
+--sweep       the one path input; every other path is derived (utils.paths).
+--placement   the rank->role map (utils.roles). It replaces --bulk-mb: the class
+              of a flow is structural, not a size threshold that needs tuning.
+--bottleneck  optional. Default is measured (deepest queue in qlen.txt), and it
+              must come out the same on every run of the sweep or this aborts:
+              a sweep whose curves are stitched together from different switches
+              is not a sweep.
 
-`slow_mean_incast` is ~N, not ~1. standalone_fct assumes a flow owns its
-bottleneck, so N flows sharing it fairly give slowdown N. The meaningful number is
-`slow_mean_over_fairshare`: 1.0 means the fabric is as fair as it can be.
-
-Flow taxonomy, used consistently:
-    bulk     size >= --bulk-mb                (a KV/PP transfer, not an ACK)
-    fabric   traverses at least one switch    (hops > 1)
-    direct   host-to-host link, 1 hop         (TP collectives; never congested,
-                                               slowdown ~1 by construction)
-    incast   bulk AND fabric                  -> the population every statistic
-                                                 named *_incast is computed over
-Mixing direct flows into the incast statistics turns them into a bimodal mixture:
-mean and CV then describe the mixing ratio, which is a constant of the workload,
-and look flat vs buffer for the wrong reason. Hence the filter, hence the need for
---topology.
-
-Layout
+What can silently be wrong
 --------------------------------------------------------------------------------
-    <astra_root>/<tag>/   stats_sys*.csv        tag = e.g. T1_bx100_dcqcn_buf8
-    <ns3_root>/<tag>/     fct.txt pfc.txt qlen.txt
-Matching is by tag; `buf<N>` is the swept axis and the rest is a `variant` key, so a
-second moving knob becomes its own series.
-
---topology takes a path, a {tag} template, or a directory. One file is fine if the
-topology is constant across the sweep (it is cached and reused).
---config MUST resolve per tag: BUFFER_SIZE is the swept axis, and a single
-config.txt collapses every run onto one buffer value.
+`headroom_factor` is compiled into ns-3 (common.h) and does NOT appear in
+config.txt, so this tool cannot read it -- it is asserted with --headroom-factor
+and every threshold, ceiling and band scales with it. If measured peak egress
+exceeds the modelled PFC ceiling, the ceiling is an upper bound by construction
+(pfc_threshold is evaluated at shared_used=0) and the excess is proof the
+asserted value is wrong. That check runs and prints; it is not decoration.
 
 Usage
 --------------------------------------------------------------------------------
-    python3 buffer_analyzer.py [ASTRA_ROOT] [--ns3-root R] [-o OUT]
-                               [--topology PATH|DIR|TEMPLATE] [--config ...]
-                               [--bulk-mb 1] [--decode-nodes 4,5,6,7]
-
-    python3 -m ns3_fabric <topology> <config>      # inspect the model on its own
-    python3 buffer_analyzer.py --print-patch       # the ns-3 qIndex diff
+    python3 buffer_sweep.py --sweep buffer_sweep_T1
+    python3 buffer_sweep.py --sweep buffer_sweep_T1 --placement "p0=0,1 p1=2,3 d0=4,5 d1=6,7"
+    python3 buffer_sweep.py --sweep buffer_sweep_T1 --bottleneck 8->12 -o /tmp/x
+    python3 -m utils.fabric <topology> <config>     # the model, on its own
+    python3 buffer_sweep.py --print-patch           # the ns-3 qIndex diff
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -79,721 +66,577 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from utils import astra
-from utils import ns3
-from utils.fabric import (Bottleneck, FabricModel, Ns3Config, Topology,
-                             parse_ns3_config, parse_topology)
 from utils import flows as flowlib
-from utils.plots import logx_pow2, plot_series, relative_range, save_fig
-from utils.sweep import (BUFFER_AXIS, discover_runs, find_aux, find_ns3_run,
-                            order_columns, resolve_ns3_root, resolve_outdir,
-                            write_table)
+from utils import ns3, paths, roles
+from utils.fabric import Bottleneck, FabricModel, Ns3Config, Topology, \
+    parse_ns3_config, parse_topology
+from utils.plots import logx_pow2, save_fig
+from utils.roles import Placement
+from utils.paths import BUFFER_AXIS
 
 NAN = float("nan")
-
-DEFAULT_ASTRA_ROOT = ("/home/andre/tesi/trace_evaluator/output/astra_logs/"
-                      "llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt/buffer_sweep_T1")
-DEFAULT_NS3_ROOT = "/home/andre/tesi/trace_evaluator/output/ns3/buffer_sweep_T1"
-DEFAULT_OUTDIR = ("/home/andre/tesi/trace_evaluator/results/sweep_analysis/buffer/T1_v2/"
-                  "llama2_13b_p-tp2pp2_d-tp2pp2_stream_16req_512prompt")
-DEFAULT_TOPOLOGY = ("/home/andre/tesi/trace_evaluator/configs/astra_sim/ns3/"
-                    "buffer_sweep_T1/{tag}/physical_topology.txt")
-DEFAULT_CONFIG = ("/home/andre/tesi/trace_evaluator/configs/astra_sim/ns3/"
-                  "buffer_sweep_T1/{tag}/config.txt")
-
-# Min-max normalisation maps any range onto 0-1, so a 1% wiggle renders as a
-# full-scale trend. Series flatter than this are refused, not normalised.
-MIN_REL_RANGE = 0.05
+KIND = "buffer"
 
 
 # --------------------------------------------------------------------------- #
-# Metrics
+# Fail fast, warn loud
+# --------------------------------------------------------------------------- #
+class Abort(Exception):
+    """A condition under which no number this script could print would mean
+    anything. Never caught, never downgraded to a default."""
+
+
+def need(cond, msg: str) -> None:
+    if not cond:
+        raise Abort(msg)
+
+
+WARNINGS: list[str] = []
+
+
+def warn(msg: str) -> None:
+    WARNINGS.append(msg)
+    print(f"  ! {msg}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# One row per run
 # --------------------------------------------------------------------------- #
 @dataclass
-class AstraMetrics:
-    n_ranks: float = NAN
-    makespan_ms: float = NAN
-    kv_completion_ns: float = NAN
-    comp_completion_ns: float = NAN
-    prefill_comp_completion_ns: float = NAN
-    kv_bound_ratio: float = NAN
-    kv_flows: float = NAN
-    kv_dedup: str = ""
-    kv_total_GB: float = NAN
-    kv_busy_union_ns: float = NAN
-    kv_agg_bw_bytes_per_ns: float = NAN
+class Row:
+    tag: str = ""
+    buffer_mb: float = NAN
+    cc_mode: float = NAN
 
-
-@dataclass
-class FabricMetrics:
-    congested_link: str = ""
-    congested_rate_gbps: float = NAN
-    fanin_ports: float = NAN
+    # -- the bottleneck, and the model of it (topology + config only) -------- #
+    bottleneck: str = ""
+    bn_rate_gbps: float = NAN
+    f_ports: float = NAN
     ingress_ports: str = ""
-    pfc_thresh_bytes: float = NAN
-    pfc_thresh_egress_equiv_bytes: float = NAN
-    pfc_thresh_naive_bytes: float = NAN
-    pfc_egress_ceiling_bytes: float = NAN
     pfc_shift: float = NAN
-    hdrm_pct_of_buffer: float = NAN
+    pfc_thresh_bytes: float = NAN
+    pfc_thresh_x_fports_bytes: float = NAN
+    pfc_thresh_naive_bytes: float = NAN
+    naive_error_pct: float = NAN
+    pfc_ceiling_bytes: float = NAN
+    hdrm_rsrv_pct_of_buffer: float = NAN
     kmin_bytes: float = NAN
     kmax_bytes: float = NAN
-    regime_pred: str = "?"
+    regime_model: str = ""
 
+    # -- measured: queue ----------------------------------------------------- #
+    qlen_peak_bytes: float = NAN
+    qlen_mean_bytes: float = NAN
+    qlen_peak_over_kmax: float = NAN
+    qlen_peak_over_ceiling: float = NAN      # >1 falsifies --headroom-factor
 
-@dataclass
-class PfcMetrics:
-    pfc_events: float = NAN
-    pfc_qidx: str = "n/a"
-    pfc_unclosed_pauses: float = NAN
-    pfc_bottleneck_pause_pct: float = NAN
-    pfc_worst_link_pause_pct: float = NAN
-    pfc_worst_link_device: str = ""
-    pfc_host_pause_max_pct: float = NAN
-    pfc_sw_pause_max_pct: float = NAN
+    # -- measured: PFC ------------------------------------------------------- #
+    pfc_qidx: str = ""
+    pfc_pause_pct_of_window: float = NAN
+    pfc_pause_pct_suspect: float = NAN   # mis-paired without qIndex; an upper bound on the error
+    pfc_pause_worst_device: str = ""
     pfc_paused_devices: float = NAN
 
+    # -- measured: flows ----------------------------------------------------- #
+    flows_total: float = NAN
+    flows_tp: float = NAN
+    flows_kv: float = NAN
+    flows_pp_prefill: float = NAN
+    flows_pp_decode: float = NAN
+    flows_other: float = NAN
+    kv_at_bottleneck: float = NAN
+    kv_window_ns: float = NAN
+    concurrency_peak: float = NAN
+    concurrency_mean: float = NAN
+    slow_mean: float = NAN
+    slow_p50: float = NAN
+    slow_p99: float = NAN
+    slow_max: float = NAN
 
-@dataclass
-class QlenMetrics:
-    qlen_samples: float = NAN
-    qlen_peak_congested_port_bytes: float = NAN
-    qlen_mean_congested_port_bytes: float = NAN
-    qlen_peak_over_pfc_ceiling: float = NAN     # the decisive regime test
-    qlen_peak_over_kmax: float = NAN
-    qlen_peak_over_kmin: float = NAN
-    qlen_peak_switch_total_bytes: float = NAN
-
-
-@dataclass
-class FlowMetrics:
-    fct_flows: float = NAN
-    fct_incast_flows: float = NAN
-    fct_direct_flows: float = NAN
-    bottleneck_flows: float = NAN
-    n_concurrent_peak: float = NAN
-    n_concurrent_mean: float = NAN
-    slow_mean_incast: float = NAN
-    slow_p50_incast: float = NAN
-    slow_p99_incast: float = NAN
-    slow_max_incast: float = NAN
-    slow_cv_incast: float = NAN
-    slow_mean_over_fairshare: float = NAN
-    slow_p99_over_fairshare: float = NAN
-    slow_mean_direct: float = NAN
-    incast_window_ns: float = NAN
-    run_end_ns: float = NAN
-
-
-@dataclass
-class BarrierMetrics:
-    kv_ready_max_ns: float = NAN
+    # -- measured: the barrier ----------------------------------------------- #
+    kv_ready_max_ns: float = NAN             # the decode-start gate
     kv_ready_min_ns: float = NAN
-    sync_skew_ns: float = NAN
-    cross_rank_skew_ns: float = NAN
-    decode_ranks_seen: float = NAN
-    incast_dst: str = ""
+    cross_rank_skew_ns: float = NAN          # a real skew: spread ACROSS ranks
+    kv_stream_duration_ns: float = NAN       # NOT a skew -- see barrier()
+    decode_ranks: str = ""
 
-
-@dataclass
-class RunRow:
-    run_dir: str = ""
-    variant: str = ""
-    buffer_mb: float = NAN
-    regime_obs: str = "?"
-    cc_mode: float = NAN
-    ns3_dir: str = ""
-    astra: AstraMetrics = field(default_factory=AstraMetrics)
-    fabric: FabricMetrics = field(default_factory=FabricMetrics)
-    pfc: PfcMetrics = field(default_factory=PfcMetrics)
-    qlen: QlenMetrics = field(default_factory=QlenMetrics)
-    flows: FlowMetrics = field(default_factory=FlowMetrics)
-    barrier: BarrierMetrics = field(default_factory=BarrierMetrics)
-    per_node: object = None          # audit frame; excluded from flat()
+    slowdowns: object = None                 # raw array, for the box plot
 
     def flat(self) -> dict:
-        """One CSV row. Field names are declared once, in the dataclasses, so a
-        metric can no longer be silently invented or forgotten by a dict literal."""
-        out = {}
-        for f in fields(self):
-            if f.name == "per_node":
-                continue
-            v = getattr(self, f.name)
-            out.update(asdict(v)) if hasattr(v, "__dataclass_fields__") else out.update({f.name: v})
-        return out
-
-
-def isnum(x) -> bool:
-    return isinstance(x, (int, float)) and x == x
+        d = asdict(self)
+        d.pop("slowdowns")
+        return d
 
 
 # --------------------------------------------------------------------------- #
-# Run discovery
+# Measurement
 # --------------------------------------------------------------------------- #
-# --------------------------------------------------------------------------- #
-# Flow annotation and the bottleneck
-# --------------------------------------------------------------------------- #
-# --------------------------------------------------------------------------- #
-# Metric computation, one group per function
-# --------------------------------------------------------------------------- #
-def astra_metrics(df: pd.DataFrame) -> AstraMetrics:
-    m = AstraMetrics()
-    m.n_ranks = int(df["sys_id"].nunique()) if "sys_id" in df else NAN
-    span = df["end_tick"].max() - df["start_tick"].min()
-    m.makespan_ms = span / 1e6
+def pause_pct(log: ns3.PfcLog, bn: Bottleneck, topo: Topology,
+              lo: int, hi: int) -> tuple[float, float, str, int]:
+    """Fraction of [lo, hi] each PAUSE victim of `bn` spent paused.
 
-    def last_end(mask) -> float:
-        s = df.loc[mask, "end_tick"]
-        return float(s.max()) if len(s) else NAN
+    Two things the old code got wrong and that are not cosmetic:
 
-    kv_mask, comp_mask = df["op_class"] == "KV", df["op_class"] == "COMP"
-    m.kv_completion_ns = last_end(kv_mask)
-    m.comp_completion_ns = last_end(comp_mask)
-    m.prefill_comp_completion_ns = last_end(comp_mask & (df["phase"] == "prefill"))
-    m.kv_bound_ratio = m.kv_completion_ns / span if span > 0 else NAN
+    * the numerator was accumulated over the whole run and divided by the KV
+      window. Different supports; not a percentage of anything. Here the pause
+      intervals are clipped to the same window as the denominator.
+    * queues of one device overlap in time, so summing over qIndex can exceed
+      the device's own paused wall-clock. Here they are unioned.
 
-    kv = df[kv_mask]
-    if not len(kv):
-        return m
-    # One row per transfer: the send side. A send and its recv share a node name
-    # and land in two different sys files, so the raw rows are exactly double.
-    n_raw = len(kv)
-    kv = astra.sends(df, kv_mask)
-    m.kv_dedup = f"send-only ({n_raw} rows -> {len(kv)} transfers)"
-    m.kv_flows = len(kv)
-    total = kv["comm_size"].sum(min_count=1)
-    window = kv["end_tick"].max() - kv["start_tick"].min()
-    m.kv_total_GB = total / 1e9 if pd.notna(total) else NAN
-    m.kv_busy_union_ns = astra.interval_union(kv["start_tick"], kv["end_tick"])
-    m.kv_agg_bw_bytes_per_ns = total / window if window > 0 else NAN
-    return m
+    When pfc.txt has no qIndex the pairing can be wrong, but only where the two
+    queues actually interleave -- so the suspect intervals are flagged and their
+    weight returned, rather than the whole file being declared unusable. The
+    truth is bracketed by [pct - suspect, pct].
 
-
-def fabric_metrics(model: FabricModel | None, bn: Bottleneck | None,
-                   buffer_bytes: int) -> FabricMetrics:
-    m = FabricMetrics(pfc_thresh_naive_bytes=buffer_bytes / 8.0)
-    if model is None or bn is None:
-        return m
-    topo = model.topo
-    m.congested_link = str(bn)
-    m.congested_rate_gbps = bn.rate / 1e9
-    m.fanin_ports = bn.f_ports
-    m.ingress_ports = ",".join(str(p) for p in bn.ingress_ports)
-    m.pfc_shift = topo.shift[bn.switch][bn.egress_port]
-    m.pfc_thresh_bytes = model.pfc_threshold(bn, buffer_bytes)
-    m.hdrm_pct_of_buffer = 100.0 * (topo.total_hdrm[bn.switch]
-                                    + topo.total_rsrv[bn.switch]) / buffer_bytes
-    kmin, kmax = model.ecn_band(bn)
-    m.kmin_bytes = kmin if kmin is not None else NAN
-    m.kmax_bytes = kmax if kmax is not None else NAN
-    if bn.f_ports:
-        try:
-            m.pfc_thresh_egress_equiv_bytes = model.egress_equivalent_threshold(bn, buffer_bytes)
-            m.pfc_egress_ceiling_bytes = model.pfc_egress_ceiling(bn, buffer_bytes)
-            m.regime_pred = model.regime(bn, buffer_bytes)
-        except ValueError as exc:
-            print(f"  ! {exc}", file=sys.stderr)
-    return m
-
-
-def pfc_metrics(log: ns3.PfcLog | None, bn: Bottleneck | None, topo: Topology | None,
-                window: float, run_end: float) -> PfcMetrics:
-    m = PfcMetrics()
-    if log is None:
-        return m
-    m.pfc_events = log.n_events
-    m.pfc_qidx = log.qidx_state
-    per_dev = log.pause_per_device(clamp_to=int(run_end or log.t_max))
-    _, m.pfc_unclosed_pauses = log.pause_totals(int(run_end or log.t_max))
-    denom = window if isnum(window) and window > 0 else run_end
-    if not denom:
-        return m
-
-    def pct(v) -> float:
-        return 100.0 * v / denom
-
+    Only the devices upstream of THIS link are evidence about ITS regime: the
+    global worst can sit on an unrelated one (in T1 it usually sits on the other
+    leaf, which is a second, independent bottleneck)."""
+    victims = set(bn.pause_victims(topo))
+    iv = log.pause_intervals_flagged(clamp_to=hi)
+    per_dev: dict[tuple[int, int], list] = {}
+    for (node, _ntype, ifidx, _q), spans in iv.items():
+        if (node, ifidx) in victims:
+            per_dev.setdefault((node, ifidx), []).extend(spans)
     if not per_dev:
-        m.pfc_bottleneck_pause_pct = m.pfc_worst_link_pause_pct = 0.0
-        m.pfc_host_pause_max_pct = m.pfc_sw_pause_max_pct = 0.0
-        m.pfc_paused_devices = 0
-        return m
-    worst = max(per_dev, key=per_dev.get)
-    m.pfc_worst_link_pause_pct = pct(per_dev[worst])
-    m.pfc_worst_link_device = f"n{worst[0]}/if{worst[2]}({'sw' if worst[1] == 1 else 'host'})"
-    hosts = [v for (_n, nt, _i), v in per_dev.items() if nt == 0]
-    sws = [v for (_n, nt, _i), v in per_dev.items() if nt == 1]
-    m.pfc_host_pause_max_pct = pct(max(hosts)) if hosts else 0.0
-    m.pfc_sw_pause_max_pct = pct(max(sws)) if sws else 0.0
-    m.pfc_paused_devices = sum(1 for v in per_dev.values() if v > 0)
-    # Only the devices upstream of the congested link are evidence about ITS
-    # regime; the global worst can sit on an unrelated link.
-    if bn is not None and topo is not None:
-        victims = set(bn.pause_victims(topo))
-        vv = [v for (n, _nt, i), v in per_dev.items() if (n, i) in victims]
-        m.pfc_bottleneck_pause_pct = pct(max(vv)) if vv else 0.0
-    return m
+        return 0.0, 0.0, "", 0
+    span = hi - lo
+    need(span > 0, "the KV window has zero duration")
+    tot = {k: union_len([(a, b) for a, b, _ in v], lo, hi) for k, v in per_dev.items()}
+    best = max(tot, key=tot.get)
+    sus = union_len([(a, b) for a, b, q in per_dev[best] if q], lo, hi)
+    return (100.0 * tot[best] / span, 100.0 * sus / span,
+            f"n{best[0]}/if{best[1]}", sum(1 for v in tot.values() if v > 0))
 
 
-def qlen_metrics(log: ns3.QlenLog | None, bn: Bottleneck | None,
-                 fab: FabricMetrics, buffer_bytes: int) -> QlenMetrics:
-    m = QlenMetrics()
-    if log is None or not log.port_max:
-        return m
-    m.qlen_samples = log.samples
-    m.qlen_peak_switch_total_bytes = max(log.switch_total_max.values(), default=NAN)
-    if bn is None:
-        return m
-    peak = log.port_max.get((bn.switch, bn.egress_port), NAN)
-    m.qlen_peak_congested_port_bytes = peak
-    m.qlen_mean_congested_port_bytes = log.port_mean.get((bn.switch, bn.egress_port), NAN)
-    for attr, ref in (("qlen_peak_over_pfc_ceiling", fab.pfc_egress_ceiling_bytes),
-                      ("qlen_peak_over_kmax", fab.kmax_bytes),
-                      ("qlen_peak_over_kmin", fab.kmin_bytes)):
-        if isnum(peak) and isnum(ref) and ref:
-            setattr(m, attr, peak / ref)
-    return m
+def union_len(spans: list[tuple[int, int]], lo: int, hi: int) -> int:
+    """Measure of the union of `spans` clipped to [lo, hi]."""
+    clipped = sorted((max(s, lo), min(e, hi)) for s, e in spans
+                     if min(e, hi) > max(s, lo))
+    total, cs, ce = 0, None, None
+    for s, e in clipped:
+        if cs is None:
+            cs, ce = s, e
+        elif s <= ce:
+            ce = max(ce, e)
+        else:
+            total += ce - cs
+            cs, ce = s, e
+    return total + (ce - cs if cs is not None else 0)
 
 
-def flow_metrics(f: pd.DataFrame | None, bn: Bottleneck | None) -> FlowMetrics:
-    m = FlowMetrics()
-    if f is None or not len(f):
-        return m
-    m.fct_flows = len(f)
-    m.run_end_ns = float(f["arrival"].max())
-    inc = f[f["incast"]]
-    m.fct_incast_flows = len(inc)
-    m.fct_direct_flows = int((~f["fabric"]).sum())
-    if len(inc):
-        m.incast_window_ns = float(inc["arrival"].max() - inc["start"].min())
-    else:
-        print("  ! no incast flows: check --bulk-mb against the real KV flow size "
-              "(there is no silent fallback to all flows)", file=sys.stderr)
-
-    if bn is not None:
-        iv = flowlib.bottleneck_intervals(f, bn)
-        m.bottleneck_flows = len(iv)
-        m.n_concurrent_peak, m.n_concurrent_mean = flowlib.concurrency_stats(iv)
-
-    sd = inc.loc[inc["slowdown"].notna(), "slowdown"].to_numpy(float)
-    if len(sd):
-        m.slow_mean_incast = float(np.mean(sd))
-        m.slow_p50_incast = float(np.percentile(sd, 50))
-        m.slow_p99_incast = float(np.percentile(sd, 99))
-        m.slow_max_incast = float(np.max(sd))
-        s = np.std(sd, ddof=1) if len(sd) > 1 else 0.0
-        m.slow_cv_incast = float(s / m.slow_mean_incast) if m.slow_mean_incast else NAN
-        if isnum(m.n_concurrent_mean) and m.n_concurrent_mean:
-            m.slow_mean_over_fairshare = m.slow_mean_incast / m.n_concurrent_mean
-            m.slow_p99_over_fairshare = m.slow_p99_incast / m.n_concurrent_mean
-    direct = f.loc[~f["fabric"] & f["slowdown"].notna(), "slowdown"]
-    m.slow_mean_direct = float(direct.mean()) if len(direct) else NAN
-    return m
-
-
-def barrier_metrics(f: pd.DataFrame | None, decode_nodes: list[int]) -> BarrierMetrics:
+def barrier(kv: pd.DataFrame, placement: Placement) -> dict:
     """The first decode step is a synchronisation barrier: it cannot start until
-    every KV flow feeding a decode rank has arrived. So KV-ready per rank is its
-    latest arrival, and the gate is the worst rank.
+    every KV flow feeding a decode rank has arrived. KV-ready per rank is that
+    rank's latest arrival; the gate is the worst rank.
 
-    Caveat worth carrying into the write-up: with KV emitted per layer, the spread
-    of arrivals on a rank is the duration of that rank's KV stream (staggered by
-    prefill compute), not a synchronisation skew. Redefining it over same-layer
-    flows is a methodology choice, not a bug fix."""
-    m = BarrierMetrics()
-    if f is None or not len(f):
-        return m
-    inc = f[f["incast"]]
-    if not len(inc):
-        return m
-    if decode_nodes:
-        dnodes = [d for d in decode_nodes if d in set(inc["dst"])]
-    else:
-        cnt = inc.groupby("dst").size().sort_values(ascending=False)
-        dnodes = [int(d) for d, c in cnt.items() if c > 1] or \
-                 ([int(cnt.index[0])] if len(cnt) else [])
-    ready, skew = [], []
-    for d in dnodes:
-        arr = inc.loc[inc["dst"] == d, "arrival"]
+    Two spreads, and they are not the same quantity:
+
+        cross_rank_skew_ns    max(ready) - min(ready) ACROSS decode ranks. A
+                              real synchronisation skew: how much earlier the
+                              luckiest rank could have started.
+        kv_stream_duration_ns max(arrival) - min(arrival) WITHIN one rank. With
+                              KV emitted per layer (T1: 20 flows per prefill
+                              rank, one per layer) this is the duration of that
+                              rank's KV stream, staggered by prefill compute --
+                              NOT a skew. The old `sync_skew_ns` was this, under
+                              the other name."""
+    out = {"decode_ranks": ",".join(map(str, placement.decode_ranks))}
+    ready, dur = {}, {}
+    for d in placement.decode_ranks:
+        arr = kv.loc[kv["dst"] == d, "arrival"]
         if len(arr):
-            ready.append(float(arr.max()))
-            skew.append(float(arr.max() - arr.min()))
-    if not ready:
-        return m
-    m.kv_ready_max_ns = max(ready)
-    m.kv_ready_min_ns = min(ready)
-    m.sync_skew_ns = max(skew)
-    m.cross_rank_skew_ns = max(ready) - min(ready)
-    m.decode_ranks_seen = len(ready)
-    m.incast_dst = ",".join(str(d) for d in dnodes)
-    return m
+            ready[d] = float(arr.max())
+            dur[d] = float(arr.max() - arr.min())
+    need(ready, f"no KV flow arrives at any declared decode rank "
+                f"{placement.decode_ranks}: --placement is wrong.")
+    if len(ready) < len(placement.decode_ranks):
+        warn(f"only {len(ready)}/{len(placement.decode_ranks)} decode ranks "
+             f"receive KV; the barrier is over {sorted(ready)}.")
+    out["kv_ready_max_ns"] = max(ready.values())
+    out["kv_ready_min_ns"] = min(ready.values())
+    out["cross_rank_skew_ns"] = max(ready.values()) - min(ready.values())
+    out["kv_stream_duration_ns"] = max(dur.values())
+    return out
 
 
-def regime_observed(row: RunRow) -> str:
-    """Measured, not assumed. The queue riding at the PFC ceiling means it is held
-    by backpressure; below it, rate control limits."""
-    pause = row.pfc.pfc_bottleneck_pause_pct
-    if not isnum(pause):
-        pause = row.pfc.pfc_worst_link_pause_pct
-    if not isnum(pause):
-        return "?"
-    at_ceiling = isnum(row.qlen.qlen_peak_over_pfc_ceiling) and \
-        row.qlen.qlen_peak_over_pfc_ceiling >= 0.95
-    if at_ceiling and pause > 1.0:
-        return "PFC"
-    return "MIXED" if pause > 0.5 else "DCQCN"
+def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
+            hf: int, bn_force: str | None) -> Row:
+    buf = BUFFER_AXIS.value(tag)
+    need(buf is not None, f"{tag}: no 'buf<num>' token in the directory name; "
+                          f"the swept axis is unreadable.")
+
+    tpath, cpath = p.topology(tag), p.config(tag)
+    ns3_dir = p.ns3_run(tag)
+    for f in (tpath, cpath, ns3_dir / "fct.txt", ns3_dir / "pfc.txt",
+              ns3_dir / "qlen.txt"):
+        need(f.exists(), f"{tag}: missing {f}")
+
+    topo = parse_topology(tpath, hf)
+    cfg = parse_ns3_config(cpath)
+    for w in cfg.warnings():
+        warn(f"{tag}: {w}")
+    need(cfg.buffer_mb is not None,
+         f"{tag}: no BUFFER_SIZE in {cpath}. If this is the template, --sweep "
+         f"points at the template dir, not the generated configs.")
+    need(abs(cfg.buffer_mb - buf) < 1e-6,
+         f"{tag}: BUFFER_SIZE={cfg.buffer_mb} MiB in config.txt but 'buf{buf:g}' "
+         f"in the directory name. One of the two is lying.")
+    if topo.ecmp_pairs:
+        warn(f"{tag}: ECMP ties on {len(topo.ecmp_pairs)} (node, host) pairs: "
+             f"runtime paths are hash-chosen, so per-flow path attribution -- "
+             f"including the ingress set of the bottleneck -- is approximate.")
+
+    row = Row(tag=tag, buffer_mb=float(buf), cc_mode=cfg.cc_mode if cfg.cc_mode
+              is not None else NAN)
+    buffer_bytes = int(buf * 1024 * 1024)
+
+    # -- flows ------------------------------------------------------------- #
+    raw = ns3.read_fct(ns3_dir / "fct.txt")
+    need(raw is not None and len(raw), f"{tag}: fct.txt has no parsable rows.")
+    f = flowlib.annotate(raw, topo, placement, cfg.payload)
+    for w in roles.check(f, placement):
+        warn(f"{tag}: {w}")
+    counts = f["flow_class"].value_counts()
+    row.flows_total = len(f)
+    for c in roles.FLOW_CLASSES:
+        setattr(row, f"flows_{c}", float(counts.get(c, 0)))
+    kv = f[f["flow_class"] == "kv"]
+    need(len(kv), f"{tag}: no KV flow after classification.")
+
+    # -- the bottleneck ---------------------------------------------------- #
+    qlen = ns3.read_qlen(ns3_dir / "qlen.txt")
+    need(qlen is not None and qlen.port_max, f"{tag}: qlen.txt has no samples.")
+    if bn_force:
+        sw, peer = (int(x) for x in bn_force.split("->"))
+        egress = topo.port_facing(sw, peer)
+        need(egress is not None, f"--bottleneck {bn_force}: no such link.")
+        ing = set()
+        for path in kv["path"]:
+            for i, (x, y) in enumerate(path or []):
+                if (x, y) == (sw, peer) and i > 0:
+                    if (q := topo.port_facing(sw, path[i - 1][0])) is not None:
+                        ing.add(q)
+        bn = Bottleneck(sw, egress, peer, topo.ports[sw][egress].rate,
+                        tuple(sorted(ing)))
+    else:
+        bn = flowlib.find_bottleneck(topo, qlen.port_max, kv)
+    need(bn.f_ports, f"{tag}: no KV flow enters {bn} through a known ingress "
+                     f"port; F_ports=0 and the PFC threshold is meaningless.")
+
+    row.bottleneck, row.bn_rate_gbps = str(bn), bn.rate / 1e9
+    row.f_ports = bn.f_ports
+    row.ingress_ports = ",".join(map(str, bn.ingress_ports))
+    row.pfc_shift = topo.shift[bn.switch][bn.egress_port]
+
+    # -- the model (topology + config only) -------------------------------- #
+    model = FabricModel(topo, cfg)
+    row.pfc_thresh_bytes = model.steady_threshold(bn, buffer_bytes)
+    row.pfc_thresh_x_fports_bytes = model.egress_equivalent_threshold(bn, buffer_bytes)
+    row.pfc_ceiling_bytes = model.pfc_egress_ceiling(bn, buffer_bytes)
+    row.pfc_thresh_naive_bytes = buffer_bytes / 8.0
+    row.naive_error_pct = 100.0 * (row.pfc_thresh_naive_bytes /
+                                   row.pfc_thresh_bytes - 1.0)
+    row.hdrm_rsrv_pct_of_buffer = 100.0 * (topo.total_hdrm[bn.switch] +
+                                           topo.total_rsrv[bn.switch]) / buffer_bytes
+    kmin, kmax = model.ecn_band(bn)
+    need(kmin is not None and kmax is not None,
+         f"{tag}: no KMIN/KMAX entry for {bn.rate} bit/s in {cpath}. ns-3 would "
+         f"NS_ASSERT on this; the map key must equal the link BitRate exactly.")
+    row.kmin_bytes, row.kmax_bytes = float(kmin), float(kmax)
+    row.regime_model = model.regime(bn, buffer_bytes)
+
+    # -- measured queue ----------------------------------------------------- #
+    row.qlen_peak_bytes = float(qlen.port_max[(bn.switch, bn.egress_port)])
+    row.qlen_mean_bytes = float(qlen.port_mean[(bn.switch, bn.egress_port)])
+    row.qlen_peak_over_kmax = row.qlen_peak_bytes / kmax
+    row.qlen_peak_over_ceiling = row.qlen_peak_bytes / row.pfc_ceiling_bytes
+
+    # -- measured flows at the bottleneck ----------------------------------- #
+    kv_bn = kv[flowlib.crosses(kv, bn)]
+    need(len(kv_bn), f"{tag}: no KV flow crosses {bn}.")
+    row.kv_at_bottleneck = len(kv_bn)
+    lo, hi = int(kv_bn["start"].min()), int(kv_bn["arrival"].max())
+    row.kv_window_ns = hi - lo
+    row.concurrency_peak, row.concurrency_mean = \
+        flowlib.concurrency_stats(flowlib.intervals(kv_bn))
+    sd = kv_bn.loc[kv_bn["slowdown"].notna(), "slowdown"].to_numpy(float)
+    need(len(sd), f"{tag}: every KV flow at {bn} has standalone_fct <= 0.")
+    row.slowdowns = sd
+    row.slow_mean, row.slow_p50 = float(sd.mean()), float(np.percentile(sd, 50))
+    row.slow_p99, row.slow_max = float(np.percentile(sd, 99)), float(sd.max())
+
+    # -- measured PFC ------------------------------------------------------- #
+    pfc = ns3.read_pfc(ns3_dir / "pfc.txt")
+    need(pfc is not None, f"{tag}: pfc.txt unreadable.")
+    row.pfc_qidx = pfc.qidx_state
+    (row.pfc_pause_pct_of_window, row.pfc_pause_pct_suspect,
+     row.pfc_pause_worst_device, n) = pause_pct(pfc, bn, topo, lo, hi)
+    row.pfc_paused_devices = n
+    if pfc.qidx_state == "MISSING" and row.pfc_pause_pct_suspect > 0:
+        warn(f"{tag}: pfc.txt has no qIndex, and the PAUSE/RESUME sequences of "
+             f"two priority queues demonstrably interleave on "
+             f"{row.pfc_pause_worst_device} (get_pfc drops the qIndex that "
+             f"qbb-net-device.cc:383 has in scope). The mis-paired intervals are "
+             f"worth {row.pfc_pause_pct_suspect:.2f} of the "
+             f"{row.pfc_pause_pct_of_window:.2f} percentage points, so the true "
+             f"pause is in [{row.pfc_pause_pct_of_window - row.pfc_pause_pct_suspect:.2f}, "
+             f"{row.pfc_pause_pct_of_window:.2f}]%. Apply --print-patch to remove "
+             f"the bracket.")
+
+    # -- the model check that matters --------------------------------------- #
+    if row.qlen_peak_over_ceiling > 1.0:
+        warn(f"{tag}: measured peak egress ({row.qlen_peak_bytes/1e6:.2f} MB) "
+             f"exceeds the modelled PFC ceiling ({row.pfc_ceiling_bytes/1e6:.2f} "
+             f"MB) by {100*(row.qlen_peak_over_ceiling-1):.0f}%. The ceiling is "
+             f"built from the threshold at its FIXED POINT, so it is an upper "
+             f"bound and this is impossible. Ruled out already, in the ns-3 "
+             f"source: headroom_factor is 3 (common.h:86, and HEADROOM_FACTOR "
+             f"overrides it if you set it); ingress and egress account the same "
+             f"packets (RemoveFromIngressAdmission runs at dequeue); headroom "
+             f"does not overflow (uint64). What is left, and is checkable: "
+             f"hdrm_bytes[port][qIndex] is per-queue but its limit headroom[port] "
+             f"is per-port, and ConfigNPort reserves ONE per port -- so qCnt "
+             f"queues can each claim a full headroom. qlen.txt cannot show it "
+             f"because monitor_buffer sums egress_bytes over all queues while "
+             f"ShouldSendCN tests one (switch-mmu.cc:103). Emit qIndex from "
+             f"monitor_buffer to settle it.")
+
+    # -- the barrier -------------------------------------------------------- #
+    for k, v in barrier(kv, placement).items():
+        setattr(row, k, v)
+    return row
 
 
 # --------------------------------------------------------------------------- #
-# Plots
+# Figures. Four measured, one model. Nothing normalised, nothing fitted.
 # --------------------------------------------------------------------------- #
-def _band(ax, band: tuple[float, float] | None) -> None:
-    """The transition is a band, not a line: PFC below the KMIN crossing, DCQCN
-    above the KMAX crossing, mixed in between."""
-    if not band:
-        return
-    lo, hi = band
-    ax.axvspan(lo, hi, color="#6a4c93", alpha=0.12, zorder=0,
-               label=f"predicted PFC↔DCQCN band ({lo:.1f}–{hi:.1f} MiB)")
-    ax.axvline(lo, color="#6a4c93", linestyle=":", lw=1.0)
-    ax.axvline(hi, color="#6a4c93", linestyle="--", lw=1.2)
+def band_of(topo: Topology, cfg: Ns3Config, bn: Bottleneck) -> tuple[float, float] | None:
+    return FabricModel(topo, cfg).flip_band(bn)
 
 
-def make_plots(summary: pd.DataFrame, outdir: Path,
-               band: tuple[float, float] | None) -> list[Path]:
-    outdir.mkdir(parents=True, exist_ok=True)
+def _decorate(fig, s, outdir, name, title, ylabel, band, written, fs=8):
+    ax = fig.axes[0]
+    logx_pow2(ax, s, "buffer_mb", "Per-switch buffer (MiB)")
+    if band:
+        lo, hi = band
+        ax.axvspan(lo, hi, color="#6a4c93", alpha=0.12, zorder=0,
+                   label=f"MODEL: PFC↔DCQCN band ({lo:.1f}–{hi:.1f} MiB)")
+        ax.axvline(lo, color="#6a4c93", ls=":", lw=1.0)
+        ax.axvline(hi, color="#6a4c93", ls="--", lw=1.2)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3, which="both")
+    h = sum((a.get_legend_handles_labels()[0] for a in fig.axes), [])
+    l = sum((a.get_legend_handles_labels()[1] for a in fig.axes), [])
+    ax.legend(h, l, loc="best", fontsize=fs)
+    save_fig(fig, outdir, name, written)
+
+
+def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
+               band, bn_label: str, qidx_ok: bool) -> list[Path]:
     written: list[Path] = []
-    s = summary.sort_values("buffer_mb")
+    x = s["buffer_mb"]
 
-    def save(fig, name, title, ylabel, legend_fs=8):
-        ax = fig.axes[0]
-        logx_pow2(ax, s, "buffer_mb", "Per-switch buffer (MiB)")
-        _band(ax, band)
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        ax.grid(True, alpha=0.3)
-        handles = sum((a.get_legend_handles_labels()[0] for a in fig.axes), [])
-        labels = sum((a.get_legend_handles_labels()[1] for a in fig.axes), [])
-        ax.legend(handles, labels, loc="best", fontsize=legend_fs)
-        save_fig(fig, outdir, name, written)
-
-    # 1 REGIME ------------------------------------------------------------- #
+    # 01 PFC pause: the regime discriminator, measured ---------------------- #
     fig, ax = plt.subplots(figsize=(8, 5))
-    ok = plot_series(ax, s, "buffer_mb", "pfc_bottleneck_pause_pct", "PFC pause on the bottleneck's ingress")
-    ok |= plot_series(ax, s, "buffer_mb", "pfc_worst_link_pause_pct", "PFC pause, worst device anywhere",
-                marker="v", linestyle="-.")
-    if ok:
-        ax2 = ax.twinx()
-        plot_series(ax2, s, "buffer_mb", "qlen_peak_over_pfc_ceiling", "Peak egress / PFC ceiling",
-              marker="s", linestyle="--", color="#d98a00")
-        ax2.axhline(1.0, color="#d98a00", linestyle=":", lw=1)
-        ax2.set_ylabel("Peak egress / PFC ceiling  (≈1 = held by backpressure)")
-        save(fig, "01_regime_vs_buffer.png",
-             "Congestion regime vs buffer\n(queue at the PFC ceiling = backpressure; "
-             "below it = rate control)", "PFC pause (% of incast window)")
-    else:
-        plt.close(fig)
+    ax.plot(x, s["pfc_pause_pct_of_window"], "o-", color="#1f77b4",
+            label=f"PAUSE received by the ingress hosts of {bn_label}")
+    sus = s["pfc_pause_pct_suspect"].fillna(0)
+    if (sus > 0).any():
+        ax.fill_between(x, s["pfc_pause_pct_of_window"] - sus,
+                        s["pfc_pause_pct_of_window"], color="#1f77b4", alpha=0.25,
+                        label="mis-paired without qIndex (upper bound on the error)")
+    caveat = "" if qidx_ok else (f"\npfc.txt has no qIndex: shaded = the "
+                                 f"{sus.max():.1f} pp that may be mis-paired")
+    _decorate(fig, s, outdir, "01_pfc_pause_vs_buffer.png",
+              f"Congestion regime: PFC pause vs buffer{caveat}",
+              "Paused fraction of the KV window (%)", band, written)
 
-    # 2 TRADE-OFF ---------------------------------------------------------- #
+    # 02 queue vs the ECN band: measured bytes, config constants ------------ #
     fig, ax = plt.subplots(figsize=(8, 5))
-    if plot_series(ax, s, "buffer_mb", "slow_mean_incast", "Mean slowdown (incast)"):
-        plot_series(ax, s, "buffer_mb", "slow_p99_incast", "p99 slowdown (incast)", marker="s", linestyle="--")
-        plot_series(ax, s, "buffer_mb", "slow_max_incast", "Max slowdown (incast)", marker="^", linestyle=":")
-        mn = s["n_concurrent_mean"].dropna()
-        pk = s["n_concurrent_peak"].dropna().unique()
-        if len(mn):
-            ax.axhline(mn.mean(), color="#2b8a3e", linestyle="-.", lw=1.4,
-                       label=f"fair-share reference (mean concurrency ≈ {mn.mean():.0f})")
-        if len(pk) == 1 and pk[0]:
-            ax.axhline(pk[0], color="#2b8a3e", linestyle=":", lw=1.0,
-                       label=f"peak concurrency = {pk[0]:g} (upper bound, not a floor)")
-        save(fig, "02_slowdown_mean_vs_tail.png",
-             "Mean vs tail vs buffer\n(standalone_fct assumes the flow owns the "
-             "bottleneck → reference = concurrency)",
-             "Slowdown (fct / standalone_fct)")
-    else:
-        plt.close(fig)
+    ax.plot(x, s["qlen_peak_bytes"] / 1e3, "s-", color="#d1495b",
+            label="Measured PEAK egress queue")
+    ax.plot(x, s["qlen_mean_bytes"] / 1e3, "v--", color="#d1495b", alpha=0.6,
+            label="Measured MEAN egress queue")
+    for col, ls, nm in (("kmin_bytes", ":", "KMIN"), ("kmax_bytes", "--", "KMAX")):
+        v = s[col].unique()
+        if len(v) == 1:
+            ax.axhline(v[0] / 1e3, color="#2b8a3e", ls=ls, lw=1.2,
+                       label=f"{nm} = {v[0]/1e3:g} kB (config.txt)")
+    ax.set_yscale("log")
+    _decorate(fig, s, outdir, "02_queue_vs_ecn_band.png",
+              "Why the regime flips: does the queue ever reach KMAX?\n"
+              "(peak below KMIN → ECN never marks → DCQCN is inert by geometry)",
+              "Egress queue (kB, log)", band, written)
 
-    # 3 FAIRNESS ----------------------------------------------------------- #
+    # 03 slowdown distribution: no mean/CV, the actual distribution --------- #
     fig, ax = plt.subplots(figsize=(8, 5))
-    if plot_series(ax, s, "buffer_mb", "slow_cv_incast", "CV of incast slowdown (unfairness)"):
-        save(fig, "03_fairness_cv_vs_buffer.png",
-             "Fairness vs buffer\n(higher CV = victim flows / HOL blocking = PFC signature)",
-             "CV = std/mean of slowdown")
-    else:
-        plt.close(fig)
+    order = np.argsort(s["buffer_mb"].to_numpy())
+    data = [rows[i].slowdowns for i in order]
+    pos = s["buffer_mb"].to_numpy()[order]
+    ax.boxplot(data, positions=pos, widths=[b * 0.25 for b in pos],
+               showfliers=True, manage_ticks=False,
+               medianprops=dict(color="#d1495b"))
+    cm = s["concurrency_mean"]
+    ax.plot(x, cm, "^--", color="#2b8a3e", lw=1.2,
+            label="measured mean concurrency at the bottleneck\n"
+                  "(standalone_fct assumes the flow owns the link → this is "
+                  "the fair-share reference)")
+    _decorate(fig, s, outdir, "03_slowdown_distribution.png",
+              f"KV flow slowdown at {bn_label}, full distribution vs buffer",
+              "Slowdown (fct / standalone_fct)", band, written)
 
-    # 4 BARRIER ------------------------------------------------------------ #
+    # 04 the barrier: real units, twin axis, no normalisation --------------- #
     fig, ax = plt.subplots(figsize=(8, 5))
-    if plot_series(ax, s, "buffer_mb", "kv_ready_max_ns", "Decode-start gate = max KV-ready", scale=1e-6):
-        ax2 = ax.twinx()
-        plot_series(ax2, s, "buffer_mb", "sync_skew_ns", "Spread of KV arrivals on one rank",
-              marker="s", linestyle="--", scale=1e-6, color="#d1495b")
-        ax2.set_ylabel("Arrival spread (ms)")
-        save(fig, "04_barrier_and_skew_vs_buffer.png",
-             "Barrier metric vs buffer\n(what actually gates disaggregated decode)",
-             "Decode-start gate (ms)")
-    else:
-        plt.close(fig)
+    ax.plot(x, s["kv_ready_max_ns"] / 1e6, "o-", color="#1f77b4",
+            label="Decode-start gate = max KV-ready over decode ranks")
+    ax.plot(x, s["kv_ready_min_ns"] / 1e6, "o:", color="#1f77b4", alpha=0.45,
+            label="earliest decode rank (min KV-ready)")
+    ax2 = ax.twinx()
+    ax2.plot(x, s["cross_rank_skew_ns"] / 1e6, "s--", color="#d1495b",
+             label="cross-rank skew = max − min KV-ready")
+    ax2.plot(x, s["kv_stream_duration_ns"] / 1e6, "d-.", color="#d98a00",
+             label="KV stream duration on one rank (NOT a skew: KV is per-layer)")
+    ax2.set_ylabel("Spread (ms)")
+    _decorate(fig, s, outdir, "04_barrier_vs_buffer.png",
+              "Barrier metric: what actually gates disaggregated decode",
+              "Decode-start gate (ms)", band, written)
 
-    # 5 MECHANISM ---------------------------------------------------------- #
+    # 05 THE MODEL. Topology + config only. Kept apart on purpose. ---------- #
     fig, ax = plt.subplots(figsize=(8, 5))
-    if plot_series(ax, s, "buffer_mb", "pfc_thresh_bytes", "PFC threshold (exact, ingress)",
-             scale=1e-3, color="#1f77b4"):
-        plot_series(ax, s, "buffer_mb", "pfc_thresh_egress_equiv_bytes", "  × F_ports (egress-equivalent)",
-              marker="D", scale=1e-3, color="#1f77b4", linestyle="--")
-        plot_series(ax, s, "buffer_mb", "pfc_thresh_naive_bytes", "buffer/8 (naive — wrong by 86% at 2 MiB)",
-              marker="x", scale=1e-3, color="#b0b0b0", linestyle=":")
-        plot_series(ax, s, "buffer_mb", "pfc_egress_ceiling_bytes",
-              "PFC egress ceiling  Σ(reserve+thresh+headroom)", marker="*",
-              scale=1e-3, color="#d1495b", linestyle="-.")
-        plot_series(ax, s, "buffer_mb", "qlen_peak_congested_port_bytes", "Measured peak egress",
-              marker="s", scale=1e-3, color="#d1495b")
-        for col, style, name in (("kmin_bytes", ":", "KMIN"), ("kmax_bytes", "--", "KMAX")):
-            v = s[col].dropna().unique()
-            if len(v) == 1:
-                ax.axhline(v[0] / 1e3, color="#2b8a3e", ls=style, lw=1.2,
-                           label=f"{name} = {v[0]/1e3:g} kB")
-        ax.set_yscale("log")
-        ax.grid(True, alpha=0.3, which="both")
-        save(fig, "05_threshold_vs_ecn_band.png",
-             "The mechanism: dynamic PFC threshold vs the ECN band\n"
-             "(measured peak at the ceiling → PFC governs)", "Bytes (kB, log)", 7)
-    else:
-        plt.close(fig)
-
-    # 6 HEADLINE OVERLAY --------------------------------------------------- #
-    cols = ["slow_mean_incast", "sync_skew_ns"]
-    if s[cols].notna().all(axis=None):
-        rng = {c: relative_range(s, c) for c in cols}
-        keep = [c for c in cols if rng[c][2] >= MIN_REL_RANGE]
-        for c in cols:
-            if c not in keep:
-                lo, hi, r = rng[c]
-                print(f"  - 06 overlay: dropping {c}, it varies by {r:.1%} across the "
-                      f"sweep ({lo:.4g}–{hi:.4g}). Normalising that renders noise as "
-                      f"signal.", file=sys.stderr)
-        if len(keep) < 2:
-            print("  - skip 06_aggregate_vs_barrier_overlay: fewer than two series "
-                  "carry a real trend.", file=sys.stderr)
-            return written
-        fig, ax = plt.subplots(figsize=(8, 5))
-        for variant, grp in s.groupby("variant"):
-            grp = grp.sort_values("buffer_mb")
-            suff = "" if s["variant"].nunique() == 1 else f" [{variant}]"
-            for c, mk, ls in zip(keep, ("o", "s"), ("-", "--")):
-                v = grp[c].to_numpy(float)
-                lo, hi = np.nanmin(v), np.nanmax(v)
-                norm = (v - lo) / (hi - lo) if hi > lo else np.zeros_like(v)
-                lo_a, hi_a, r = rng[c]
-                ax.plot(grp["buffer_mb"], norm, marker=mk, linestyle=ls,
-                        label=f"{c} ({lo_a:.4g}–{hi_a:.4g}, {r:.1%})" + suff)
-        save(fig, "06_aggregate_vs_barrier_overlay.png",
-             "Aggregate vs barrier, normalised\n(divergence = the trade-off the tool reveals)",
-             "Normalised (0–1)")
+    ax.plot(x, s["pfc_thresh_bytes"] / 1e3, "o-", color="#1f77b4",
+            label="PFC threshold at its fixed point, A/(2^s+F), per ingress port")
+    ax.plot(x, s["pfc_thresh_x_fports_bytes"] / 1e3, "D--", color="#1f77b4",
+            label=f"  × F_ports = {s['f_ports'].iloc[0]:g} (egress-equivalent)")
+    err = s["naive_error_pct"].abs().max()
+    ax.plot(x, s["pfc_thresh_naive_bytes"] / 1e3, "x:", color="#b0b0b0",
+            label=f"buffer/8 (naive — off by up to {err:.0f}%)")
+    ax.plot(x, s["pfc_ceiling_bytes"] / 1e3, "*-.", color="#d1495b",
+            label="PFC egress ceiling Σ(reserve+thresh+headroom)")
+    ax.plot(x, s["qlen_peak_bytes"] / 1e3, "s-", color="#000000", alpha=0.55,
+            label="measured peak egress (the only measured line here)")
+    for col, ls, nm in (("kmin_bytes", ":", "KMIN"), ("kmax_bytes", "--", "KMAX")):
+        v = s[col].unique()
+        if len(v) == 1:
+            ax.axhline(v[0] / 1e3, color="#2b8a3e", ls=ls, lw=1.2,
+                       label=f"{nm} = {v[0]/1e3:g} kB")
+    ax.set_yscale("log")
+    _decorate(fig, s, outdir, "05_model_pfc_threshold_vs_ecn.png",
+              "MODEL (topology + config only): dynamic PFC threshold vs the ECN band\n"
+              "band = where F_ports×threshold crosses KMIN and KMAX",
+              "Bytes (kB, log)", band, written, fs=7)
     return written
 
 
 # --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
-FRONT_COLS = ["run_dir", "variant", "buffer_mb", "regime_pred", "regime_obs",
-              "congested_link", "congested_rate_gbps", "fanin_ports",
-              "n_concurrent_peak", "n_concurrent_mean",
-              "pfc_thresh_bytes", "pfc_thresh_egress_equiv_bytes",
-              "pfc_egress_ceiling_bytes", "kmin_bytes", "kmax_bytes",
-              "qlen_peak_congested_port_bytes", "qlen_peak_over_pfc_ceiling",
-              "qlen_peak_over_kmax", "pfc_bottleneck_pause_pct",
-              "pfc_worst_link_pause_pct", "pfc_worst_link_device", "pfc_qidx",
-              "slow_mean_incast", "slow_p99_incast", "slow_cv_incast",
-              "slow_mean_over_fairshare", "kv_ready_max_ns", "sync_skew_ns",
-              "makespan_ms", "kv_bound_ratio"]
-REPORT_COLS = ["buffer_mb", "regime_pred", "regime_obs", "fanin_ports",
-               "n_concurrent_mean", "pfc_thresh_egress_equiv_bytes",
-               "pfc_egress_ceiling_bytes", "qlen_peak_congested_port_bytes",
-               "qlen_peak_over_pfc_ceiling", "pfc_bottleneck_pause_pct",
-               "slow_mean_incast", "slow_cv_incast", "kv_ready_max_ns"]
-
-
-def analyse_run(tag: str, astra_dir: Path, ns3_dir: Path | None,
-                topo: Topology | None, cfg: Ns3Config | None,
-                buffer_mb: float, bulk_bytes: int,
-                decode_nodes: list[int]) -> tuple[RunRow, Bottleneck | None] | None:
-    adf = astra.read_run(astra_dir)
-    if adf is None:
-        return None
-    row = RunRow(run_dir=tag, variant=BUFFER_AXIS.variant(tag), buffer_mb=buffer_mb,
-                 ns3_dir=str(ns3_dir or ""),
-                 cc_mode=cfg.cc_mode if cfg and cfg.cc_mode is not None else NAN)
-    row.astra = astra_metrics(adf)
-
-    flows = pfc_log = qlen_log = None
-    if ns3_dir is not None:
-        raw = ns3.read_fct(ns3_dir / "fct.txt")
-        flows = flowlib.annotate(raw, topo, bulk_bytes) if raw is not None else None
-        pfc_log = ns3.read_pfc(ns3_dir / "pfc.txt")
-        qlen_log = ns3.read_qlen(ns3_dir / "qlen.txt")
-
-    bn = flowlib.find_bottleneck(topo, qlen_log.port_max if qlen_log else None, flows)
-    model = FabricModel(topo, cfg) if (topo is not None and cfg is not None) else None
-    buffer_bytes = int(buffer_mb * 1024 * 1024)
-
-    row.fabric = fabric_metrics(model, bn, buffer_bytes)
-    row.flows = flow_metrics(flows, bn)
-    row.pfc = pfc_metrics(pfc_log, bn, topo, row.flows.incast_window_ns,
-                          row.flows.run_end_ns)
-    row.qlen = qlen_metrics(qlen_log, bn, row.fabric, buffer_bytes)
-    row.barrier = barrier_metrics(flows, decode_nodes)
-    row.regime_obs = regime_observed(row)
-    row.per_node = (adf.groupby(["sys_id", "op_class"])
-                    .agg(count=("name", "size"), total_bytes=("comm_size", "sum"),
-                         total_busy_ns=("duration", "sum"))
-                    .reset_index()
-                    .assign(buffer_mb=buffer_mb, variant=BUFFER_AXIS.variant(tag)))
-    return row, bn
+REPORT = ["buffer_mb", "bottleneck", "f_ports", "regime_model",
+          "pfc_pause_pct_of_window", "pfc_pause_pct_suspect", "qlen_peak_bytes", "qlen_peak_over_kmax",
+          "qlen_peak_over_ceiling", "concurrency_mean", "slow_mean", "slow_p99",
+          "kv_ready_max_ns", "cross_rank_skew_ns"]
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("astra_root", nargs="?", default=DEFAULT_ASTRA_ROOT)
-    ap.add_argument("--ns3-root", default=None)
-    ap.add_argument("-o", "--out", default=None)
-    ap.add_argument("--topology", default=DEFAULT_TOPOLOGY,
-                    help="path, directory, or {tag} template")
-    ap.add_argument("--config", default=DEFAULT_CONFIG,
-                    help="path, directory, or {tag} template; MUST resolve per tag")
-    ap.add_argument("--bulk-mb", type=float, default=1.0)
-    ap.add_argument("--decode-nodes", default=None)
-    ap.add_argument("--headroom-factor", type=int, default=3)
-    ap.add_argument("--print-patch", action="store_true",
-                    help="print the ns-3 diff that adds qIndex to pfc.txt and exit")
+    paths.add_arguments(ap, KIND)
+    roles.add_argument(ap)
+    ap.add_argument("--bottleneck", default=None,
+                    help="'sw->peer', e.g. '8->12'. Default: measured (deepest "
+                         "queue in qlen.txt), and required to be identical on "
+                         "every run.")
+    ap.add_argument("--headroom-factor", type=int, default=3,
+                    help="ns-3 common.h::headroom_factor. NOT in config.txt: it "
+                         "is compiled in, so this is an ASSERTION and every "
+                         "threshold scales with it (default 3).")
+    ap.add_argument("--print-patch", action="store_true")
     a = ap.parse_args(argv)
 
     if a.print_patch:
         print(ns3.PFC_QIDX_PATCH)
         return 0
 
-    astra_root = Path(a.astra_root)
-    if not astra_root.is_dir():
-        print(f"ERROR: astra_root not found: {astra_root}", file=sys.stderr)
+    try:
+        p, outdir = paths.from_arguments(a, KIND)
+        need(not p.missing_roots(),
+             "derived root(s) do not exist:\n    " + "\n    ".join(p.missing_roots())
+             + f"\n  --sweep {a.sweep!r} is probably wrong.")
+        placement = Placement.parse(a.placement)
+        tags = p.tags("ns3")
+        need(tags, f"no run sub-directory under {p.ns3_root}")
+
+        print(p.describe())
+        print(f"  out      {outdir}")
+        print(f"  placement\n{placement.describe()}")
+        print(f"  headroom_factor = {a.headroom_factor}  (ASSERTED, not read)\n")
+        # The placement is the one assumption nothing else can catch: get it wrong
+        # and every rank-dependent number stays plausible while describing a
+        # different machine. MLSynth already wrote it into the ASTRA op names, so
+        # compare rather than trust.
+        if (ad := p.astra_run(tags[0])).is_dir():
+            if msg := roles.cross_check(placement, ad):
+                warn(msg)
+        else:
+            warn(f"no ASTRA run at {ad}: --placement cannot be cross-checked "
+                 f"against the trace and is taken on trust.")
+
+        print(f"Analysing {len(tags)} runs:")
+
+        rows = [analyse(t, p, placement, a.headroom_factor, a.bottleneck)
+                for t in tags]
+
+        bns = {r.bottleneck for r in rows}
+        need(len(bns) == 1,
+             f"the deepest queue is not on the same link on every run: {sorted(bns)}. "
+             f"The per-run model numbers would come from different switches and "
+             f"the curves would be stitched together from incomparable runs. "
+             f"Pass --bottleneck to fix one.")
+        fps = {r.f_ports for r in rows}
+        need(len(fps) == 1, f"F_ports differs across runs: {sorted(fps)}.")
+
+        s = pd.DataFrame([r.flat() for r in rows]).sort_values("buffer_mb")
+        s = s.reset_index(drop=True)
+        rows = sorted(rows, key=lambda r: r.buffer_mb)
+
+        # the band depends only on (switch, F_ports, shift, KMIN/KMAX), all of
+        # which are now known to be constant -- so one band for the whole sweep.
+        t0 = parse_topology(p.topology(rows[0].tag), a.headroom_factor)
+        c0 = parse_ns3_config(p.config(rows[0].tag))
+        sw, peer = (int(v) for v in rows[0].bottleneck.split("->"))
+        bn0 = Bottleneck(sw, t0.port_facing(sw, peer), peer, t0.ports[sw][
+            t0.port_facing(sw, peer)].rate,
+            tuple(int(i) for i in rows[0].ingress_ports.split(",")))
+        band = band_of(t0, c0, bn0)
+
+        outdir.mkdir(parents=True, exist_ok=True)
+        s.to_csv(outdir / "summary.csv", index=False)
+        pd.concat([pd.DataFrame({"buffer_mb": r.buffer_mb,
+                                 "slowdown": r.slowdowns}) for r in rows],
+                  ignore_index=True).to_csv(outdir / "slowdowns.csv", index=False)
+        plots = make_plots(rows, s, outdir, band, rows[0].bottleneck,
+                           rows[0].pfc_qidx == "present")
+
+        pd.set_option("display.width", 220)
+        print("\n================ BUFFER SWEEP ================")
+        print(s[[c for c in REPORT if c in s.columns]].to_string(index=False))
+        if band:
+            print(f"\nMODEL (topology + config only): PFC below {band[0]:.2f} MiB, "
+                  f"DCQCN above {band[1]:.2f} MiB, at {rows[0].bottleneck} "
+                  f"(F_ports={rows[0].f_ports:g}).")
+            print("Agreement with the measured pause is the result; disagreement "
+                  "is the finding.")
+        print(f"\nWrote {outdir}:")
+        for f in ["summary.csv", "slowdowns.csv", *[q.name for q in plots]]:
+            print(f"  {f}")
+        if WARNINGS:
+            print(f"\n{len(WARNINGS)} WARNING(S) — the numbers above are "
+                  f"conditional on them:")
+            for w in WARNINGS:
+                print(f"  ! {w}")
+            return 1
+        return 0
+    except Abort as e:
+        print(f"\nABORT: {e}", file=sys.stderr)
         return 2
-    ns3_root = resolve_ns3_root(astra_root, a.ns3_root, DEFAULT_NS3_ROOT)
-    outdir = resolve_outdir(a.out, DEFAULT_OUTDIR, astra_root, "buffer_analysis")
-    decode_nodes = [int(x) for x in a.decode_nodes.split(",")] if a.decode_nodes else []
-    bulk_bytes = int(a.bulk_mb * 1024 * 1024)
-
-    tags = discover_runs(astra_root, outdir, skip_names=("buffer_analysis",))
-    if not tags:
-        print(f"ERROR: no run sub-directories under {astra_root}", file=sys.stderr)
-        return 2
-    print(f"Scanning {len(tags)} run dirs under:\n  {astra_root}")
-    print(f"ns-3 root: {ns3_root or '(none — regime metrics will be empty)'}\n")
-
-    rows: list[RunRow] = []
-    topo_cache: dict[str, Topology | None] = {}
-    degraded: set[str] = set()
-    band = None
-
-    for d in tags:
-        tag = d.name
-        buf = BUFFER_AXIS.value(tag)
-        if buf is None:
-            print(f"  - skip {tag!r}: no 'buf<num>' token", file=sys.stderr)
-            continue
-        ns3_dir = find_ns3_run(ns3_root, tag)
-        search = [ns3_dir, ns3_root, astra_root]
-
-        tpath = find_aux(a.topology, tag, "physical_topology.txt", search)
-        cpath = find_aux(a.config, tag, "config.txt", search)
-        if tpath is None:
-            print(f"  ! {tag}: physical_topology.txt NOT RESOLVED — no PFC threshold, "
-                  f"no ECN band, and no fabric/direct filter, so the incast statistics "
-                  f"will be a MIXTURE of congested KV flows and uncongested direct-link "
-                  f"collectives. Pass --topology.", file=sys.stderr)
-            degraded.add(tag)
-        if cpath is None:
-            print(f"  ! {tag}: config.txt NOT RESOLVED — KMIN/KMAX unknown, no regime "
-                  f"prediction. Pass --config.", file=sys.stderr)
-            degraded.add(tag)
-
-        topo = None
-        if tpath:
-            key = f"{tpath}|{a.headroom_factor}"
-            if key not in topo_cache:
-                try:
-                    topo_cache[key] = parse_topology(tpath, a.headroom_factor)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"  ! cannot parse {tpath}: {exc}", file=sys.stderr)
-                    topo_cache[key] = None
-                if (t := topo_cache[key]) and t.ecmp_pairs:
-                    print(f"  ! ECMP ties on {len(t.ecmp_pairs)} (node, host) pairs: "
-                          f"runtime paths are hash-chosen, so per-flow path "
-                          f"attribution is approximate", file=sys.stderr)
-            topo = topo_cache[key]
-        cfg = parse_ns3_config(cpath) if cpath else None
-        if cfg:
-            for w in cfg.warnings():
-                print(f"  ! {tag}: {w}", file=sys.stderr)
-            if cfg.buffer_mb is None:
-                print(f"  ! {tag}: no BUFFER_SIZE in {cpath} (a template?) — using "
-                      f"'buf{buf:g}' from the dir name", file=sys.stderr)
-            elif abs(cfg.buffer_mb - buf) > 1e-6:
-                print(f"  ! {tag}: BUFFER_SIZE={cfg.buffer_mb} in config.txt but "
-                      f"'buf{buf:g}' in the dir name — trusting config.txt. If every "
-                      f"run says this, --config is not resolving per tag.",
-                      file=sys.stderr)
-                buf = cfg.buffer_mb
-
-        res = analyse_run(tag, d, ns3_dir, topo, cfg, buf, bulk_bytes, decode_nodes)
-        if res is None:
-            print(f"  - skip {tag!r}: no readable CSVs", file=sys.stderr)
-            continue
-        row, bn = res
-        rows.append(row)
-        if band is None and topo is not None and cfg is not None and bn is not None:
-            band = FabricModel(topo, cfg).flip_band(bn)
-
-        print(f"  + {tag:<28} buf={row.buffer_mb:<5g} pred={row.fabric.regime_pred:<5} "
-              f"obs={row.regime_obs:<5} pause={row.pfc.pfc_bottleneck_pause_pct:6.2f}% "
-              f"peak/ceil={row.qlen.qlen_peak_over_pfc_ceiling:5.2f} "
-              f"meanSD={row.flows.slow_mean_incast:.1f} "
-              f"Fp={row.fabric.fanin_ports:g} N={row.flows.n_concurrent_peak:g}")
-
-    if not rows:
-        print("ERROR: no valid runs parsed.", file=sys.stderr)
-        return 2
-
-    summary = pd.DataFrame([r.flat() for r in rows])
-    summary = summary.sort_values(["variant", "buffer_mb"]).reset_index(drop=True)
-    summary = order_columns(summary, FRONT_COLS)
-    summary_path = write_table(summary, outdir, "summary.csv")
-    # per-node audit table, one row per (rank, op class) -- restored for parity with
-    # bandwidth_analyzer, which has always written one.
-    per_node = pd.concat([r.per_node for r in rows if r.per_node is not None],
-                         ignore_index=True)
-    per_node_path = write_table(per_node, outdir, "per_node.csv")
-    plots = make_plots(summary, outdir, band)
-
-    pd.set_option("display.width", 240)
-    pd.set_option("display.max_columns", 40)
-    print("\n================ BUFFER SWEEP SUMMARY ================")
-    print(summary[[c for c in REPORT_COLS if c in summary.columns]].to_string(index=False))
-    if band:
-        print(f"\nPredicted: PFC below {band[0]:.2f} MiB, DCQCN above {band[1]:.2f} MiB.")
-        print("The prediction uses topology + config only. Agreement with regime_obs "
-              "is the result; disagreement is the finding.")
-    if degraded:
-        print(f"\nWARNING: {len(degraded)} run(s) ran without topology and/or config. "
-              f"Those rows are degraded — see the messages above.")
-    if (summary.get("pfc_qidx") == "MISSING").any():
-        print("\nWARNING: pfc.txt has no qIndex column. With qos-enabled the PAUSE/"
-              "RESUME sequences of different priority groups interleave on one ifindex "
-              "and the pause totals are NOT a measurement. Run --print-patch for the "
-              "three-line ns-3 diff.")
-    print("\nWrote:")
-    for p in [summary_path, per_node_path, *plots]:
-        print(f"  {p}")
-    return 0
 
 
 if __name__ == "__main__":
