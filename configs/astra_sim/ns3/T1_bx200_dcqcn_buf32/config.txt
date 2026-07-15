@@ -3,13 +3,13 @@ USE_DYNAMIC_PFC_THRESHOLD 1
 
 PACKET_PAYLOAD_SIZE 3500
 
-TOPOLOGY_FILE /home/andre/tesi/trace_evaluator/configs/astra_sim/ns3/T2_bx50_dcqcn_buf2/physical_topology.txt
+TOPOLOGY_FILE /home/andre/tesi/trace_evaluator/configs/astra_sim/ns3/T1_bx200_dcqcn_buf32/physical_topology.txt
 FLOW_FILE /home/andre/tesi/trace_evaluator/configs/astra_sim/ns3/additional_configs/add_flow.txt
 TRACE_FILE /home/andre/tesi/trace_evaluator/configs/astra_sim/ns3/additional_configs/trace_link.txt
-TRACE_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/T2_bx50_dcqcn_buf2/traces.tr
-FCT_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/T2_bx50_dcqcn_buf2/fct.txt
-PFC_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/T2_bx50_dcqcn_buf2/pfc.txt
-QLEN_MON_FILE /home/andre/tesi/trace_evaluator/output/ns3/T2_bx50_dcqcn_buf2/qlen.txt
+TRACE_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/T1_bx200_dcqcn_buf32/traces.tr
+FCT_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/T1_bx200_dcqcn_buf32/fct.txt
+PFC_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/T1_bx200_dcqcn_buf32/pfc.txt
+QLEN_MON_FILE /home/andre/tesi/trace_evaluator/output/ns3/T1_bx200_dcqcn_buf32/qlen.txt
 QLEN_MON_START 0
 QLEN_MON_END 0
 
@@ -58,4 +58,4 @@ KMAX_MAP 8 25000000000 200 40000000000 320 50000000000 400 100000000000 800 2000
 KMIN_MAP 8 25000000000 50 40000000000 80 50000000000 100 100000000000 200 200000000000 400 400000000000 800 1024000000000 7000 4800000000000 7000
 PMAX_MAP 8 25000000000 0.2 40000000000 0.2 50000000000 0.2 100000000000 0.2 200000000000 0.2 400000000000 0.2 1024000000000 0.2 4800000000000 0.2
 
-BUFFER_SIZE 2
+BUFFER_SIZE 32

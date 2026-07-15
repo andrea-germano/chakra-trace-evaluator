@@ -1,0 +1,13 @@
+{
+  "tag": "T1_bx200_dcqcn_buf32",
+  "topo": "T1",
+  "num_nodes": 8,
+  "bx_gbps": "200",
+  "cc": "dcqcn",
+  "cc_mode": 1,
+  "buffer_size": "32",
+  "enable_trace": "0",
+  "qlen_start": "0",
+  "qlen_end": "0",
+  "generated": "2026-07-14T19:34:42"
+}
