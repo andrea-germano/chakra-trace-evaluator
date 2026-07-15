@@ -114,7 +114,7 @@ DEFAULT_ROOT = (
 # Where results (summary.csv, per_node.csv, the PNG graphs) are written by
 # default. Edit this constant to change the default output location.
 # Set it to None to fall back to "<root>/bandwidth_analysis" instead.
-DEFAULT_OUTDIR = ("/home/andre/tesi/trace_evaluator/sweep_results/bandwidth_analysis/llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt")
+DEFAULT_OUTDIR = ("/home/andre/tesi/trace_evaluator/results/sweep_analysis/bandwidth/llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt")
 
 def _phase_of(pl) -> str:
     return {"p": "prefill", "d": "decode"}.get(pl, "other")

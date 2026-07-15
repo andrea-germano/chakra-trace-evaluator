@@ -1,14 +1,7 @@
-old_graphs/
 __pycache__/
 
-configs/astra_sim/auto_generated/
-configs/mlsynth/auto_generated/
 output/
-
-temp/
 log/
 experiments.txt
 experiments.log
-ns3_graphs/
-result_graphs/
-sweep_results/
+results/

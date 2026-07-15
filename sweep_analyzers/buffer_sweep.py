@@ -93,7 +93,7 @@ NAN = float("nan")
 DEFAULT_ASTRA_ROOT = ("/home/andre/tesi/trace_evaluator/output/astra_logs/"
                       "llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt/buffer_sweep_T1")
 DEFAULT_NS3_ROOT = "/home/andre/tesi/trace_evaluator/output/ns3/buffer_sweep_T1"
-DEFAULT_OUTDIR = ("/home/andre/tesi/trace_evaluator/sweep_results/buffer_analysis/T1/"
+DEFAULT_OUTDIR = ("/home/andre/tesi/trace_evaluator/results/sweep_analysis/buffer/T1/"
                   "llama2_13b_p-tp2pp2_d-tp2pp2_stream_16req_512prompt")
 DEFAULT_TOPOLOGY = ("/home/andre/tesi/trace_evaluator/configs/astra_sim/ns3/"
                     "buffer_sweep_T1/{tag}/physical_topology.txt")

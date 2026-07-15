@@ -21,7 +21,7 @@ from matplotlib.ticker import FuncFormatter
 # Root from which model/topology sub-paths are resolved when --input is omitted.
 DATA_DIR = "./output/astra_logs"
 # Root under which per-run result folders (charts, timeline, summary) are written.
-RESULT_DIR = "./result_graphs"
+RESULT_DIR = "./results/timeline_graphs"
 
 # Communications whose payload is <= this many bytes are treated as control /
 # signalling traffic (the "serialize" / 8-byte FIRSTTOK messages).  They are

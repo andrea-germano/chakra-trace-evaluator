@@ -990,7 +990,7 @@ def main():
     ap.add_argument("folder",
                     help="run subdir under output/ns3/, or a direct path to the run folder")
     ap.add_argument("--out-dir", default=None,
-                    help="output directory (default: ./ns3_graphs/<run basename>)")
+                    help="output directory (default: ./results/ns3/<run basename>)")
     ap.add_argument("--buffer-mb", type=float, default=None,
                     help="per-switch BUFFER_SIZE in MiB. If omitted, taken from the "
                          "run name (the number after 'buf', e.g. ...buf2 -> 2 MiB); "
@@ -1013,7 +1013,7 @@ def main():
         sys.exit(1)
 
     run_name = os.path.basename(folder.rstrip("/"))
-    out_dir = args.out_dir or os.path.join(os.getcwd(), "ns3_graphs", run_name)
+    out_dir = args.out_dir or os.path.join(os.getcwd(), "results", "ns3_graphs", run_name)
     os.makedirs(out_dir, exist_ok=True)
 
     # buffer size: explicit flag wins; else parse the 'buf<N>' token in the name;
