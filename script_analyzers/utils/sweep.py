@@ -85,6 +85,39 @@ def find_ns3_run(root: Path | None, tag: str) -> Path | None:
     return None
 
 
+def project_roots(*starts: Path | str, depth: int = 8) -> list[Path]:
+    """Every ancestor of each start directory, nearest first, de-duplicated.
+
+    A run lives at <root>/output/ns3/<tag> while its config lives at
+    <root>/configs/astra_sim/ns3/... -- they only share the project root, which is
+    several levels up. Walking ancestors is what lets the config be found without
+    a flag; not walking them silently drops the analyzer into degraded mode, which
+    is far worse than not finding the file at all."""
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for start in starts:
+        if start is None:
+            continue
+        d = Path(start).resolve()
+        for _ in range(depth):
+            if d not in seen:
+                seen.add(d)
+                roots.append(d)
+            if d.parent == d:
+                break
+            d = d.parent
+    return roots
+
+
+def find_under_roots(roots: list[Path], relative: str) -> Path | None:
+    """First existing <root>/<relative> across the ancestor chain."""
+    for r in roots:
+        cand = r / relative
+        if cand.is_file():
+            return cand
+    return None
+
+
 def find_aux(spec: str | None, tag: str, filename: str,
              search: list[Path | None]) -> Path | None:
     """Locate a per-run auxiliary file. `spec` may be a path, a template containing

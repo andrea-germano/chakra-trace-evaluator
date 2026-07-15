@@ -83,6 +83,7 @@ from utils import astra
 from utils import ns3
 from utils.fabric import (Bottleneck, FabricModel, Ns3Config, Topology,
                              parse_ns3_config, parse_topology)
+from utils import flows as flowlib
 from utils.plots import logx_pow2, plot_series, relative_range, save_fig
 from utils.sweep import (BUFFER_AXIS, discover_runs, find_aux, find_ns3_run,
                             order_columns, resolve_ns3_root, resolve_outdir,
@@ -93,7 +94,7 @@ NAN = float("nan")
 DEFAULT_ASTRA_ROOT = ("/home/andre/tesi/trace_evaluator/output/astra_logs/"
                       "llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt/buffer_sweep_T1")
 DEFAULT_NS3_ROOT = "/home/andre/tesi/trace_evaluator/output/ns3/buffer_sweep_T1"
-DEFAULT_OUTDIR = ("/home/andre/tesi/trace_evaluator/results/sweep_analysis/buffer/T1/"
+DEFAULT_OUTDIR = ("/home/andre/tesi/trace_evaluator/results/sweep_analysis/buffer/T1_v2/"
                   "llama2_13b_p-tp2pp2_d-tp2pp2_stream_16req_512prompt")
 DEFAULT_TOPOLOGY = ("/home/andre/tesi/trace_evaluator/configs/astra_sim/ns3/"
                     "buffer_sweep_T1/{tag}/physical_topology.txt")
@@ -232,91 +233,6 @@ def isnum(x) -> bool:
 # --------------------------------------------------------------------------- #
 # Flow annotation and the bottleneck
 # --------------------------------------------------------------------------- #
-def annotate_flows(fct: pd.DataFrame, topo: Topology | None,
-                   bulk_bytes: int) -> pd.DataFrame:
-    """Attach the taxonomy from the module docstring. Without a topology every
-    flow is optimistically 'fabric', which is exactly the degraded mode the CLI
-    shouts about: the incast statistics then describe a mixture."""
-    f = fct.copy()
-    f["bulk"] = f["size"] >= bulk_bytes
-    if topo is None:
-        f["hops"], f["path"] = NAN, None
-        f["fabric"] = True
-    else:
-        f["hops"] = [topo.dist.get(s, {}).get(d, NAN) for s, d in zip(f["src"], f["dst"])]
-        f["path"] = [topo.path(s, d) for s, d in zip(f["src"], f["dst"])]
-        f["fabric"] = f["hops"] > 1
-    f["incast"] = f["bulk"] & f["fabric"]
-    return f
-
-
-def concurrency_stats(intervals: list[tuple[int, int]]) -> tuple[float, float]:
-    """(peak, mean_experienced).
-
-    `peak` is the max flows alive at once -- an UPPER bound on the fair-share
-    slowdown, which is why the measured mean legitimately sits below it.
-    `mean_experienced` averages, over flows, the time-averaged concurrency during
-    each flow's own lifetime: that is the fair-share a flow should actually expect,
-    and the right denominator for slow_mean_over_fairshare."""
-    if not intervals:
-        return NAN, NAN
-    ev = sorted([(s, 1) for s, _ in intervals] + [(e, -1) for _, e in intervals],
-                key=lambda x: (x[0], x[1]))
-    peak, cur, segs = 0, 0, []
-    for i in range(len(ev) - 1):
-        cur += ev[i][1]
-        peak = max(peak, cur)
-        if ev[i + 1][0] > ev[i][0]:
-            segs.append((ev[i][0], ev[i + 1][0], cur))
-    peak = max(peak, cur + ev[-1][1])
-    means = []
-    for s, e in intervals:
-        if e <= s:
-            continue
-        acc = sum(k * (min(t1, e) - max(t0, s))
-                  for t0, t1, k in segs if min(t1, e) > max(t0, s))
-        means.append(acc / (e - s))
-    return float(peak), (float(np.mean(means)) if means else NAN)
-
-
-def find_bottleneck(topo: Topology | None, qlen: ns3.QlenLog | None,
-                    flows: pd.DataFrame | None) -> Bottleneck | None:
-    """Ground truth is qlen.txt: the port that actually built a queue. Falls back
-    to the directed link carrying the most incast bytes. The ingress ports are
-    then read off the flows' paths -- a port count, never a flow count."""
-    if topo is None:
-        return None
-    sw = port = None
-    if qlen is not None and (busiest := qlen.busiest_port()):
-        sw, port = busiest
-        if port not in topo.ports.get(sw, {}):
-            sw = port = None
-    if sw is None and flows is not None:
-        load: dict[tuple[int, int], int] = {}
-        for path, size, inc in zip(flows["path"], flows["size"], flows["incast"]):
-            if path and inc:
-                for a, b in path:
-                    if topo.is_switch(a):
-                        load[(a, b)] = load.get((a, b), 0) + size
-        if load:
-            (a, b), _ = max(load.items(), key=lambda kv: kv[1])
-            sw, port = a, topo.port_facing(a, b)
-    if sw is None or port is None:
-        return None
-
-    peer = topo.ports[sw][port].peer
-    ingress: set[int] = set()
-    if flows is not None:
-        for path, inc in zip(flows["path"], flows["incast"]):
-            if not path or not inc:
-                continue
-            for i, (a, b) in enumerate(path):
-                if (a, b) == (sw, peer) and i > 0:
-                    if (p := topo.port_facing(sw, path[i - 1][0])) is not None:
-                        ingress.add(p)
-    return Bottleneck(sw, port, peer, topo.ports[sw][port].rate, tuple(sorted(ingress)))
-
-
 # --------------------------------------------------------------------------- #
 # Metric computation, one group per function
 # --------------------------------------------------------------------------- #
@@ -454,11 +370,9 @@ def flow_metrics(f: pd.DataFrame | None, bn: Bottleneck | None) -> FlowMetrics:
               "(there is no silent fallback to all flows)", file=sys.stderr)
 
     if bn is not None:
-        iv = [(s, a) for path, s, a, i in
-              zip(f["path"], f["start"], f["arrival"], f["incast"])
-              if path and i and (bn.switch, bn.peer) in path]
+        iv = flowlib.bottleneck_intervals(f, bn)
         m.bottleneck_flows = len(iv)
-        m.n_concurrent_peak, m.n_concurrent_mean = concurrency_stats(iv)
+        m.n_concurrent_peak, m.n_concurrent_mean = flowlib.concurrency_stats(iv)
 
     sd = inc.loc[inc["slowdown"].notna(), "slowdown"].to_numpy(float)
     if len(sd):
@@ -715,11 +629,11 @@ def analyse_run(tag: str, astra_dir: Path, ns3_dir: Path | None,
     flows = pfc_log = qlen_log = None
     if ns3_dir is not None:
         raw = ns3.read_fct(ns3_dir / "fct.txt")
-        flows = annotate_flows(raw, topo, bulk_bytes) if raw is not None else None
+        flows = flowlib.annotate(raw, topo, bulk_bytes) if raw is not None else None
         pfc_log = ns3.read_pfc(ns3_dir / "pfc.txt")
         qlen_log = ns3.read_qlen(ns3_dir / "qlen.txt")
 
-    bn = find_bottleneck(topo, qlen_log, flows)
+    bn = flowlib.find_bottleneck(topo, qlen_log.port_max if qlen_log else None, flows)
     model = FabricModel(topo, cfg) if (topo is not None and cfg is not None) else None
     buffer_bytes = int(buffer_mb * 1024 * 1024)
 

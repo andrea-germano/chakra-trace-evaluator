@@ -48,13 +48,13 @@ USAGE
     python3 ns3_analyzer.py <run>  [options]
 
 <run> may be:
-    * a subdirectory name looked up under  ./output/ns3/<run>  (relative to this
-      script, as in the original tool), or
+    * a subdirectory name looked up under  ../output/ns3/<run>  (relative to this
+      script or current working directory), or
     * a direct path to a folder that contains fct.txt / pfc.txt / qlen.txt.
 
 Options:
     --out-dir DIR     where to write the report + figures.
-                      default: ./ns3_graphs/<run basename>  (in the CWD)
+                      default: ../results/ns3_graphs/<run basename>
     --buffer-mb F     per-switch buffer in MiB (default 16)
     --bulk-mb F       flow-size threshold (MB) to count as "bulk" KV/PP (default 1)
     --topology FILE   topology file, to label switch ports with their neighbour
@@ -64,11 +64,18 @@ Options:
 """
 import argparse
 import json
-import math
 import os
-import re
 import sys
+import traceback
+from pathlib import Path
 from collections import defaultdict
+
+from utils import ns3 as ns3io
+from utils import flows as flowlib
+from utils.fabric import FabricModel, parse_ns3_config, parse_topology
+from utils.plots import save_fig
+from utils.sweep import (BUFFER_AXIS, find_aux, find_under_roots,
+                            project_roots)
 
 # Matplotlib is optional: if it is missing we still print the text report.
 try:
@@ -174,198 +181,142 @@ def fmt_ns(ns):
     return f"{ns/1e9:.3f} s"
 
 def ip_to_node(tok):
-    """node id from an fct.txt address token (hex '0b000005' or dotted '11.0.0.5').
-    Mapping (common.h:139): node = (ip >> 8) & 0xffff."""
-    tok = tok.strip()
-    try:
-        if "." in tok:
-            parts = [int(x) for x in tok.split(".")]
-            ip = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
-        else:
-            ip = int(tok, 16)
-    except (ValueError, IndexError):
-        return -1
-    return (ip >> 8) & 0xffff
+    """node id from an fct.txt address token. See sweeplib.ns3.ip_to_node."""
+    return ns3io.ip_to_node(tok)
 
 # ============================================================================ #
 #  Topology  (optional) : switch port -> neighbour node id
 # ============================================================================ #
-def parse_topology(path):
-    """Return (switch_ids:set, portmap:{(node,ifindex):neighbor}, host_ids:set).
-    ifIndex counting starts at 1 (0 = loopback) and follows link-file order."""
-    switch_ids, portmap = set(), {}
+def load_topology(path):
+    """Return (Topology|None, switch_ids:set, portmap:{(node,ifindex):neighbor}).
+
+    The Topology object is what makes the regime verdict quantitative: it carries
+    the headroom, the reserve and the per-port pfc_a_shift, hence the PFC
+    threshold and the ceiling the egress queue settles at. `portmap` is kept for
+    the human-readable port labels the report already prints."""
     try:
-        with open(path) as f:
-            toks = f.read().split()
-    except OSError:
-        return switch_ids, portmap, set()
-    it = iter(toks)
-    try:
-        node_num = int(next(it)); switch_num = int(next(it)); link_num = int(next(it))
-        for _ in range(switch_num):
-            switch_ids.add(int(next(it)))
-        nxt = defaultdict(lambda: 1)      # per node: next ifIndex to assign
-        for _ in range(link_num):
-            src = int(next(it)); dst = int(next(it))
-            next(it); next(it); next(it)  # rate, delay, error
-            portmap[(src, nxt[src])] = dst; nxt[src] += 1
-            portmap[(dst, nxt[dst])] = src; nxt[dst] += 1
-    except (StopIteration, ValueError):
-        pass
-    all_nodes = {n for (n, _) in portmap}
-    host_ids = all_nodes - switch_ids
-    return switch_ids, portmap, host_ids
+        topo = parse_topology(Path(path))
+    except Exception as exc:
+        print(f"  ! cannot parse topology {path}: {exc}", file=sys.stderr)
+        return None, set(), {}
+    portmap = {(n, i): pt.peer for n, ports in topo.ports.items() for i, pt in ports.items()}
+    return topo, set(topo.switches), portmap
 
 def port_label(node, ifidx, portmap, switch_ids):
+    """'p3->sw12' / 'p2->h0'. Thin shim over Topology.port_label so the plotting
+    code keeps its existing signature; the convention lives in sweeplib.fabric."""
     nb = portmap.get((node, ifidx))
     if nb is None:
         return f"p{ifidx}"
-    kind = "sw" if nb in switch_ids else "h"
-    return f"p{ifidx}->{kind}{nb}"
+    return f"p{ifidx}->{'sw' if nb in switch_ids else 'h'}{nb}"
 
 # ============================================================================ #
 #  Parsers  — return plain dicts reused by both the text report and the plots
 # ============================================================================ #
-def parse_fct(path, bulk_bytes):
+def parse_fct(path, bulk_bytes, topo=None):
+    """Adapter over sweeplib.ns3.read_fct + sweeplib.flows.annotate.
+
+    Same dict shape the report and the plots already consume, but the flows are
+    now split by the taxonomy: `slow_bulk` is the INCAST population (bulk AND
+    crossing a switch), not a bimodal mixture of congested KV transfers and
+    tensor-parallel all-reduces on dedicated host-to-host links. Those direct
+    flows have slowdown ~1 by construction; blending them in makes the mean and
+    the CV describe the mixing ratio, which is a constant of the workload, and so
+    look flat no matter what the fabric does. `slow_direct` keeps them visible.
+
+    With no topology every flow is treated as fabric and nothing is filtered --
+    the caller warns."""
+    df = ns3io.read_fct(Path(path))
     d = dict(n=0, sizes=[], starts=[], fcts=[], sfcts=[], slow=[], slow_bulk=[],
-             sd_size=[], sd_start=[], worst=[], run_end=0,
+             slow_direct=[], sd_size=[], sd_start=[], worst=[], run_end=0,
              per_dst_bulk=defaultdict(int), per_dst_bytes=defaultdict(int),
-             per_dst_slow=defaultdict(list),
-             # --- sanity / self-diagnosis ---
+             per_dst_slow=defaultdict(list), n_fabric=0, n_direct=0,
+             filtered=topo is not None,
              raw_lines=0, skipped_short=0, skipped_badnum=0, sfct_nonpos=0,
              slow_lt1=0, ncols=None, sample=None, ncol_hist=defaultdict(int))
-    with open(path) as f:
-        for line in f:
-            if not line.strip():
-                continue
-            d["raw_lines"] += 1
-            p = line.split()
-            d["ncol_hist"][len(p)] += 1
-            if d["sample"] is None:
-                d["sample"] = line.rstrip("\n"); d["ncols"] = len(p)
-            if len(p) < 8:
-                d["skipped_short"] += 1
-                continue
-            try:
-                size = int(p[4]); start = int(p[5]); fct = int(p[6]); sfct = int(p[7])
-            except ValueError:
-                d["skipped_badnum"] += 1
-                continue
-            d["n"] += 1
-            d["sizes"].append(size); d["starts"].append(start); d["fcts"].append(fct)
-            d["sfcts"].append(sfct)
-            d["run_end"] = max(d["run_end"], start + fct)
-            src = ip_to_node(p[0]); dst = ip_to_node(p[1])
-            if sfct > 0:
-                sd = fct / sfct
-                if sd < 0.999:
-                    d["slow_lt1"] += 1
-                d["slow"].append(sd); d["sd_size"].append(size); d["sd_start"].append(start)
-                d["worst"].append((sd, size, src, dst, fct, start))
-                d["per_dst_slow"][dst].append(sd)
-                if size >= bulk_bytes:
-                    d["slow_bulk"].append(sd)
-                    d["per_dst_bulk"][dst] += 1
-                    d["per_dst_bytes"][dst] += size
-            else:
-                d["sfct_nonpos"] += 1
+    if df is None:
+        return d
+    d.update({k: v for k, v in df.attrs.get("diagnostics", {}).items()})
+    f = flowlib.annotate(df, topo, bulk_bytes)
+    d["n"] = len(f)
+    d["sizes"] = f["size"].tolist()
+    d["starts"] = f["start"].tolist()
+    d["fcts"] = f["fct"].tolist()
+    d["sfcts"] = f["sfct"].tolist()
+    d["run_end"] = int(f["arrival"].max())
+    d["n_fabric"] = int(f["fabric"].sum())
+    d["n_direct"] = int((~f["fabric"]).sum())
+    ok = f[f["slowdown"].notna()]
+    d["slow"] = ok["slowdown"].tolist()
+    d["sd_size"] = ok["size"].tolist()
+    d["sd_start"] = ok["start"].tolist()
+    d["worst"] = list(zip(ok["slowdown"], ok["size"], ok["src"], ok["dst"],
+                          ok["fct"], ok["start"]))
+    d["slow_bulk"] = ok.loc[ok["incast"], "slowdown"].tolist()
+    d["slow_direct"] = ok.loc[~ok["fabric"], "slowdown"].tolist()
+    for dst, sd in zip(ok["dst"], ok["slowdown"]):
+        d["per_dst_slow"][dst].append(sd)
+    inc = ok[ok["incast"]]
+    for dst, size in zip(inc["dst"], inc["size"]):
+        d["per_dst_bulk"][dst] += 1
+        d["per_dst_bytes"][dst] += size
+    d["_flows"] = f            # the annotated frame, for find_bottleneck
     return d
 
 def parse_pfc(path):
-    """events[(node,ntype,ifidx)] = sorted [(time,type)]; also raw stream for timeline."""
-    ev = defaultdict(list)
-    raw = []                 # (time, node, ntype, ifidx, type)
-    tmin = None; tmax = 0; n = 0
-    with open(path) as f:
-        for line in f:
-            p = line.split()
-            if len(p) < 5:
-                continue
-            try:
-                t = int(p[0]); node = int(p[1]); ntype = int(p[2])
-                ifidx = int(p[3]); typ = int(p[4])
-            except ValueError:
-                continue
-            n += 1
-            ev[(node, ntype, ifidx)].append((t, typ))
-            raw.append((t, node, ntype, ifidx, typ))
-            tmin = t if tmin is None else min(tmin, t)
-            tmax = max(tmax, t)
-    return dict(ev=ev, raw=raw, n=n, tmin=tmin or 0, tmax=tmax)
+    """Adapter over sweeplib.ns3.read_pfc.
 
-def pfc_intervals(ev, clamp_end):
-    """Turn PAUSE/RESUME events into closed [start,end] pause intervals per link.
-    Unclosed pauses (still paused at capture end) are clamped to clamp_end."""
-    intervals = {}
-    totals = {}
-    for key, events in ev.items():
-        events.sort()
-        iv = []; start = None
-        for t, typ in events:
-            if typ == 1 and start is None:      # PAUSE
-                start = t
-            elif typ == 0 and start is not None:  # RESUME
-                iv.append((start, t)); start = None
-        if start is not None:                    # still paused at end
-            iv.append((start, max(clamp_end, start)))
-        intervals[key] = iv
-        totals[key] = sum(b - a for a, b in iv)
+    Keys now include the qIndex (an optional 6th column). m_tracePfc fires per
+    qIndex but get_pfc does not print it, so with qos-enabled the PAUSE/RESUME
+    sequences of different priority groups interleave on one ifindex and a state
+    machine keyed on (node, ifindex) mis-pairs them. `qidx_state` says whether
+    the column is there; when it is MISSING the pause totals are not a
+    measurement. See sweeplib.ns3.PFC_QIDX_PATCH for the three-line ns-3 diff."""
+    log = ns3io.read_pfc(Path(path))
+    if log is None:
+        return dict(ev={}, raw=[], n=0, tmin=0, tmax=0, qidx_state="n/a")
+    raw = [(t, node, ntype, ifidx, typ)
+           for (node, ntype, ifidx, _q), evs in log.events.items()
+           for (t, typ) in evs]
+    raw.sort()
+    return dict(ev=log.events, raw=raw, n=log.n_events,
+                tmin=min((r[0] for r in raw), default=0), tmax=log.t_max,
+                qidx_state=log.qidx_state, log=log)
+
+def pfc_intervals(pfcd, clamp_end):
+    """Closed [start,end] pause intervals per key, plus totals.
+
+    Delegates to sweeplib.ns3.PfcLog: the PAUSE/RESUME state machine exists once.
+    Two copies of it is how the four analyzers ended up parsing the same file
+    three different ways."""
+    log = pfcd.get("log")
+    if log is None:
+        return {}, {}
+    intervals = log.pause_intervals(clamp_end)
+    totals, _ = log.pause_totals(clamp_end)
     return intervals, totals
 
 def parse_qlen(path):
-    """Full parse into per-(switch,port) time series (for plots) plus histograms
-    (robust percentiles on huge files).
+    """Adapter over sweeplib.ns3.read_qlen(series=True).
 
-    The switch buffer is a single SHARED pool (switch-mmu.cc: shared_used_bytes is
-    switch-wide, and GetPfcThreshold subtracts it from buffer_size).  Each qlen.txt
-    line is one switch at one timestamp listing all its congested ports, so the sum
-    over that line is the switch's shared-pool occupancy at that sample.  We track
-    that aggregate per switch as well as the per-port detail."""
-    series = defaultdict(lambda: ([], []))         # (sw,port) -> (times[], bytes[])
-    hist = defaultdict(lambda: defaultdict(int))   # (sw,port) -> {kb: count}
-    mx = defaultdict(int); cnt = defaultdict(int); ssum = defaultdict(int)
-    # per-switch shared-pool aggregate (sum over ports per sample):
-    sw_series = defaultdict(lambda: ([], []))      # sw -> (times[], total_bytes[])
-    sw_hist = defaultdict(lambda: defaultdict(int))
-    sw_mx = defaultdict(int); sw_cnt = defaultdict(int); sw_ssum = defaultdict(int)
-    tmin = None; tmax = 0
-    with open(path) as f:
-        for line in f:
-            p = line.split()
-            if len(p) < 3 or p[0] != "time":
-                continue
-            try:
-                t = int(p[1]); sw = int(p[2])
-            except ValueError:
-                continue
-            tmin = t if tmin is None else min(tmin, t); tmax = max(tmax, t)
-            i = 3; line_total = 0
-            while i + 2 <= len(p):
-                if p[i] == "j":
-                    try:
-                        port = int(p[i + 1]); b = int(p[i + 2])
-                    except ValueError:
-                        i += 3; continue
-                    key = (sw, port)
-                    ts, bs = series[key]; ts.append(t); bs.append(b)
-                    hist[key][b // 1000] += 1
-                    cnt[key] += 1; ssum[key] += b
-                    if b > mx[key]:
-                        mx[key] = b
-                    line_total += b
-                    i += 3
-                else:
-                    i += 1
-            # record the switch-wide shared-pool sample
-            sts, sbs = sw_series[sw]; sts.append(t); sbs.append(line_total)
-            sw_hist[sw][line_total // 1000] += 1
-            sw_cnt[sw] += 1; sw_ssum[sw] += line_total
-            if line_total > sw_mx[sw]:
-                sw_mx[sw] = line_total
-    return dict(series=series, hist=hist, mx=mx, cnt=cnt, ssum=ssum,
-                sw_series=sw_series, sw_hist=sw_hist, sw_mx=sw_mx,
-                sw_cnt=sw_cnt, sw_ssum=sw_ssum,
-                tmin=tmin or 0, tmax=tmax)
+    monitor_buffer dumps ``sum_k egress_bytes[port][k]`` for ONE port, and only
+    while that port's queue is >= 1000 B. So this is PER-EGRESS-PORT occupancy --
+    exactly what ShouldSendCN() compares against kmin/kmax[ifindex]. It is NOT
+    the shared pool: that is ingress-side accounting (shared_used_bytes) and is
+    not observable from this file at all. The per-switch sum is therefore "total
+    bytes queued for egress on that switch", a useful proxy for how full the
+    switch is, but it must not be compared against the PFC threshold."""
+    q = ns3io.read_qlen(Path(path), series=True)
+    if q is None:
+        return dict(series={}, hist={}, mx={}, cnt={}, ssum={}, sw_series={},
+                    sw_hist={}, sw_mx={}, sw_cnt={}, sw_ssum={}, tmin=0, tmax=0)
+    return dict(series=q.port_series, hist=q.port_hist, mx=q.port_max,
+                cnt=q.port_count,
+                ssum={k: q.port_mean[k] * q.port_count[k] for k in q.port_count},
+                sw_series=q.switch_series, sw_hist=q.switch_hist,
+                sw_mx=q.switch_total_max, sw_cnt=q.switch_count,
+                sw_ssum={s: sum(q.switch_series[s][1]) for s in q.switch_count},
+                tmin=q.t_min, tmax=q.t_max)
 
 def hpct(h, total, pp):
     """percentile from a {kb:count} histogram (returns bytes)."""
@@ -465,10 +416,17 @@ def report_fct(say, d, bulk_bytes):
             say(f"    {dst:>8}  {c:>6}  {fmt_bytes(d['per_dst_bytes'][dst]):>12}")
     return dict(all=s_all, bulk=s_bulk)
 
-def report_pfc(say, pfcd, totals, run_span, portmap, switch_ids):
+def report_pfc(say, pfcd, totals, run_span, portmap, switch_ids, topo=None, bn=None):
     if pfcd["n"] == 0:
         say("  (no PFC events — no pause: good sign, DCQCN regime)")
-        return dict(events=0, paused_links=0, tot_pause=0, max_frac=0.0)
+        return dict(events=0, paused_links=0, tot_pause=0, max_frac=0.0,
+                    bottleneck_frac=0.0)
+    if pfcd.get("qidx_state") == "MISSING":
+        say("  !! pfc.txt has no qIndex column. m_tracePfc fires per queue but "
+            "get_pfc does not print it, so with qos-enabled the PAUSE/RESUME "
+            "sequences of different priority groups interleave on one ifindex and "
+            "the state machine mis-pairs them. The numbers below are NOT a "
+            "measurement. See sweeplib.ns3.PFC_QIDX_PATCH.")
     span = run_span or (pfcd["tmax"] - pfcd["tmin"]) or 1
     tot_pause = sum(totals.values())
     paused_links = sum(1 for v in totals.values() if v > 0)
@@ -479,17 +437,36 @@ def report_pfc(say, pfcd, totals, run_span, portmap, switch_ids):
     say("\n  Top links by pause-time (fraction of the run spent in PAUSE):")
     say(f"    {'node':>5} {'type':>6} {'port':>16}  {'pause-time':>12}  {'% run':>7}")
     max_frac = 0.0
-    for (node, ntype, ifidx), tp in sorted(totals.items(), key=lambda x: -x[1])[:10]:
+    # Keys are (node, node_type, ifindex, qIndex). Queues of one device overlap in
+    # time, so they are shown per queue and the device max is what is reported --
+    # summing across devices and dividing by a time window can trivially exceed
+    # 100%, which is what "283% paused" looked like.
+    for key, tp in sorted(totals.items(), key=lambda x: -x[1])[:10]:
+        node, ntype, ifidx, qidx = key
         if tp == 0:
             continue
         kind = "switch" if ntype == 1 else "host"
         lbl = port_label(node, ifidx, portmap, switch_ids)
+        q = f" q{qidx}" if qidx >= 0 else ""
         frac = 100 * tp / span; max_frac = max(max_frac, frac)
-        say(f"    {node:>5} {kind:>6} {lbl:>16}  {fmt_ns(tp):>12}  {frac:6.2f}%")
-    return dict(events=pfcd["n"], paused_links=paused_links,
-                tot_pause=tot_pause, max_frac=max_frac, span=span)
+        say(f"    {node:>5} {kind:>6} {lbl + q:>16}  {fmt_ns(tp):>12}  {frac:6.2f}%")
+    # Pause on the devices upstream of the CONGESTED link specifically. The global
+    # worst can sit on a completely unrelated link, so it is not evidence about
+    # this bottleneck's regime. The trace fires on the device RECEIVING the pause
+    # frame -- the victim -- so the keys to look for are the peers' ports.
+    bfrac = float("nan")
+    if topo is not None and bn is not None:
+        victims = set(bn.pause_victims(topo))
+        vals = [tp for (node, _nt, ifidx, *_), tp in totals.items()
+                if (node, ifidx) in victims]
+        bfrac = 100 * max(vals) / span if vals else 0.0
+        say(f"\n  Pause on the bottleneck's own ingress ({sorted(victims)}): "
+            f"{bfrac:.2f}% of the run  <== this, not the global worst, is what "
+            f"{bn} 's regime rests on")
+    return dict(events=pfcd["n"], paused_links=paused_links, tot_pause=tot_pause,
+                max_frac=max_frac, bottleneck_frac=bfrac, span=span)
 
-def report_qlen(say, qd, buffer_bytes, portmap, switch_ids, top):
+def report_qlen(say, qd, buffer_bytes, portmap, switch_ids, top, model=None, bn=None):
     if not qd["cnt"]:
         say("  (no congested port recorded — queues always < 1KB: DCQCN regime)")
         return dict(ports=0, switches=0, max_pct=0.0, near_buffer=0)
@@ -502,16 +479,57 @@ def report_qlen(say, qd, buffer_bytes, portmap, switch_ids, top):
         "[QLEN_MON_START, QLEN_MON_END]. A short window or a well-behaved DCQCN run "
         "both make this look sparse.")
 
-    # --- primary view: switch-wide shared-pool occupancy (drives PFC) --------
-    say("\n  Shared-pool occupancy per SWITCH (sum of all ports = what PFC watches):")
+    # --- the regime test: is the congested port's queue at the PFC ceiling? ---
+    # The ceiling is Sum over ingress ports of (reserve + threshold + headroom):
+    # where the egress queue settles once PFC has paused every ingress port and
+    # their headroom has absorbed the packets already in flight. At the ceiling
+    # the queue is held by backpressure; below it, the rate control is limiting.
+    #
+    # Comparing the queue against a fraction of the BUFFER instead is not just
+    # imprecise, it is unreachable: on an oversubscribed leaf whose host ports
+    # carry a large rate*delay headroom, the ceiling itself is ~50% of a 2 MiB
+    # buffer and ~27% of a 32 MiB one, so an "80% of buffer" flag can never fire
+    # even in full PFC.
+    ceiling = None
+    if model is not None and bn is not None and bn.f_ports:
+        ceiling = model.pfc_egress_ceiling(bn, buffer_bytes)
+        peak = qd["mx"].get((bn.switch, bn.egress_port))
+        kmin, kmax = model.ecn_band(bn)
+        say(f"\n  Congested link {bn}  (egress p{bn.egress_port} @ "
+            f"{bn.rate/1e9:g} Gbps, F_ports={bn.f_ports})")
+        say(f"    PFC threshold (per ingress port) : {fmt_bytes(model.pfc_threshold(bn, buffer_bytes))}")
+        say(f"    PFC egress ceiling               : {fmt_bytes(ceiling)}"
+            f"   ({100*ceiling/buffer_bytes:.1f}% of buffer)")
+        if kmin and kmax:
+            say(f"    ECN band                         : KMIN {fmt_bytes(kmin)} .. "
+                f"KMAX {fmt_bytes(kmax)}")
+        if peak:
+            r = peak / ceiling if ceiling else float("nan")
+            verdict = ("at the ceiling -> held by BACKPRESSURE" if r >= 0.95
+                       else "below the ceiling -> RATE CONTROL is limiting")
+            say(f"    measured peak egress             : {fmt_bytes(peak)}"
+                f"   peak/ceiling = {r:.3f}   <== {verdict}")
+    else:
+        say("\n  (no topology/config: no PFC threshold, no ceiling, no regime test. "
+            "Pass --topology and --config.)")
+
+    # --- context: total bytes queued for egress, per switch ------------------
+    say("\n  Total bytes queued for EGRESS per switch (sum over its ports).")
+    say("    NB: this is NOT the shared pool. monitor_buffer dumps egress_bytes;")
+    say("        the shared pool is ingress accounting (shared_used_bytes) and is")
+    say("        not observable from qlen.txt. Do not compare it to the threshold.")
     say(f"    {'switch':>6}  {'max':>10} {'% buf':>6}  {'mean':>10}  {'p99':>10}")
     near_buffer = 0; max_pct = 0.0
     for sw in sorted(qd["sw_cnt"], key=lambda s: -qd["sw_mx"][s]):
         m = qd["sw_mx"][sw]; av = qd["sw_ssum"][sw] / qd["sw_cnt"][sw]
         p99 = hpct(qd["sw_hist"][sw], qd["sw_cnt"][sw], 0.99)
         pctbuf = 100 * m / buffer_bytes; max_pct = max(max_pct, pctbuf)
-        flag = "  <== pool near buffer (PFC/overshoot)" if pctbuf >= 80 else ""
-        if pctbuf >= 80:
+        # Flag against the PFC ceiling, which is where the queue physically stops,
+        # rather than against the buffer, which it can never approach.
+        ref = ceiling if ceiling else buffer_bytes
+        pctref = 100 * m / ref
+        flag = "  <== at the PFC ceiling" if pctref >= 95 else ""
+        if pctref >= 95:
             near_buffer += 1
         say(f"    {sw:>6}  {fmt_bytes(m):>10} {pctbuf:5.1f}%  "
             f"{fmt_bytes(av):>10}  {fmt_bytes(p99):>10}{flag}")
@@ -529,48 +547,82 @@ def report_qlen(say, qd, buffer_bytes, portmap, switch_ids, top):
         say(f"    {sw:>6} {lbl:>16}  {fmt_bytes(m):>10} {pctbuf:5.1f}%  "
             f"{fmt_bytes(av):>10}  {fmt_bytes(p99):>10}{flag}")
 
-    say(f"\n  Switches whose shared pool hit >= 80% of buffer : {near_buffer}  "
-        f"(>=1 => PFC/overshoot regime; zero => DCQCN regime)")
+    say(f"\n  Switches whose egress queue reached the PFC ceiling : {near_buffer}  "
+        f"(>=1 => backpressure-limited; zero => rate-control-limited)")
     say("  NB: the monitor logs a port only when its queue >= 1KB, so 'mean' is over")
     say("      the active phase, not the whole run. MAX remains reliable.")
+    peak_over_ceiling = float("nan")
+    if ceiling and bn is not None:
+        pk = qd["mx"].get((bn.switch, bn.egress_port))
+        if pk:
+            peak_over_ceiling = pk / ceiling
     return dict(ports=len(qd["cnt"]), switches=len(qd["sw_cnt"]),
-                max_pct=max_pct, near_buffer=near_buffer)
+                max_pct=max_pct, near_buffer=near_buffer,
+                peak_over_ceiling=peak_over_ceiling, ceiling=ceiling)
 
 # ============================================================================ #
 #  REGIME VERDICT  (quantitative DCQCN vs PFC classification)
 # ============================================================================ #
-def classify(fct_s, pfc_s, qlen_s):
-    max_buf = qlen_s.get("max_pct", 0.0)
-    pause_frac = pfc_s.get("max_frac", 0.0)
+def classify(fct_s, pfc_s, qlen_s, model=None, bn=None, buffer_bytes=None):
+    """DCQCN vs PFC, from measurements rather than from thresholds picked by hand.
+
+    The decisive test is peak_over_ceiling: the egress queue riding at the PFC
+    ceiling means backpressure is holding it; below the ceiling, the rate control
+    is what limits. Pause time on the bottleneck's own ingress corroborates.
+
+    The previous version summed four boolean signals, two of which -- cv >= 0.7
+    and p99 >= 3.0 -- were computed over an unfiltered bimodal mixture of
+    congested KV flows (slowdown ~36) and tensor-parallel all-reduces on
+    dedicated host links (slowdown ~1). Those two fired at EVERY buffer size,
+    which alone met the "pfc_signals >= 2" bar, so the verdict was "PFC" on every
+    run of a sweep -- including one with literally zero PFC events. Meanwhile the
+    third signal, "pool >= 80% of buffer", could never fire at all, because the
+    physical ceiling is ~50% of a 2 MiB buffer. Three of the four inputs were
+    broken; the verdict was right once out of five, by luck.
+
+    cv and p99 remain, now over the incast alone, but only as corroboration: they
+    cannot by themselves produce a PFC verdict."""
+    ceil_ratio = qlen_s.get("peak_over_ceiling", float("nan"))
+    pause_frac = pfc_s.get("bottleneck_frac", pfc_s.get("max_frac", 0.0))
     near = qlen_s.get("near_buffer", 0)
+    max_buf = qlen_s.get("max_pct", 0.0)
     cv = 0.0; p99 = 1.0
     if fct_s and fct_s.get("bulk"):
         cv = fct_s["bulk"]["cv"]; p99 = fct_s["bulk"]["p99"]
     elif fct_s and fct_s.get("all"):
         cv = fct_s["all"]["cv"]; p99 = fct_s["all"]["p99"]
 
-    pfc_signals = 0
-    pfc_signals += near > 0 or max_buf >= 80
-    pfc_signals += pause_frac >= 1.0
-    pfc_signals += cv >= 0.7
-    pfc_signals += p99 >= 3.0
+    at_ceiling = ceil_ratio == ceil_ratio and ceil_ratio >= 0.95
+    have_model = ceil_ratio == ceil_ratio
 
-    if pfc_signals >= 2 or max_buf >= 90 or pause_frac >= 5:
-        verdict, color = "PFC / buffer-overshoot regime", CORAL
-    elif pfc_signals == 1 or max_buf >= 50 or pause_frac > 0:
-        verdict, color = "MIXED — DCQCN holding, PFC starting to bite", AMBER
+    if not have_model:
+        # Without the topology there is no ceiling to compare against, so fall
+        # back to pause time alone and say the verdict is provisional.
+        if pause_frac >= 5.0:
+            verdict, color = "PFC (provisional: no topology, pause-time only)", CORAL
+        elif pause_frac > 0.5:
+            verdict, color = "MIXED (provisional: no topology, pause-time only)", AMBER
+        else:
+            verdict, color = "DCQCN (provisional: no topology, pause-time only)", OKGREEN
+    elif at_ceiling and pause_frac > 1.0:
+        verdict, color = "PFC / backpressure-limited", CORAL
+    elif pause_frac > 0.5 or at_ceiling:
+        verdict, color = "MIXED - DCQCN holding, PFC starting to bite", AMBER
     else:
-        verdict, color = "DCQCN regime (healthy)", OKGREEN
+        verdict, color = "DCQCN regime (rate-control-limited)", OKGREEN
     return dict(verdict=verdict, color=color, max_buf_pct=max_buf,
-                pause_frac=pause_frac, near_buffer=near, cv=cv, p99=p99)
+                pause_frac=pause_frac, near_buffer=near, cv=cv, p99=p99,
+                peak_over_ceiling=ceil_ratio)
 
 # ============================================================================ #
 #  PLOTS
 # ============================================================================ #
 def _finish(fig, path, dpi):
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
-    return path
+    """Shim over sweeplib.plots.save_fig, kept because the plot functions pass a
+    full path rather than (dir, name)."""
+    p = Path(path)
+    save_fig(fig, p.parent, p.name)
+    return os.path.basename(path)
 
 def _empty_panel(ax, msg):
     ax.axis("off")
@@ -678,10 +730,13 @@ def plot_pfc(pfcd, intervals, totals, run_span, portmap, switch_ids, top, out, d
     ax = fig.add_subplot(gs[0, 0])
     if ranked:
         labs, fracs, cols = [], [], []
-        for (node, ntype, ifidx) in ranked:
+        for key in ranked:
+            node, ntype, ifidx, qidx = key
             kind = "sw" if ntype == 1 else "h"
             lbl = f"{kind}{node}:{port_label(node, ifidx, portmap, switch_ids)}"
-            labs.append(lbl); fr = 100 * totals[(node, ntype, ifidx)] / span
+            if qidx >= 0:
+                lbl += f" q{qidx}"
+            labs.append(lbl); fr = 100 * totals[key] / span
             fracs.append(fr)
             cols.append(CORAL if ntype == 1 else VIOLET)
         ypos = np.arange(len(labs))
@@ -722,14 +777,15 @@ def plot_pfc(pfcd, intervals, totals, run_span, portmap, switch_ids, top, out, d
     ax = fig.add_subplot(gs[1, :])
     if ranked:
         for row, key in enumerate(ranked):
-            node, ntype, ifidx = key
+            node, ntype, ifidx, qidx = key
             col = CORAL if ntype == 1 else VIOLET
             for (a, b) in intervals[key]:
                 ax.barh(row, (b - a) / 1e3, left=(a - t0) / 1e3, height=0.7,
                         color=col, alpha=0.85)
             kind = "sw" if ntype == 1 else "h"
+            q = f" q{qidx}" if qidx >= 0 else ""
             ax.text(-0.005 * (span / 1e3), row,
-                    f"{kind}{node}:{port_label(node, ifidx, portmap, switch_ids)} ",
+                    f"{kind}{node}:{port_label(node, ifidx, portmap, switch_ids)}{q} ",
                     va="center", ha="right", fontsize=8)
         ax.set_yticks([])
         ax.set_ylim(-0.6, len(ranked) - 0.4); ax.invert_yaxis()
@@ -931,66 +987,69 @@ def plot_overview(regime, fct_s, pfc_s, qlen_s, run_name, out, dpi):
 #  MAIN
 # ============================================================================ #
 def buffer_mb_from_name(run_name):
-    """Extract the per-switch buffer (MiB) from the run name, e.g.
-    'T1_bx200_dcqcn_buf2' -> 2.0.  The token always follows 'buf' but is not
-    necessarily at the end; 'bx200' etc. are ignored because we anchor on 'buf'
-    immediately followed by digits.  Returns None if absent."""
-    m = re.search(r"buf(\d+(?:\.\d+)?)", run_name, re.IGNORECASE)
-    return float(m.group(1)) if m else None
+    """Per-switch buffer (MiB) from the run name, e.g. 'T1_bx200_dcqcn_buf2' -> 2.0.
+    Anchored on 'buf' so 'bx200' is not mistaken for it. config.txt overrides this
+    when present: the name is a convention, the config is fact."""
+    return BUFFER_AXIS.value(run_name)
 
 def resolve_input(folder):
     if os.path.isdir(folder):
         return os.path.abspath(folder)
+    
+    cwd_cand = os.path.join(os.getcwd(), "..", "output", "ns3", folder)
+    if os.path.isdir(cwd_cand):
+        return os.path.abspath(cwd_cand)
+    
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    cand = os.path.join(base_dir, "output", "ns3", folder)
-    if os.path.isdir(cand):
-        return os.path.abspath(cand)
+    script_cand = os.path.join(base_dir, "..", "output", "ns3", folder)
+    if os.path.isdir(script_cand):
+        return os.path.abspath(script_cand)
+    return None
+
+def _resolve_aux(explicit, run_name, folder, filename):
+    """Locate a per-run auxiliary file, no flag needed. Priority:
+      1. the explicit override (a path, a {tag} template, or a directory);
+      2. ../configs/astra_sim/ns3/<run_name>/<filename> relative to CWD or script;
+      3. original project roots search.
+    """
+    if explicit:
+        hit = find_aux(explicit, run_name, filename, [])
+        if hit:
+            return str(hit)
+            
+    # 1. Cerca in ../configs rispetto alla directory corrente del terminale (CWD)
+    cwd_cand = os.path.abspath(os.path.join(os.getcwd(), "..", "configs", "astra_sim", "ns3", run_name, filename))
+    if os.path.isfile(cwd_cand):
+        return cwd_cand
+        
+    # 2. Cerca in ../configs rispetto alla posizione dello script
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    script_cand = os.path.abspath(os.path.join(base_dir, "..", "configs", "astra_sim", "ns3", run_name, filename))
+    if os.path.isfile(script_cand):
+        return script_cand
+
+    # 3. Fallback sulla ricerca "root" originale dello script
+    roots = project_roots(folder, os.getcwd(), base_dir)
+    hit = find_under_roots(roots, os.path.join("configs", "astra_sim", "ns3",
+                                               run_name, filename))
+    if hit:
+        return str(hit)
+        
     return None
 
 def resolve_topology(explicit, run_name, folder):
-    """Locate the physical topology file automatically (no flag needed).  Priority:
-      1. --topology (explicit override);
-      2. configs/astra_sim/ns3/<run_name>/physical_topology.txt under any ancestor
-         of the run folder — the run lives at <root>/output/ns3/<run> and configs
-         at <root>/configs/..., so they share a project root; we also try the CWD
-         and this script's directory as fallback roots;
-      3. physical_topology.txt sitting inside the run folder itself."""
-    if explicit:
-        return explicit if os.path.isfile(explicit) else None
-    rel = os.path.join("configs", "astra_sim", "ns3", run_name, "physical_topology.txt")
+    return _resolve_aux(explicit, run_name, folder, "physical_topology.txt")
 
-    def ancestors(start, depth=8):
-        d = os.path.abspath(start)
-        for _ in range(depth):
-            yield d
-            nd = os.path.dirname(d)
-            if nd == d:
-                break
-            d = nd
-
-    roots, seen = [], set()
-    # run folder first (most reliable), then CWD, then the script's directory
-    for base in (folder, os.getcwd(), os.path.dirname(os.path.abspath(__file__))):
-        for d in ancestors(base):
-            if d not in seen:
-                seen.add(d); roots.append(d)
-
-    for root in roots:
-        cand = os.path.join(root, rel)
-        if os.path.isfile(cand):
-            return cand
-    inside = os.path.join(folder, "physical_topology.txt")
-    if os.path.isfile(inside):
-        return inside
-    return None
+def resolve_config(explicit, run_name, folder):
+    return _resolve_aux(explicit, run_name, folder, "config.txt")
 
 def main():
     ap = argparse.ArgumentParser(
         description="Analyze & visualize ns-3 output (fct/pfc/qlen) for one run.")
     ap.add_argument("folder",
-                    help="run subdir under output/ns3/, or a direct path to the run folder")
+                    help="run subdir under ../output/ns3/, or a direct path to the run folder")
     ap.add_argument("--out-dir", default=None,
-                    help="output directory (default: ./results/ns3/<run basename>)")
+                    help="output directory (default: ../results/ns3_graphs/<run basename>)")
     ap.add_argument("--buffer-mb", type=float, default=None,
                     help="per-switch BUFFER_SIZE in MiB. If omitted, taken from the "
                          "run name (the number after 'buf', e.g. ...buf2 -> 2 MiB); "
@@ -998,8 +1057,14 @@ def main():
     ap.add_argument("--bulk-mb", type=float, default=1.0,
                     help="threshold in MB for a 'bulk' flow (KV/PP) (default 1)")
     ap.add_argument("--topology", default=None,
-                    help="topology file for port->neighbour labels. If omitted, "
+                    help="physical_topology.txt. Drives the port labels, the PFC "
+                         "threshold and ceiling, and the fabric/direct flow filter. "
+                         "Without it the regime verdict is provisional and the "
+                         "slowdown statistics are a mixture. If omitted, "
                          "auto-detected at configs/astra_sim/ns3/<run>/physical_topology.txt")
+    ap.add_argument("--config", default=None,
+                    help="ns-3 config.txt for this run (KMIN/KMAX + authoritative "
+                         "BUFFER_SIZE). Default: <run folder>/config.txt")
     ap.add_argument("--top", type=int, default=10,
                     help="how many worst links/ports to show (default 10)")
     ap.add_argument("--dpi", type=int, default=130, help="figure DPI (default 130)")
@@ -1013,7 +1078,8 @@ def main():
         sys.exit(1)
 
     run_name = os.path.basename(folder.rstrip("/"))
-    out_dir = args.out_dir or os.path.join(os.getcwd(), "results", "ns3_graphs", run_name)
+    # Salva in ../results/ns3_graphs/
+    out_dir = args.out_dir or os.path.abspath(os.path.join(os.getcwd(), "..", "results", "ns3_graphs", run_name))
     os.makedirs(out_dir, exist_ok=True)
 
     # buffer size: explicit flag wins; else parse the 'buf<N>' token in the name;
@@ -1023,16 +1089,37 @@ def main():
     else:
         parsed = buffer_mb_from_name(run_name)
         if parsed is not None:
-            buffer_mb, buf_src = parsed, f"run name ('buf' token)"
+            buffer_mb, buf_src = parsed, "run name ('buf' token)"
         else:
             buffer_mb, buf_src = 16.0, "default (no 'buf' in name)"
     buffer_bytes = int(buffer_mb * 1024 * 1024)
     bulk_bytes = int(args.bulk_mb * 1024 * 1024)
 
-    portmap, switch_ids = {}, set()
+    topo, portmap, switch_ids, model = None, {}, set(), None
     topo_path = resolve_topology(args.topology, run_name, folder)
     if topo_path:
-        switch_ids, portmap, _ = parse_topology(topo_path)
+        topo, switch_ids, portmap = load_topology(topo_path)
+    else:
+        print("[warn] no physical_topology.txt resolved: no PFC threshold, no "
+              "ceiling, no fabric/direct filter. The slowdown statistics will be "
+              "a MIXTURE of congested transfers and uncongested direct-link "
+              "collectives, and the regime verdict is provisional. Pass --topology.",
+              file=sys.stderr)
+    cfg_path = resolve_config(args.config, run_name, folder)
+    if cfg_path and topo is not None:
+        cfg = parse_ns3_config(Path(cfg_path))
+        for w in cfg.warnings():
+            print(f"[warn] {w}", file=sys.stderr)
+        if cfg.buffer_mb is not None and abs(cfg.buffer_mb - buffer_mb) > 1e-6:
+            print(f"[warn] BUFFER_SIZE={cfg.buffer_mb} in config.txt but "
+                  f"'buf{buffer_mb:g}' in the run name -- trusting config.txt",
+                  file=sys.stderr)
+            buffer_mb = cfg.buffer_mb
+            buffer_bytes = int(buffer_mb * 1024 * 1024)
+        model = FabricModel(topo, cfg)
+    elif topo is not None:
+        print("[warn] no config.txt resolved: KMIN/KMAX unknown, no ECN band.",
+              file=sys.stderr)
 
     make_plots = HAVE_MPL and not args.no_plots
     if not HAVE_MPL and not args.no_plots:
@@ -1056,11 +1143,27 @@ def main():
     fct_path = os.path.join(folder, "fct.txt")
     fct_d, fct_s = None, None
     if os.path.isfile(fct_path):
-        fct_d = parse_fct(fct_path, bulk_bytes)
+        fct_d = parse_fct(fct_path, bulk_bytes, topo)
         fct_s = report_fct(say, fct_d, bulk_bytes)
     else:
         say("  file not found")
     run_end = fct_d["run_end"] if fct_d else 0
+
+    # ---- QLEN (parsed first: it identifies the bottleneck, which both the PFC
+    #      attribution and the regime test need) -----------------------------
+    qlen_path = os.path.join(folder, "qlen.txt")
+    qlen_d = qlen_s = None
+    if os.path.isfile(qlen_path):
+        qlen_d = parse_qlen(qlen_path)
+
+    # The congested directed link, plus the ingress PORTS feeding it. Ground truth
+    # is qlen.txt (the port that actually built a queue); the ingress ports come
+    # from the flows' paths. PFC accounting is per (port, qIndex), so it is a port
+    # count -- dozens of flows entering through two host ports load two counters.
+    bn = None
+    if topo is not None:
+        bn = flowlib.find_bottleneck(topo, qlen_d["mx"] if qlen_d else None,
+                                     fct_d["_flows"] if fct_d is not None else None)
 
     # ---- PFC ----------------------------------------------------------------
     say.header("PFC  (pfc.txt) — pause-time per link")
@@ -1069,29 +1172,32 @@ def main():
     if os.path.isfile(pfc_path):
         pfc_d = parse_pfc(pfc_path)
         clamp = run_end or pfc_d["tmax"]
-        intervals, totals = pfc_intervals(pfc_d["ev"], clamp)
-        pfc_s = report_pfc(say, pfc_d, totals, run_end, portmap, switch_ids)
+        intervals, totals = pfc_intervals(pfc_d, clamp)
+        pfc_s = report_pfc(say, pfc_d, totals, run_end, portmap, switch_ids, topo, bn)
     else:
         say("  file not found")
 
     # ---- QLEN ---------------------------------------------------------------
-    say.header("QLEN (qlen.txt) — queue occupancy vs buffer (DCQCN vs PFC regime)")
-    qlen_path = os.path.join(folder, "qlen.txt")
-    qlen_d = qlen_s = None
-    if os.path.isfile(qlen_path):
-        qlen_d = parse_qlen(qlen_path)
-        qlen_s = report_qlen(say, qlen_d, buffer_bytes, portmap, switch_ids, args.top)
+    say.header("QLEN (qlen.txt) — egress occupancy vs the PFC ceiling and the ECN band")
+    if qlen_d is not None:
+        qlen_s = report_qlen(say, qlen_d, buffer_bytes, portmap, switch_ids, args.top,
+                             model, bn)
     else:
         say("  file not found")
 
     # ---- verdict ------------------------------------------------------------
-    regime = classify(fct_s, pfc_s or {}, qlen_s or {})
+    regime = classify(fct_s, pfc_s or {}, qlen_s or {}, model, bn, buffer_bytes)
     say.header("VERDICT")
     say(f"  {regime['verdict']}")
-    say(f"    peak queue / buffer : {regime['max_buf_pct']:.1f}%")
-    say(f"    worst link pause    : {regime['pause_frac']:.2f}% of run")
-    say(f"    slowdown CV (bulk)  : {regime['cv']:.3f}")
-    say(f"    p99 slowdown (bulk) : {regime['p99']:.2f}x")
+    pc = regime.get("peak_over_ceiling", float("nan"))
+    say(f"    peak egress / PFC ceiling : {pc:.3f}   "
+        f"({'held by backpressure' if pc == pc and pc >= 0.95 else 'rate control limiting' if pc == pc else 'no topology/config'})")
+    say(f"    pause on the bottleneck   : {regime['pause_frac']:.2f}% of run")
+    say(f"    peak egress / buffer      : {regime['max_buf_pct']:.1f}%   "
+        f"(context only: the ceiling, not the buffer, is where the queue stops)")
+    say(f"    slowdown CV (incast)      : {regime['cv']:.3f}   "
+        f"{'' if (fct_s or {}).get('filtered', True) else '<< UNFILTERED: a fabric/direct mixture'}")
+    say(f"    p99 slowdown (incast)     : {regime['p99']:.2f}x")
 
     say("\n" + "-" * 74)
     say("Reading: queues near buffer + high pause-time + high-CV slowdown => PFC.")
@@ -1119,6 +1225,7 @@ def main():
                 made.append(plot_fct(fct_d, bulk_bytes,
                                      os.path.join(out_dir, "01_fct.png"), args.dpi))
             except Exception as e:
+                traceback.print_exc()
                 print(f"[warn] fct plot failed: {e}")
         if pfc_d and pfc_d["n"]:
             try:
@@ -1126,6 +1233,7 @@ def main():
                                      switch_ids, args.top,
                                      os.path.join(out_dir, "02_pfc.png"), args.dpi))
             except Exception as e:
+                traceback.print_exc()
                 print(f"[warn] pfc plot failed: {e}")
         if qlen_d and qlen_d["cnt"]:
             try:
@@ -1133,6 +1241,7 @@ def main():
                                       args.top,
                                       os.path.join(out_dir, "03_qlen.png"), args.dpi))
             except Exception as e:
+                traceback.print_exc()
                 print(f"[warn] qlen plot failed: {e}")
 
     print(f"\nWrote report.txt + summary.json to {out_dir}")

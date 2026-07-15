@@ -10,7 +10,6 @@ reader without sharing a question.
 
 from __future__ import annotations
 
-import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,20 +53,38 @@ def read_fct(path: Path) -> pd.DataFrame | None:
     if not path.is_file():
         return None
     rows = []
+    diag = dict(raw_lines=0, skipped_short=0, skipped_badnum=0, sfct_nonpos=0,
+                slow_lt1=0, ncols=None, sample=None, ncol_hist=defaultdict(int))
     for line in path.open():
+        if not line.strip():
+            continue
+        diag["raw_lines"] += 1
         p = line.split()
+        diag["ncol_hist"][len(p)] += 1
+        if diag["sample"] is None:
+            diag["sample"], diag["ncols"] = line.rstrip("\n"), len(p)
         if len(p) < 8:
+            diag["skipped_short"] += 1
             continue
         try:
-            rows.append((ip_to_node(p[0]), ip_to_node(p[1]),
-                         int(p[4]), int(p[5]), int(p[6]), int(p[7])))
+            size, start, fct, sfct = int(p[4]), int(p[5]), int(p[6]), int(p[7])
         except ValueError:
+            diag["skipped_badnum"] += 1
             continue
+        if sfct <= 0:
+            diag["sfct_nonpos"] += 1
+        elif fct / sfct < 0.999:
+            diag["slow_lt1"] += 1
+        rows.append((ip_to_node(p[0]), ip_to_node(p[1]), size, start, fct, sfct))
     if not rows:
         return None
     df = pd.DataFrame(rows, columns=["src", "dst", "size", "start", "fct", "sfct"])
     df["arrival"] = df["start"] + df["fct"]
     df["slowdown"] = np.where(df["sfct"] > 0, df["fct"] / df["sfct"], np.nan)
+    # Parse diagnostics ride along: a wrong column layout must be visible before
+    # any number computed from it is trusted.
+    diag["ncol_hist"] = dict(diag["ncol_hist"])
+    df.attrs["diagnostics"] = diag
     return df
 
 
@@ -119,6 +136,24 @@ class PfcLog:
                 tot += max(clamp_to, start) - start
             totals[key] = tot
         return totals, unclosed
+
+    def pause_intervals(self, clamp_to: int) -> dict[tuple, list[tuple[int, int]]]:
+        """Closed [start, end] pause intervals per (node, node_type, ifindex, qIndex),
+        for timelines. Same state machine as pause_totals."""
+        out: dict[tuple, list] = {}
+        for key, events in self.events.items():
+            events.sort()
+            iv, start = [], None
+            for t, typ in events:
+                if typ == 1 and start is None:
+                    start = t
+                elif typ == 0 and start is not None:
+                    iv.append((start, t))
+                    start = None
+            if start is not None:
+                iv.append((start, max(clamp_to, start)))
+            out[key] = iv
+        return out
 
     def pause_per_device(self, clamp_to: int) -> dict[tuple[int, int, int], int]:
         """Collapsed to (node, node_type, ifindex). Queues of one device overlap
@@ -201,7 +236,17 @@ class QlenLog:
     samples: int = 0
     port_max: dict[tuple[int, int], int] = field(default_factory=dict)
     port_mean: dict[tuple[int, int], float] = field(default_factory=dict)
+    port_count: dict[tuple[int, int], int] = field(default_factory=dict)
     switch_total_max: dict[int, int] = field(default_factory=dict)
+    t_min: int = 0
+    t_max: int = 0
+    # Filled only when read_qlen(..., series=True): the raw samples and the
+    # {kB: count} histograms, which keep percentiles affordable on huge files.
+    port_series: dict[tuple[int, int], tuple[list, list]] = field(default_factory=dict)
+    port_hist: dict[tuple[int, int], dict[int, int]] = field(default_factory=dict)
+    switch_series: dict[int, tuple[list, list]] = field(default_factory=dict)
+    switch_hist: dict[int, dict[int, int]] = field(default_factory=dict)
+    switch_count: dict[int, int] = field(default_factory=dict)
 
     def busiest_port(self) -> tuple[int, int] | None:
         if not self.port_max:
@@ -209,22 +254,31 @@ class QlenLog:
         return max(self.port_max.items(), key=lambda kv: kv[1])[0]
 
 
-def read_qlen(path: Path) -> QlenLog | None:
+def read_qlen(path: Path, series: bool = False) -> QlenLog | None:
+    """`series=True` also retains the per-sample time series and histograms, which
+    plots need and a sweep does not."""
     if not path.is_file():
         return None
     pmax: dict[tuple[int, int], int] = defaultdict(int)
     psum: dict[tuple[int, int], int] = defaultdict(int)
     pcnt: dict[tuple[int, int], int] = defaultdict(int)
     swmax: dict[int, int] = defaultdict(int)
-    samples = 0
+    swcnt: dict[int, int] = defaultdict(int)
+    pser: dict = defaultdict(lambda: ([], []))
+    phist: dict = defaultdict(lambda: defaultdict(int))
+    sser: dict = defaultdict(lambda: ([], []))
+    shist: dict = defaultdict(lambda: defaultdict(int))
+    samples, tmin, tmax = 0, None, 0
     for line in path.open():
         p = line.split()
         if len(p) < 3 or p[0] != "time":
             continue
         try:
-            sw = int(p[2])
+            ts, sw = int(p[1]), int(p[2])
         except ValueError:
             continue
+        tmin = ts if tmin is None else min(tmin, ts)
+        tmax = max(tmax, ts)
         i, total = 3, 0
         while i < len(p):
             # i+2 < len(p), not <=: a truncated final line from a killed run
@@ -239,14 +293,28 @@ def read_qlen(path: Path) -> QlenLog | None:
                 pcnt[key] += 1
                 psum[key] += b
                 pmax[key] = max(pmax[key], b)
+                if series:
+                    pser[key][0].append(ts)
+                    pser[key][1].append(b)
+                    phist[key][b // 1000] += 1
                 total += b
                 i += 3
             else:
                 i += 1
         samples += 1
+        swcnt[sw] += 1
         swmax[sw] = max(swmax[sw], total)
+        if series:
+            sser[sw][0].append(ts)
+            sser[sw][1].append(total)
+            shist[sw][total // 1000] += 1
     if samples == 0:
         return QlenLog()
     return QlenLog(samples=samples, port_max=dict(pmax),
                    port_mean={k: psum[k] / pcnt[k] for k in pcnt},
-                   switch_total_max=dict(swmax))
+                   port_count=dict(pcnt), switch_total_max=dict(swmax),
+                   switch_count=dict(swcnt), t_min=tmin or 0, t_max=tmax,
+                   port_series={k: v for k, v in pser.items()},
+                   port_hist={k: dict(v) for k, v in phist.items()},
+                   switch_series={k: v for k, v in sser.items()},
+                   switch_hist={k: dict(v) for k, v in shist.items()})

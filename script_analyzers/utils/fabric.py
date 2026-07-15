@@ -187,6 +187,15 @@ class Topology:
                 return idx
         return None
 
+    def port_label(self, node: int, ifidx: int) -> str:
+        """'p3->sw12' / 'p2->h0'. The ifindex alone is meaningless to a reader:
+        it follows link-file order, so a host's port toward its leaf is not
+        necessarily 1."""
+        port = self.ports.get(node, {}).get(ifidx)
+        if port is None:
+            return f"p{ifidx}"
+        return f"p{ifidx}->{'sw' if self.is_switch(port.peer) else 'h'}{port.peer}"
+
     def path(self, src: int, dst: int) -> list[tuple[int, int]] | None:
         """Directed links on the src->dst shortest path, or None if ambiguous
         (ECMP: SetRoutingEntries installs every equal-cost next hop and the
