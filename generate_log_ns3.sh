@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 
+# Phase 2/2: ns-3/ASTRA-sim execution only.
+#
+# Requires MLSynth traces to already exist for MODEL_FILE_NAME (run
+# generate_traces.sh once beforehand). Safe to run in parallel across
+# different NS3_SUBDIR values; do NOT run two instances with the SAME
+# NS3_SUBDIR (or the same OUTPUT_DIR_NAME) concurrently, since their
+# ns-3 output files and logging folder would collide.
+
 # 1. Ask for user input (supports command line args or interactive prompt)
 MODEL_FILE_NAME="$1"
 NS3_SUBDIR="$2"
@@ -33,7 +41,6 @@ echo "---------------------------------------------------"
 # 2. Paths
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-MLSYNTH_SCRIPT="$BASE_DIR/../mlsynth/synthesise_inference.py"
 NS3_DIR="$BASE_DIR/../astra-sim/extern/network_backend/ns-3"
 NS3_BIN="$NS3_DIR/build/scratch/ns3.42-AstraSimNetwork-default"
 
@@ -49,8 +56,6 @@ SYSTEM_CFG="$BASE_DIR/configs/astra_sim/system/h100_1D.json"
 REMOTE_MEM_CFG="$BASE_DIR/configs/astra_sim/no_remote_memory.json"
 LOGGING_CFG="$BASE_DIR/configs/astra_sim/logging_config.toml"
 
-MLSYNTH_CFG_PATH="$BASE_DIR/configs/mlsynth/${MODEL_FILE_NAME}.yaml"
-
 # 4. Define output paths
 TRACES_DIR="$BASE_DIR/output/mlsynth"
 WORKLOAD_PREFIX="$TRACES_DIR/$MODEL_FILE_NAME/et/$MODEL_FILE_NAME"
@@ -59,11 +64,6 @@ NS3_OUT_DIR="$BASE_DIR/output/ns3/$NS3_SUBDIR"
 OUTPUT_DIR="$BASE_DIR/output/astra_logs/${OUTPUT_DIR_NAME}"
 
 # ESSENTIAL CHECK 2: Verify all required files and binaries exist
-if [ ! -f "$MLSYNTH_CFG_PATH" ]; then
-  echo "ERROR: MLSynth config file not found at $MLSYNTH_CFG_PATH"
-  exit 1
-fi
-
 if [ ! -x "$NS3_BIN" ]; then
   echo "ERROR: ns-3 binary not found or not executable at:"
   echo "       $NS3_BIN"
@@ -77,27 +77,22 @@ for f in "$SYSTEM_CFG" "$REMOTE_MEM_CFG" "$NET_CFG" "$TOPOLOGY_FILE" "$LOGICAL_T
   fi
 done
 
-# --- EXECUTION ---
-
-# Step 1: MLSynth
-echo "==> [1/2] Running MLSynth to generate traces for model: $MODEL_FILE_NAME"
-python3 "$MLSYNTH_SCRIPT" -c "$MLSYNTH_CFG_PATH" -o "$TRACES_DIR"
-
-# ESSENTIAL CHECK 3: Stop if MLSynth failed
-if [ $? -ne 0 ]; then
-  echo "ERROR: MLSynth execution failed. Check the python errors above. Exiting."
+# ESSENTIAL CHECK 3: MLSynth traces must already exist for this model
+# (run ./generate_traces.sh "$MODEL_FILE_NAME" once beforehand)
+if ! find "$TRACES_DIR/$MODEL_FILE_NAME/et/" -maxdepth 1 -name "${MODEL_FILE_NAME}.*.et" -print -quit 2>/dev/null | grep -q .; then
+  echo "ERROR: No MLSynth traces found for model '$MODEL_FILE_NAME' in:"
+  echo "       $TRACES_DIR/$MODEL_FILE_NAME/et/"
+  echo "       Run './generate_traces.sh $MODEL_FILE_NAME' first."
   exit 1
 fi
 
-echo "==> Traces successfully generated in $TRACES_DIR/$MODEL_FILE_NAME"
+if [ ! -f "$COMM_GROUPS" ]; then
+  echo "ERROR: comm_groups.json not found at $COMM_GROUPS"
+  echo "       Run './generate_traces.sh $MODEL_FILE_NAME' first."
+  exit 1
+fi
 
-# Sanity check: the number of NPUs (one .et per NPU) must equal the number of
-# COMPUTE nodes in physical_topology.txt, and logical_topology.json must use that count.
-NUM_NPUS=$(find "$TRACES_DIR/$MODEL_FILE_NAME/et/" -maxdepth 1 -name "${MODEL_FILE_NAME}.*.et" | wc -l | tr -d ' ')
-echo "==> Detected $NUM_NPUS NPU trace file(s) (.et)."
-echo "    -> physical_topology.txt must have exactly $NUM_NPUS compute nodes"
-echo "    -> logical_topology.json must use [\"$NUM_NPUS\"]"
-echo ""
+# --- EXECUTION ---
 
 # Ensure we run from the root
 cd "$BASE_DIR" || exit
@@ -108,8 +103,7 @@ if [ -d "$OUTPUT_DIR" ]; then
 fi
 mkdir -p "$NS3_OUT_DIR"
 
-# Step 2: ASTRA-sim
-echo "==> [2/2] Starting ASTRA-sim (ns-3 backend)..."
+echo "==> Starting ASTRA-sim (ns-3 backend)..."
 "$NS3_BIN" \
   --workload-configuration="$WORKLOAD_PREFIX" \
   --system-configuration="$SYSTEM_CFG" \
