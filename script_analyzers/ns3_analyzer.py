@@ -49,6 +49,7 @@ import pandas as pd
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.colors
 import matplotlib.pyplot as plt
 
 from utils import flows as flowlib
@@ -343,6 +344,74 @@ def plot_ports(qlen, topo, bn, kmax, out, written):
     save_fig(fig, out, "03_queue_peak_by_port.png", written)
 
 
+def plot_congestion_heatmap(qlen, topo, model, bn, out, written):
+    """Peak egress queue, as a fraction of that port's own KMAX, for EVERY
+    switch port in the topology -- not just the one link the rest of this
+    report drills into. Rows are switches, columns are the peer at the far end
+    of each port (host or switch), so the grid is the topology's own adjacency
+    matrix: a big cell on a switch's uplink and nothing on its host-facing
+    ports says the incast is downstream of it, not on it. Gray means no such
+    link exists; a real port that never queued gets a near-white cell instead
+    of being indistinguishable from a non-existent one, because 'this NIC
+    never builds a queue' is itself a finding, not a missing value.
+
+    qlen.txt only ever logs switch egress (common.h::monitor_buffer runs on
+    switches, not hosts -- see utils.ns3.QlenLog), so there is no host row to
+    add: a host's queue is simply not observable in this simulator, and this
+    heatmap already covers every host as a COLUMN (the peer of a switch port).
+
+    Cells are peak/KMAX rather than raw bytes because ports run at different
+    rates -- a host-facing port here is 1024 Gbps, an uplink 200 Gbps -- and
+    comparing bytes across them compares nothing. peak/KMAX is the same
+    quantity the rest of the report already uses for the single analysed
+    link, computed here for every one; a port whose rate has no KMAX_MAP entry
+    is shown by its raw peak alone and left out of the color scale."""
+    switches = sorted(topo.switches)
+    peers = sorted({port.peer for sw in switches for port in topo.ports.get(sw, {}).values()})
+    ratio = np.full((len(switches), len(peers)), np.nan)
+    label = np.full((len(switches), len(peers)), "", dtype=object)
+    for i, sw in enumerate(switches):
+        for pt, port in topo.ports.get(sw, {}).items():
+            # Every port here is a REAL link (topo only enumerates ones that
+            # exist), so a cell with no qlen.txt entry is a link that never
+            # queued above monitor_buffer's 1000 B floor -- worth SHOWING as
+            # near-zero, not masking as gray, or "the host NIC never queues"
+            # (a legitimate finding) looks identical to "there is no such link".
+            peak = qlen.port_max.get((sw, pt), 0)
+            j = peers.index(port.peer)
+            kmax = model.cfg.kmax.get(port.rate)
+            label[i, j] = fmt_b(peak) + (f"\n{peak/kmax:.2f}x" if kmax else "\n(no KMAX)")
+            ratio[i, j] = (peak / kmax) if kmax else 0.0
+
+    fig, ax = plt.subplots(figsize=(max(6, 0.65 * len(peers) + 2),
+                                    max(4, 0.5 * len(switches) + 2)))
+    cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
+        "congestion", ["#fbeaea", CORAL])
+    cmap.set_bad("#ececec")
+    vmax = max(1.0, np.nanmax(ratio)) if np.isfinite(ratio).any() else 1.0
+    im = ax.imshow(np.ma.masked_invalid(ratio), cmap=cmap, vmin=0, vmax=vmax, aspect="auto")
+    for i in range(len(switches)):
+        for j in range(len(peers)):
+            if label[i, j]:
+                ax.text(j, i, label[i, j], ha="center", va="center", fontsize=6.5)
+    bi, bj = switches.index(bn.switch), peers.index(bn.peer)
+    ax.add_patch(plt.Rectangle((bj - 0.5, bi - 0.5), 1, 1, fill=False,
+                               edgecolor="black", lw=2.2))
+    ax.set_xticks(range(len(peers)))
+    ax.set_xticklabels([("sw" if topo.is_switch(p) else "h") + str(p) for p in peers],
+                       fontsize=8)
+    ax.set_yticks(range(len(switches)))
+    ax.set_yticklabels([f"sw{s}" for s in switches], fontsize=8)
+    ax.set_xlabel("Egress port's peer (host or switch)")
+    ax.set_ylabel("Switch")
+    ax.set_title(f"Peak egress queue / KMAX, every switch port\n"
+                 f"(black box = the analysed bottleneck {bn}; gray = no such "
+                 f"link; near-white = a real port that never queued)")
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Peak egress queue / KMAX")
+    save_fig(fig, out, "07_congestion_heatmap.png", written)
+
+
 def plot_gantt(kv_bn, bn, out, written):
     """One bar per KV flow at the bottleneck, start -> arrival, sorted by start.
 
@@ -371,6 +440,9 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     paths.add_arguments(ap, KIND)
+    for act in ap._actions:
+        if act.dest == "out":
+            act.help = "output dir (default: results/ns3_graphs/<workload>/<sweep>/<tag>)"
     roles.add_argument(ap)
     ap.add_argument("--tag", required=True, help="run sub-directory, e.g. "
                                                  "'T1_bx200_dcqcn_buf8'")
@@ -382,7 +454,15 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     try:
-        p, outbase = paths.from_arguments(a, KIND)
+        p = paths.SweepPaths(sweep=a.sweep, workload=a.workload, root=Path(a.root))
+        # Model first, experiment second, then the one run: results/ns3_graphs/
+        # <workload>/<sweep>/<tag> -- one workload runs many sweeps, so this
+        # groups a model's results together instead of scattering them across
+        # sweeps the way utils.paths.SweepPaths.outdir's <kind>/<sweep>/
+        # <workload> layout would (and this analyzer needs a <tag> leaf on top
+        # of that, which buffer_sweep/bandwidth_sweep don't).
+        outbase = (Path(a.out) if a.out else
+                  p.root / "results" / "ns3_graphs" / p.workload / p.sweep)
         outdir = outbase / a.tag
         need(not p.missing_roots(),
              "derived root(s) do not exist:\n    " + "\n    ".join(p.missing_roots()))
@@ -584,6 +664,7 @@ def main(argv: list[str] | None = None) -> int:
         plot_pause_ecdf(pfc, bn, topo, outdir, written, int(f["arrival"].max()))
         plot_slowdown_ecdf(f, outdir, written)
         plot_ports(qlen, topo, bn, kmax, outdir, written)
+        plot_congestion_heatmap(qlen, topo, model, bn, outdir, written)
         plot_gantt(kv_bn, bn, outdir, written)
         f.drop(columns=["path"]).to_csv(outdir / "flows.csv", index=False)
         pd.DataFrame([{"switch": s, "port": pt,

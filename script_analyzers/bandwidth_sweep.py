@@ -411,12 +411,22 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     paths.add_arguments(ap, KIND)
+    for act in ap._actions:
+        if act.dest == "out":
+            act.help = "output dir (default: results/sweep_analysis/" \
+                       f"{KIND}/<workload>/<sweep>)"
     ap.add_argument("--pattern", default="*.csv",
                     help="glob for the per-node CSVs inside each run dir")
     a = ap.parse_args(argv)
 
     try:
-        p, outdir = paths.from_arguments(a, KIND)
+        p = paths.SweepPaths(sweep=a.sweep, workload=a.workload, root=Path(a.root))
+        # Model first, experiment second: results/sweep_analysis/bandwidth/
+        # <workload>/<sweep>, not utils.paths.SweepPaths.outdir's <sweep>/
+        # <workload> -- one workload runs many sweeps, so this groups a
+        # model's results together instead of scattering them across sweeps.
+        outdir = (Path(a.out) if a.out else
+                  p.root / "results" / "sweep_analysis" / KIND / p.workload / p.sweep)
         need(p.astra_root.is_dir(),
              f"derived ASTRA root does not exist:\n    {p.astra_root}\n"
              f"  --sweep {a.sweep!r} or --workload {a.workload!r} is wrong.")

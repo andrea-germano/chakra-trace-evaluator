@@ -55,7 +55,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import hashlib
 import shutil
 import sys
 from dataclasses import asdict, dataclass, field
@@ -166,6 +165,11 @@ class Row:
     kv_stream_duration_ns: float = NAN       # NOT a skew -- see barrier()
     decode_ranks: str = ""
 
+    # -- measured: token latency, from the ns-3-backed ASTRA trace ----------- #
+    ttft_ns: float = NAN                     # DECFB(it=0) send: token 1 ready
+    second_token_ns: float = NAN             # DECFB(it=1) send: token 2 ready
+    itl1_ns: float = NAN                     # second_token_ns - ttft_ns
+
     slowdowns: object = None                 # raw array, for the box plot
 
     def flat(self) -> dict:
@@ -265,6 +269,57 @@ def barrier(kv: pd.DataFrame, placement: Placement) -> dict:
     return out
 
 
+def token_latency(tag: str, p: paths.SweepPaths) -> dict:
+    """TTFT and the first inter-token gap, from the ns-3-backed ASTRA-sim trace
+    of THIS run (utils.paths.astra_run, not output/astra_logs/analytical).
+
+    FIRSTTOK arriving at decode stage 0 is NOT a token: it is the dispatch
+    signal that lets stage 0 start its forward pass. With a decode pipeline of
+    P>1 stages, stage 0 still has to run its layers, hand off to stage 1 (PP),
+    and stage 1 has to run ITS layers before token 1 exists -- confirmed on
+    T1_bx200_dcqcn_buf2: FIRSTTOK arrives at 176.87 ms, but stage 1 does not
+    finish computing until 181.90 ms, 5 ms later. A metric built on FIRSTTOK
+    alone is 5 ms early on every buffer size, which is most of why an earlier
+    version of this function looked buffer-invariant for the wrong reason.
+
+    DECFB_pl=d_ss=<last stage>_ds=0 is the fix: it only exists once the LAST
+    decode stage has produced a token and is feeding it back to stage 0 to
+    start the next one, so its SEND start_tick (not the later arrival back at
+    stage 0) is the moment that iteration's token is actually ready --
+    regardless of how many pipeline stages sit in between:
+
+    ttft_ns          DECFB(it=0, send).start_tick, max across shards: token 1.
+    second_token_ns  DECFB(it=1, send).start_tick, max across shards: token 2.
+    itl1_ns          second_token_ns - ttft_ns: the first inter-token gap.
+                     Not necessarily representative of later steps (attention
+                     cost grows with the KV cache), which is why it is its own
+                     column rather than averaged into anything."""
+    adir = p.astra_run(tag)
+    need(adir.is_dir(), f"{tag}: no ASTRA-sim run at {adir}; TTFT and "
+                        f"second-token need the ns-3-backed ASTRA stats CSVs "
+                        f"alongside this run, not output/astra_logs/analytical.")
+    df = astra.read_run(adir)
+    need(df is not None, f"{tag}: no readable stats_sys*.csv under {adir}.")
+
+    def token_ready(it: str) -> float:
+        rows = df.loc[(df["op_class"] == "DECFB") & (df["it"] == it) &
+                      (df["comm_role"] == "send"), "start_tick"]
+        return float(rows.max()) if len(rows) else NAN
+
+    ttft = token_ready("0")
+    need(not np.isnan(ttft), f"{tag}: no DECFB(it=0) round in the ASTRA trace; "
+                             f"TTFT needs the last decode stage to finish "
+                             f"producing token 1. A single-stage decode "
+                             f"pipeline may never emit DECFB at all -- see "
+                             f"utils.astra.classify_op.")
+    second = token_ready("1")
+    if np.isnan(second):
+        warn(f"{tag}: no DECFB(it=1) round in the ASTRA trace; only one "
+             f"decode step was simulated, so there is no second token to time.")
+        return {"ttft_ns": ttft, "second_token_ns": NAN, "itl1_ns": NAN}
+    return {"ttft_ns": ttft, "second_token_ns": second, "itl1_ns": second - ttft}
+
+
 def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
             hf: int, bn_force: str | None) -> Row:
     buf = BUFFER_AXIS.value(tag)
@@ -295,6 +350,9 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
     row = Row(tag=tag, buffer_mb=float(buf), cc_mode=cfg.cc_mode if cfg.cc_mode
               is not None else NAN)
     buffer_bytes = int(buf * 1024 * 1024)
+
+    for k, v in token_latency(tag, p).items():
+        setattr(row, k, v)
 
     # -- flows ------------------------------------------------------------- #
     raw = ns3.read_fct(ns3_dir / "fct.txt")
@@ -389,33 +447,21 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
      row.pfc_pause_worst_device, n) = pause_pct(pfc, bn, topo, lo, hi)
     row.pfc_paused_devices = n
     if pfc.qidx_state == "MISSING" and row.pfc_pause_pct_suspect > 0:
-        warn(f"{tag}: pfc.txt has no qIndex, and the PAUSE/RESUME sequences of "
-             f"two priority queues demonstrably interleave on "
-             f"{row.pfc_pause_worst_device} (get_pfc drops the qIndex that "
-             f"qbb-net-device.cc:383 has in scope). The mis-paired intervals are "
-             f"worth {row.pfc_pause_pct_suspect:.2f} of the "
-             f"{row.pfc_pause_pct_of_window:.2f} percentage points, so the true "
+        warn(f"{tag}: pfc.txt has no qIndex, so PAUSE/RESUME may be mis-paired "
+             f"on {row.pfc_pause_worst_device} (see ns3.PFC_QIDX_PATCH). True "
              f"pause is in [{row.pfc_pause_pct_of_window - row.pfc_pause_pct_suspect:.2f}, "
-             f"{row.pfc_pause_pct_of_window:.2f}]%. Apply --print-patch to remove "
+             f"{row.pfc_pause_pct_of_window:.2f}]% of the window, not the point "
+             f"estimate {row.pfc_pause_pct_of_window:.2f}%. --print-patch removes "
              f"the bracket.")
 
     # -- the model check that matters --------------------------------------- #
     if row.qlen_peak_over_ceiling > 1.0:
         warn(f"{tag}: measured peak egress ({row.qlen_peak_bytes/1e6:.2f} MB) "
              f"exceeds the modelled PFC ceiling ({row.pfc_ceiling_bytes/1e6:.2f} "
-             f"MB) by {100*(row.qlen_peak_over_ceiling-1):.0f}%. The ceiling is "
-             f"built from the threshold at its FIXED POINT, so it is an upper "
-             f"bound and this is impossible. Ruled out already, in the ns-3 "
-             f"source: headroom_factor is 3 (common.h:86, and HEADROOM_FACTOR "
-             f"overrides it if you set it); ingress and egress account the same "
-             f"packets (RemoveFromIngressAdmission runs at dequeue); headroom "
-             f"does not overflow (uint64). What is left, and is checkable: "
-             f"hdrm_bytes[port][qIndex] is per-queue but its limit headroom[port] "
-             f"is per-port, and ConfigNPort reserves ONE per port -- so qCnt "
-             f"queues can each claim a full headroom. qlen.txt cannot show it "
-             f"because monitor_buffer sums egress_bytes over all queues while "
-             f"ShouldSendCN tests one (switch-mmu.cc:103). Emit qIndex from "
-             f"monitor_buffer to settle it.")
+             f"MB) by {100*(row.qlen_peak_over_ceiling-1):.0f}%: the model and "
+             f"the measurement disagree on this run and neither is verified "
+             f"against qIndex-level data (qlen.txt has none -- see "
+             f"ns3.PFC_QIDX_PATCH). Unresolved, not explained away.")
 
     # -- the barrier -------------------------------------------------------- #
     for k, v in barrier(kv, placement).items():
@@ -564,6 +610,27 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
               "MODEL (topology + config only): dynamic PFC threshold vs the ECN band\n"
               "band = where F_ports×threshold crosses KMIN and KMAX",
               "Bytes (kB, log)", band, written, fs=7)
+
+    # 06 TTFT / second-token, from the ns-3-backed ASTRA trace --------------- #
+    # Both are read off DECFB(send): the moment the LAST decode stage finishes
+    # producing that iteration's token, not the FIRSTTOK dispatch signal (which
+    # arrives before the decode pipeline has run at all -- see token_latency()).
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(x, s["ttft_ns"] / 1e6, "o-", color="#1f77b4",
+            label="TTFT: token 1 ready (last decode stage, DECFB it=0)")
+    if s["second_token_ns"].notna().any():
+        ax.plot(x, s["second_token_ns"] / 1e6, "s-", color="#d1495b",
+                label="token 2 ready (last decode stage, DECFB it=1)")
+    ax2 = ax.twinx()
+    if s["itl1_ns"].notna().any():
+        ax2.plot(x, s["itl1_ns"] / 1e6, "^--", color="#2b8a3e",
+                 label="first inter-token gap (token 2 − token 1)")
+    ax2.set_ylabel("First inter-token gap (ms)")
+    ax2.ticklabel_format(axis="y", useOffset=False, style="plain")
+    _decorate(fig, s, outdir, "06_ttft_and_second_token_vs_buffer.png",
+              "Token latency vs buffer: does the buffer change TTFT or the\n"
+              "first inter-token gap? (from the ns-3-backed ASTRA trace)",
+              "Time since t=0 (ms)", band, written)
     return written
 
 
@@ -571,13 +638,18 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
 REPORT = ["buffer_mb", "regime_model", "pfc_pause_pct_of_window",
           "qlen_peak_over_kmax", "kv_window_ns", "kv_floor_ns",
           "line_rate_efficiency", "concurrency_mean", "slow_mean",
-          "kv_ready_max_ns", "cross_rank_skew_ns"]
+          "kv_ready_max_ns", "cross_rank_skew_ns",
+          "ttft_ns", "second_token_ns", "itl1_ns"]
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     paths.add_arguments(ap, KIND)
+    for act in ap._actions:
+        if act.dest == "out":
+            act.help = "output dir (default: results/sweep_analysis/" \
+                       f"{KIND}/<workload>/<sweep>)"
     roles.add_argument(ap)
     ap.add_argument("--bottleneck", default=None,
                     help="'sw->peer', e.g. '8->12'. Default: measured (deepest "
@@ -595,7 +667,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        p, outdir = paths.from_arguments(a, KIND)
+        p = paths.SweepPaths(sweep=a.sweep, workload=a.workload, root=Path(a.root))
+        # Model first, experiment second: results/sweep_analysis/buffer/
+        # <workload>/<sweep>, not utils.paths.SweepPaths.outdir's <sweep>/
+        # <workload> -- one workload runs many sweeps, so this groups a
+        # model's results together instead of scattering them across sweeps.
+        outdir = (Path(a.out) if a.out else
+                 p.root / "results" / "sweep_analysis" / KIND / p.workload / p.sweep)
         need(not p.missing_roots(),
              "derived root(s) do not exist:\n    " + "\n    ".join(p.missing_roots())
              + f"\n  --sweep {a.sweep!r} is probably wrong.")
@@ -646,6 +724,10 @@ def main(argv: list[str] | None = None) -> int:
             tuple(int(i) for i in rows[0].ingress_ports.split(",")))
         band = band_of(t0, c0, bn0)
 
+        if outdir.exists():
+            shutil.rmtree(outdir)   # a stale figure from an older version of this
+                                    # script, left sitting next to a fresh one, is
+                                    # indistinguishable from a real result.
         outdir.mkdir(parents=True, exist_ok=True)
         s.to_csv(outdir / "summary.csv", index=False)
         pd.concat([pd.DataFrame({"buffer_mb": r.buffer_mb,
