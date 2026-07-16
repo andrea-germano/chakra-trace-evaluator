@@ -194,10 +194,21 @@ def plot_timeline(say, qlen, pfc, f, kv, bn, topo, model, buffer_bytes,
 
 def plot_slowdown_ecdf(f, out, written):
     """The full distribution per flow class. No mean, no CV, no p99: an ECDF is
-    the data. The TP curve at ~1 is the check that the classification works --
-    if it is not at 1, a 'direct' flow is crossing a switch."""
+    the data.
+
+    TP is excluded, and not because it is small -- it is 96% of the flows and,
+    on the reference run, 13.4 GB against the KV transfer's 6.7 GB. Per layer the
+    TP all-reduce moves as many bytes as that layer's KV cache. The difference is
+    the fabric: 40 MB across a dedicated 4800 Gbps link is 70 us, the same bytes
+    across a shared 200 Gbps uplink is where the whole thesis lives. TP slowdown
+    is 0.997 at the median and never crosses a switch, so plotting it spends 96%
+    of the ink drawing a vertical line at 1 and pulls every aggregate toward it.
+    The classification check it used to provide is one line of text in the report
+    instead."""
     fig, ax = plt.subplots(figsize=(8, 5))
     for c in roles.FLOW_CLASSES:
+        if c == "tp":
+            continue
         v = f.loc[(f["flow_class"] == c) & f["slowdown"].notna(), "slowdown"]
         if not len(v):
             continue
@@ -208,8 +219,11 @@ def plot_slowdown_ecdf(f, out, written):
     ax.set_xscale("log")
     ax.set_xlabel("Slowdown = fct / standalone_fct  (log)")
     ax.set_ylabel("ECDF")
-    ax.set_title("Slowdown by flow class\n(standalone_fct assumes the flow owns "
-                 "its bottleneck → N flows sharing it fairly give slowdown N)")
+    tp = f.loc[(f["flow_class"] == "tp") & f["slowdown"].notna(), "slowdown"]
+    ax.set_title("Slowdown by flow class, fabric flows only\n"
+                 "(standalone_fct assumes the flow owns its bottleneck → N flows "
+                 f"sharing it fairly give slowdown N)\nTP excluded: {len(tp)} flows "
+                 f"on dedicated links, median slowdown {tp.median():.3f}")
     ax.grid(True, alpha=0.3, which="both")
     ax.legend(fontsize=8)
     save_fig(fig, out, "02_slowdown_ecdf.png", written)
@@ -424,6 +438,23 @@ def main(argv: list[str] | None = None) -> int:
         kv = f[f["flow_class"] == "kv"]
         need(len(kv), "no KV flow after classification: --placement is wrong.")
 
+        tp = f.loc[(f["flow_class"] == "tp") & f["slowdown"].notna(), "slowdown"]
+        if len(tp):
+            bad = int((tp > 2).sum())
+            say(f"\n  TP control: {len(tp)} flows on 1-hop dedicated links, median "
+                f"slowdown {tp.median():.3f}, max {tp.max():.3f}. They cannot queue "
+                f"or be paused, so this must sit at ~1; {bad} above 2 would mean a "
+                f"'direct' flow is crossing a switch, i.e. the topology is wrong.")
+            if tp.max() > 1.2:
+                n = int((tp > 1.2).sum())
+                say(f"  ! {n} TP flows exceed 1.2 on a link that cannot queue. Not "
+                    f"congestion: two QPs of the same collective open on one NIC, "
+                    f"which RdmaEgressQueue serves round-robin at half rate each. "
+                    f"Check the emission order in the generator, NOT "
+                    f"active-chunks-per-dimension — that setting is per dimension, "
+                    f"and on the reference run it is 1 while this still happens on "
+                    f"one direction out of four. Cost it before chasing it: on T1 "
+                    f"it is 2.75 ms against a 143 ms KV window, on a dedicated link.")
         say.head("Flows by class (structural, from --placement — no size threshold)")
         for c in roles.FLOW_CLASSES:
             g = f[f["flow_class"] == c]

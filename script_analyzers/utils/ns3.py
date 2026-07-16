@@ -85,10 +85,20 @@ def read_fct(path: Path) -> pd.DataFrame | None:
             diag["slow_min"] = min(diag["slow_min"], fct / sfct)
             if fct / sfct < 0.9:
                 diag["slow_lt09"] += 1
-        rows.append((ip_to_node(p[0]), ip_to_node(p[1]), size, start, fct, sfct))
+        rows.append((ip_to_node(p[0]), ip_to_node(p[1]), int(p[2]), int(p[3]),
+                     size, start, fct, sfct))
     if not rows:
         return None
-    df = pd.DataFrame(rows, columns=["src", "dst", "size", "start", "fct", "sfct"])
+    # sport/dport are kept, not dropped. They are the ONLY thing that tells two
+    # concurrent QPs on the same (src, dst) apart, and without them a pair of flows
+    # sharing one NIC round-robin looks identical to one slow flow. On the T1
+    # reference run that is exactly what happens: rank 3 posts its 40 MB all-reduce
+    # chunks in PAIRS 37,570 ns apart while rank 2 posts them singly, so
+    # RdmaEgressQueue halves the rate and fct goes 72,902 -> 107,234 on a dedicated
+    # 4800 Gbps link that cannot queue. Diagnosing it needed the ports, and getting
+    # them meant re-parsing the file by hand outside this module.
+    df = pd.DataFrame(rows, columns=["src", "dst", "sport", "dport",
+                                     "size", "start", "fct", "sfct"])
     df["arrival"] = df["start"] + df["fct"]
     df["slowdown"] = np.where(df["sfct"] > 0, df["fct"] / df["sfct"], np.nan)
     # Parse diagnostics ride along: a wrong column layout must be visible before

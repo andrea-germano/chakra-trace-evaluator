@@ -55,6 +55,8 @@ Usage
 from __future__ import annotations
 
 import argparse
+import hashlib
+import shutil
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -66,6 +68,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from utils import astra
 from utils import flows as flowlib
 from utils import ns3, paths, roles
 from utils.fabric import Bottleneck, FabricModel, Ns3Config, Topology, \
@@ -145,7 +148,10 @@ class Row:
     flows_pp_decode: float = NAN
     flows_other: float = NAN
     kv_at_bottleneck: float = NAN
-    kv_window_ns: float = NAN
+    kv_bytes_at_bottleneck: float = NAN
+    kv_window_ns: float = NAN            # measured: first KV posted -> last arrived
+    kv_floor_ns: float = NAN             # bytes / bottleneck rate: nothing beats this
+    line_rate_efficiency: float = NAN    # floor / window; 1.0 = saturated throughout
     concurrency_peak: float = NAN
     concurrency_mean: float = NAN
     slow_mean: float = NAN
@@ -357,6 +363,16 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
     row.kv_at_bottleneck = len(kv_bn)
     lo, hi = int(kv_bn["start"].min()), int(kv_bn["arrival"].max())
     row.kv_window_ns = hi - lo
+    # The floor: this many bytes cannot cross this link faster than this, whatever
+    # the buffer, the congestion control or the queue does. On the T1 reference run
+    # it is 134.2 ms against a measured 141.9 -- the fabric runs at 94.6% of line
+    # rate for the whole transfer, and every regime effect lives in the remaining
+    # 5%. That is why the decode gate moves by 2% across a 16x buffer sweep: not
+    # noise, arithmetic. Plot the floor next to the measurement or the flat curve
+    # looks like a failed experiment instead of a conserved quantity.
+    row.kv_bytes_at_bottleneck = float(kv_bn["size"].sum())
+    row.kv_floor_ns = row.kv_bytes_at_bottleneck * 8e9 / bn.rate
+    row.line_rate_efficiency = row.kv_floor_ns / row.kv_window_ns
     row.concurrency_peak, row.concurrency_mean = \
         flowlib.concurrency_stats(flowlib.intervals(kv_bn))
     sd = kv_bn.loc[kv_bn["slowdown"].notna(), "slowdown"].to_numpy(float)
@@ -486,21 +502,44 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
               f"KV flow slowdown at {bn_label}, full distribution vs buffer",
               "Slowdown (fct / standalone_fct)", band, written)
 
-    # 04 the barrier: real units, twin axis, no normalisation --------------- #
+    # 04 THE HEADLINE. What the KV transfer costs, against what it cannot beat.
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(x, s["kv_window_ns"] / 1e6, "o-", color="#1f77b4",
+            label=f"measured: KV transfer window at {bn_label}")
+    floor = s["kv_floor_ns"].mean() / 1e6
+    ax.axhline(floor, color="#d1495b", ls="--", lw=1.4,
+               label=f"line-rate floor = {s['kv_bytes_at_bottleneck'].mean()/1e9:.2f} GB "
+                     f"/ {s['bn_rate_gbps'].iloc[0]:g} Gbps = {floor:.1f} ms")
+    ax.plot(x, s["kv_ready_max_ns"] / 1e6, "^:", color="#6b7280", alpha=0.7,
+            label="decode-start gate (from t=0, includes the pipeline fill)")
+    ax2 = ax.twinx()
+    ax2.plot(x, 100 * s["line_rate_efficiency"], "s-.", color="#2a9d5c",
+             label="line-rate efficiency = floor / window")
+    ax2.set_ylabel("Line-rate efficiency (%)")
+    ax2.set_ylim(0, 105)
+    _decorate(fig, s, outdir, "04_kv_wait_vs_line_rate_floor.png",
+              "What the KV transfer costs decode, against what it cannot beat\n"
+              "(the floor is bytes/bandwidth: no buffer moves it, so the gap IS "
+              "the whole regime effect)",
+              "KV transfer window (ms)", band, written)
+
+    # 04b the skew between decode ranks: a cost of the transfer pattern, not of bytes
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(x, s["kv_ready_max_ns"] / 1e6, "o-", color="#1f77b4",
-            label="Decode-start gate = max KV-ready over decode ranks")
+            label="last decode rank ready (= the gate)")
     ax.plot(x, s["kv_ready_min_ns"] / 1e6, "o:", color="#1f77b4", alpha=0.45,
-            label="earliest decode rank (min KV-ready)")
+            label="first decode rank ready")
+    ax.fill_between(x, s["kv_ready_min_ns"] / 1e6, s["kv_ready_max_ns"] / 1e6,
+                    color="#1f77b4", alpha=0.12,
+                    label="cross-rank skew: ranks idle, waiting for the slowest")
     ax2 = ax.twinx()
-    ax2.plot(x, s["cross_rank_skew_ns"] / 1e6, "s--", color="#d1495b",
-             label="cross-rank skew = max − min KV-ready")
-    ax2.plot(x, s["kv_stream_duration_ns"] / 1e6, "d-.", color="#d98a00",
-             label="KV stream duration on one rank (NOT a skew: KV is per-layer)")
-    ax2.set_ylabel("Spread (ms)")
-    _decorate(fig, s, outdir, "04_barrier_vs_buffer.png",
-              "Barrier metric: what actually gates disaggregated decode",
-              "Decode-start gate (ms)", band, written)
+    ax2.plot(x, s["concurrency_mean"], "d-.", color="#d98a00",
+             label="mean concurrent KV flows on the bottleneck\n"
+                   "(per-layer emission: the stream competes with itself)")
+    ax2.set_ylabel("Concurrent KV flows")
+    _decorate(fig, s, outdir, "04b_skew_and_self_contention.png",
+              "Costs of the transfer PATTERN, not of the byte count",
+              "Decode rank ready (ms)", band, written)
 
     # 05 THE MODEL. Topology + config only. Kept apart on purpose. ---------- #
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -529,9 +568,9 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
 
 
 # --------------------------------------------------------------------------- #
-REPORT = ["buffer_mb", "bottleneck", "f_ports", "regime_model",
-          "pfc_pause_pct_of_window", "pfc_pause_pct_suspect", "qlen_peak_bytes", "qlen_peak_over_kmax",
-          "qlen_peak_over_ceiling", "concurrency_mean", "slow_mean", "slow_p99",
+REPORT = ["buffer_mb", "regime_model", "pfc_pause_pct_of_window",
+          "qlen_peak_over_kmax", "kv_window_ns", "kv_floor_ns",
+          "line_rate_efficiency", "concurrency_mean", "slow_mean",
           "kv_ready_max_ns", "cross_rank_skew_ns"]
 
 
