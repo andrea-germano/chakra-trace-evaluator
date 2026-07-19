@@ -337,44 +337,42 @@ def compute_metrics(df: pd.DataFrame, roles: dict) -> dict:
     # The first token leaves the LAST pipeline stage, after its final layer's
     # forward (incl. the TP all-reduce that reassembles the partial sums).
     #
-    # The simulator reports the two TP shards of that final all-reduce finishing
-    # a little apart (per-rank reporting skew of a collective that is logically a
-    # barrier). Two instants are therefore meaningful:
-    #   * first_token_ready = the EARLIEST the token exists / is handed off
-    #     (min over the final-stage final-layer forward ends, i.e. the instant
-    #     the first FIRSTTOK can be sent). This is the value that gates -- and is
-    #     causally consistent with -- the decode side, so it is what TTFT and the
-    #     KV-exposure / 2nd-token waterfall are built on.
-    #   * prefill_all_ready = the LATEST shard's reported completion (max). Kept
-    #     as a secondary "first token fully materialised across all TP shards"
-    #     diagnostic only; it must NOT be mixed with the (min-based) decode start,
-    #     or the exposed-handoff gap goes spuriously negative.
+    # The simulator reports the TP shards of that final all-reduce finishing a
+    # little apart (per-rank reporting skew of a collective that is logically a
+    # barrier). A barrier cannot complete for ANY participant before the SLOWEST
+    # one reaches it, so the token is only genuinely ready at the LATEST shard's
+    # reported completion -- first_token_ready is therefore MAX-based (over the
+    # final-stage final-layer forward ends / FIRSTTOK sends across TP shards).
+    # This is what TTFT and the KV-exposure / 2nd-token waterfall are built on.
+    # prefill_all_ready is kept as an alias of the same max-based instant for
+    # backward-compatible callers/diagnostics.
     m["prefill_compute_end"] = int(prefill_fwd["end_tick"].max()) if len(prefill_fwd) else None
     m["prefill_all_ready_tick"] = m["prefill_compute_end"]
     m["prefill_all_ready_ns"] = ((m["prefill_compute_end"] - t0)
                                  if m["prefill_compute_end"] is not None else None)
 
     def _first_token_ready() -> int | None:
-        # Prefer the FIRSTTOK send instant: send start == the moment prefill has
-        # produced the first token for that decode peer. The earliest such send
-        # is the first time the token exists anywhere.
+        # Prefer the FIRSTTOK send instant: send start == the moment that TP
+        # shard has produced the first token for its decode peer. Since the
+        # final all-reduce is a barrier, the token is only ready once the
+        # SLOWEST shard has sent -- hence the max, not the min, over shards.
         ft = df[df["cls"] == "FIRSTTOK"]
         if len(ft):
             send = ft[ft["comm_role"] == "send"] if "comm_role" in ft.columns else ft.iloc[0:0]
             if len(send):
-                return int(send["start_tick"].min())
+                return int(send["start_tick"].max())
             # no role tagging -> the send is the one that is NOT pre-posted at t0
             non_origin = ft[ft["start_tick"] > t0]
             if len(non_origin):
-                return int(non_origin["start_tick"].min())
-        # Fallback: final-stage, final-layer forward end (earliest shard).
+                return int(non_origin["start_tick"].max())
+        # Fallback: final-stage, final-layer forward end (slowest shard).
         if len(prefill_fwd):
             ss_num = pd.to_numeric(prefill_fwd["ss"], errors="coerce")
             fin = prefill_fwd[ss_num == ss_num.max()] if ss_num.notna().any() else prefill_fwd
             L_num = pd.to_numeric(fin["L"], errors="coerce")
             if L_num.notna().any():
                 fin = fin[L_num == L_num.max()]
-            return int(fin["end_tick"].min())
+            return int(fin["end_tick"].max())
         return None
 
     # --- decode-start instant (decode it=0 begins) ---------------------------
@@ -390,8 +388,8 @@ def compute_metrics(df: pd.DataFrame, roles: dict) -> dict:
     m["decode_start_ns"] = (decode_start_tick - t0) if decode_start_tick is not None else None
 
     # --- TTFT = first token produced (network-insensitive) -------------------
-    # Built on first_token_ready (min) so it is causally consistent with the
-    # decode start it feeds: TTFT <= decode_start by construction.
+    # Built on first_token_ready (max over TP shards, since the final all-reduce
+    # is a barrier that only completes once its slowest participant does).
     ttft_tick = _first_token_ready()
     if ttft_tick is None:
         ttft_tick = decode_start_tick

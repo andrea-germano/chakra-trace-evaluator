@@ -74,7 +74,7 @@ import matplotlib.pyplot as plt
 
 from utils import astra
 from utils import flows as flowlib
-from utils import ns3, paths, roles
+from utils import ns3, paths, pp, roles
 from utils.fabric import Bottleneck, Topology, parse_ns3_config, parse_topology
 from utils.plots import logx_pow2, save_fig
 from utils.roles import Placement
@@ -131,6 +131,18 @@ class Row:
     kv_stream_duration_ns: float = NAN    # max-min arrival WITHIN a rank (stagger)
     decode_ranks: str = ""
 
+    # -- 02b PP arrival skew (the CAUSE upstream of the KV skew) ------------- #
+    pp_skew_ns: float = NAN               # worst wave cross-rank PP arrival skew
+    pp_skew_mean_ns: float = NAN          # mean over waves
+    pp_first_ns: float = NAN              # earliest PP arrival (worst wave)
+    pp_last_ns: float = NAN               # latest PP arrival (worst wave)
+    pp_stage: object = None               # dst stage of the worst wave
+    pp_n_waves: int = 0
+    # not flattened: per-wave and per-flow frames for the PP figures.
+    pp_waves: object = field(default=None)      # DataFrame or None
+    pp_arrivals: object = field(default=None)   # DataFrame or None
+    kv_fct_mean_ns: float = NAN           # mean KV flow FCT (for the flat-gate fig)
+
     # -- 03 pauses / throughput --------------------------------------------- #
     pause_frames_bn: float = NAN          # PAUSE frames at the bottleneck's victims
     pause_frames_total: float = NAN       # PAUSE frames anywhere in the run
@@ -153,7 +165,8 @@ class Row:
 
     def flat(self) -> dict:
         d = asdict(self)
-        for k in ("qseries", "qswitch_peak", "qswitch_mean"):
+        for k in ("qseries", "qswitch_peak", "qswitch_mean",
+                  "pp_waves", "pp_arrivals"):
             d.pop(k, None)
         return d
 
@@ -404,6 +417,25 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
     for k, v in barrier(kv, placement).items():
         setattr(row, k, v)
 
+    # -- PP arrival skew: the CAUSE upstream of the KV/TP (measured on the
+    #    fabric, from the same annotated fct frame) --------------------------- #
+    ppr = pp.measure(f, placement)
+    if not ppr.available:
+        warn(f"{tag}: no inter-stage PP-prefill flow found; PP skew figures "
+             f"will be empty. (PP=1, or placement has one prefill stage.)")
+    row.pp_skew_ns = ppr.skew_ns
+    row.pp_skew_mean_ns = ppr.skew_mean_ns
+    row.pp_first_ns = ppr.first_ns
+    row.pp_last_ns = ppr.last_ns
+    row.pp_stage = ppr.stage
+    row.pp_n_waves = ppr.n_waves
+    row.pp_waves = ppr.waves
+    row.pp_arrivals = ppr.arrivals
+
+    # -- mean KV FCT: the aggregate that DOES move with the buffer, to sit
+    #    against the flat gate (fig 07) -------------------------------------- #
+    row.kv_fct_mean_ns = float(kv["fct"].mean()) if len(kv) else NAN
+
     # -- queue occupancy: bottleneck port summary + per-switch series -------- #
     row.qpeak_bytes = float(qlen.port_max[(bn.switch, bn.egress_port)])
     row.qmean_bytes = float(qlen.port_mean[(bn.switch, bn.egress_port)])
@@ -617,12 +649,52 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
                 "Is the extra buffer used? Peak / mean egress occupancy as a %\n"
                 "of the buffer, per switch (flat-and-low means added buffer is wasted)",
                 "Queue occupancy (% of buffer)", written)
+
+    # 06 PP ARRIVAL SKEW vs BUFFER — the CAUSE ------------------------------ #
+    # The KV skew of fig 02 is downstream. This is the driver: how far apart the
+    # ranks of a stage see the SAME PP activation. RS is gated on the local wake,
+    # AG on max(this skew, W); everything the buffer does to TP/KV enters here.
+    if s["pp_skew_ns"].notna().any():
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(x, s["pp_skew_ns"] * MS, "o-", color=VIOLET,
+                label="worst-wave PP arrival skew  Δ = last − first")
+        if s["pp_skew_mean_ns"].notna().any() and \
+           not np.allclose(s["pp_skew_mean_ns"].dropna().to_numpy(),
+                           s["pp_skew_ns"].dropna().to_numpy()):
+            ax.plot(x, s["pp_skew_mean_ns"] * MS, "d:", color=MUTED,
+                    label="mean over waves")
+        ax.fill_between(x, 0, s["pp_skew_ns"] * MS, color=VIOLET, alpha=0.12,
+                        label="skew the receiving stage's all-reduce inherits")
+        _finish(fig, ax, s, outdir, "06_pp_arrival_skew_vs_buffer.png",
+                "Pipeline-parallel activation arrival skew vs buffer\n"
+                "(Δ that gates the receiving stage's all-reduce — the cause "
+                "upstream of the TP/KV variation)",
+                "PP cross-rank arrival skew (ms)", written)
+
+    # 07 FLAT GATE vs MOVING MEAN — the counter-intuitive result ------------ #
+    # kv_gate_ns (the decode barrier) is bandwidth/volume bound and stays put;
+    # the mean KV FCT rises with the buffer (bufferbloat under DCQCN). Same axis,
+    # two scales: the aggregate moves, the gate does not.
+    if s["kv_fct_mean_ns"].notna().any():
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(x, s["kv_gate_ns"] * MS, "o-", color=BLUE,
+                label="decode gate = max KV arrival (flat: volume/bandwidth)")
+        ax2 = ax.twinx()
+        ax2.plot(x, s["kv_fct_mean_ns"] * MS, "s-", color=CORAL,
+                 label="mean KV flow FCT (rises: bufferbloat)")
+        ax2.set_ylabel("Mean KV flow FCT (ms)")
+        _finish(fig, ax, s, outdir, "07_flat_gate_vs_moving_mean.png",
+                "The decode gate is invariant while the mean KV FCT grows\n"
+                "(the CC regime moves the aggregate, not the barrier)",
+                "Decode gate = max KV arrival (ms)", written, extra_axes=(ax2,))
+
     return written
 
 
 # --------------------------------------------------------------------------- #
-REPORT = ["buffer_mb", "ttft_ns", "kv_gate_ns", "cross_rank_skew_ns",
-          "pause_frames_bn", "pause_pct_of_window", "line_rate_efficiency",
+REPORT = ["buffer_mb", "ttft_ns", "kv_gate_ns", "pp_skew_ns",
+          "cross_rank_skew_ns", "kv_fct_mean_ns", "pause_frames_bn",
+          "pause_pct_of_window", "line_rate_efficiency",
           "kv_delivered_gbps", "kv_window_ns"]
 
 
