@@ -75,6 +75,12 @@ def main() -> int:
     # so it matches the folder actually created below.
     tag_path = f"{subdir}/{tag}" if subdir else tag
 
+    # NOTE: __MODEL__ is deliberately NOT resolved here. A fabric config is
+    # model-agnostic and reused across models; the model name is only known at
+    # run time, so generate_log_ns3.sh substitutes __MODEL__ just before the
+    # ns-3 run. This keeps ns-3 outputs at output/ns3/<model>/<tag>, mirroring
+    # the astra_logs/<model>/<tag> layout, so different models no longer
+    # overwrite each other's fct/pfc/qlen.txt. Do not add __MODEL__ to `repl`.
     repl = {
         "__CONF_DIR__":     str(CONF_DIR),
         "__OUT_DIR__":      str(OUT_DIR),

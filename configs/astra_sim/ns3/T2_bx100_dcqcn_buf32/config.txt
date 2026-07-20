@@ -6,10 +6,10 @@ PACKET_PAYLOAD_SIZE 3500
 TOPOLOGY_FILE /home/andre/tesi/trace_evaluator/configs/astra_sim/ns3/T2_bx100_dcqcn_buf32/physical_topology.txt
 FLOW_FILE /home/andre/tesi/trace_evaluator/configs/astra_sim/ns3/additional_configs/add_flow.txt
 TRACE_FILE /home/andre/tesi/trace_evaluator/configs/astra_sim/ns3/additional_configs/trace_link.txt
-TRACE_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/T2_bx100_dcqcn_buf32/traces.tr
-FCT_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/T2_bx100_dcqcn_buf32/fct.txt
-PFC_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/T2_bx100_dcqcn_buf32/pfc.txt
-QLEN_MON_FILE /home/andre/tesi/trace_evaluator/output/ns3/T2_bx100_dcqcn_buf32/qlen.txt
+TRACE_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/__MODEL__/T2_bx100_dcqcn_buf32/traces.tr
+FCT_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/__MODEL__/T2_bx100_dcqcn_buf32/fct.txt
+PFC_OUTPUT_FILE /home/andre/tesi/trace_evaluator/output/ns3/__MODEL__/T2_bx100_dcqcn_buf32/pfc.txt
+QLEN_MON_FILE /home/andre/tesi/trace_evaluator/output/ns3/__MODEL__/T2_bx100_dcqcn_buf32/qlen.txt
 QLEN_MON_START 0
 QLEN_MON_END 0
 

@@ -3,10 +3,16 @@
 # Phase 2/2: ns-3/ASTRA-sim execution only.
 #
 # Requires MLSynth traces to already exist for MODEL_FILE_NAME (run
-# generate_traces.sh once beforehand). Safe to run in parallel across
-# different NS3_SUBDIR values; do NOT run two instances with the SAME
-# NS3_SUBDIR (or the same OUTPUT_DIR_NAME) concurrently, since their
-# ns-3 output files and logging folder would collide.
+# generate_traces.sh once beforehand).
+#
+# ns-3 packet-level outputs are keyed by model: output/ns3/<model>/<ns3subdir>/,
+# mirroring the astra_logs/<model>/<ns3subdir>/ layout. The config carries a
+# __MODEL__ placeholder that is resolved here, into a per-run temporary config,
+# just before launching ns-3. As a result:
+#   - the SAME NS3_SUBDIR with DIFFERENT models no longer collides (each model
+#     writes to its own output/ns3/<model>/... subtree);
+#   - two instances sharing BOTH the same model AND the same NS3_SUBDIR still
+#     collide on ns-3 outputs and must not run concurrently.
 
 # 1. Ask for user input (supports command line args or interactive prompt)
 MODEL_FILE_NAME="$1"
@@ -60,7 +66,7 @@ LOGGING_CFG="$BASE_DIR/configs/astra_sim/logging_config.toml"
 TRACES_DIR="$BASE_DIR/output/mlsynth"
 WORKLOAD_PREFIX="$TRACES_DIR/$MODEL_FILE_NAME/et/$MODEL_FILE_NAME"
 COMM_GROUPS="$TRACES_DIR/$MODEL_FILE_NAME/comm_groups.json"
-NS3_OUT_DIR="$BASE_DIR/output/ns3/$NS3_SUBDIR"
+NS3_OUT_DIR="$BASE_DIR/output/ns3/$MODEL_FILE_NAME/$NS3_SUBDIR"
 OUTPUT_DIR="$BASE_DIR/output/astra_logs/${OUTPUT_DIR_NAME}"
 
 # ESSENTIAL CHECK 2: Verify all required files and binaries exist
@@ -103,11 +109,26 @@ if [ -d "$OUTPUT_DIR" ]; then
 fi
 mkdir -p "$NS3_OUT_DIR"
 
+# Resolve the __MODEL__ placeholder into a per-run temporary config so the fabric
+# config itself stays model-agnostic and reusable. Fail fast if the config was
+# generated before the placeholder existed (otherwise ns-3 would silently write
+# to a model-less path and different models would overwrite each other).
+if ! grep -q "__MODEL__" "$NET_CFG"; then
+  echo "ERROR: '$NET_CFG' has no __MODEL__ placeholder."
+  echo "       Regenerate it with config_generator.py (updated template), or add"
+  echo "       '/__MODEL__/' after '/output/ns3/' in its output-file lines."
+  exit 1
+fi
+
+RESOLVED_CFG="$(mktemp "${TMPDIR:-/tmp}/ns3_config.${MODEL_FILE_NAME//\//_}.XXXXXX.txt")"
+trap 'rm -f "$RESOLVED_CFG"' EXIT
+sed "s#__MODEL__#${MODEL_FILE_NAME}#g" "$NET_CFG" > "$RESOLVED_CFG"
+
 echo "==> Starting ASTRA-sim (ns-3 backend)..."
 "$NS3_BIN" \
   --workload-configuration="$WORKLOAD_PREFIX" \
   --system-configuration="$SYSTEM_CFG" \
-  --network-configuration="$NET_CFG" \
+  --network-configuration="$RESOLVED_CFG" \
   --remote-memory-configuration="$REMOTE_MEM_CFG" \
   --logical-topology-configuration="$LOGICAL_TOPO" \
   --comm-group-configuration="$COMM_GROUPS" \
