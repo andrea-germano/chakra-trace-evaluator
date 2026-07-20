@@ -11,7 +11,7 @@
   "all-to-all-implementation": ["ring", "ring"],
   "collective-optimization": "localBWAware",
   "roofline-enabled": 1,
-  "peak-perf": 1979,
+  "peak-perf": 989,
   "local-mem-bw": 3350,
   "boost-mode": 1,
   "trace-enabled": 1,

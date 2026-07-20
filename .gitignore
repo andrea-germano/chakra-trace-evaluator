@@ -2,6 +2,6 @@ __pycache__/
 
 output/
 log/
-experiments.txt
-experiments.log
+experiments*.txt
+experiments*.log
 results/
