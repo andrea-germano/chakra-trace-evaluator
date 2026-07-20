@@ -6,7 +6,7 @@ The layout is fixed by the generation side, so it is a constant here and not a
 flag. Only the two names that actually vary are inputs:
 
     <ROOT>/output/astra_logs/<workload>/<sweep>/<tag>/stats_sys*.csv
-    <ROOT>/output/ns3/<sweep>/<tag>/{fct,pfc,qlen}.txt
+    <ROOT>/output/ns3/<workload>/<sweep>/<tag>/{fct,pfc,qlen}.txt
     <ROOT>/configs/astra_sim/ns3/<sweep>/<tag>/{physical_topology.txt,config.txt}
     <ROOT>/results/sweep_analysis/<kind>/<sweep>/<workload>/        <- default out
 
@@ -43,7 +43,9 @@ class SweepPaths:
 
     @property
     def ns3_root(self) -> Path:
-        return self.root / "output" / "ns3" / self.sweep
+        # keyed by workload (model), mirroring astra_root, so runs of different
+        # models on the same fabric no longer overwrite each other's ns-3 output.
+        return self.root / "output" / "ns3" / self.workload / self.sweep
 
     @property
     def config_root(self) -> Path:
