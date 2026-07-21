@@ -4,12 +4,11 @@ buffer_compare — same buffer sweep, different MODELS: whose causal chain
 (PP skew -> receiving-stage all-reduce -> TTFT) responds the same way to the
 per-switch buffer?
 
-The cross-model companion to buffer_sweep, exactly as buffer_compare is to
-buffer_sweep_v2. Auto-discovers every workload directory under output/ns3 that
-ran the given sweep (buffer_sweep_T1 by default) and overlays them on one
-figure per metric. Reuses buffer_sweep.analyse_sweep so a model is scored
-here identically to the single-model analysis -- one definition of the v3
-metrics, two tools.
+The cross-model companion to buffer_sweep. Auto-discovers every workload
+directory under output/ns3 that ran the given sweep (buffer_sweep_T1 by default)
+and overlays them on one figure per metric. Reuses buffer_sweep.analyse_sweep so
+a model is scored here identically to the single-model analysis -- one definition
+of the metrics, two tools.
 
 What goes on the axes, and why
 --------------------------------------------------------------------------------
@@ -128,7 +127,12 @@ def load_workload(root: Path, workload: str, sweep: str,
     # is already the physical number to compare across runs. No normalisation.
     s["pp_skew_ms"] = s["pp_skew_ns"] / 1e6          # arrival misalignment (delta)
     s["line_rate_pct"] = s.get("link0_eff_pct")      # already a %
-    s["pause_frames"] = s.get("link0_pause_frames")  # PFC PAUSE event count
+    s["pause_frames"] = s.get("link0_pause_frames")  # raw PFC PAUSE event count
+    # normalise the count by the KV window: a raw count also grows with run
+    # duration, so frames/ms is the count made comparable across runs.
+    win = s.get("link0_window_ns")
+    s["pause_rate"] = (s["pause_frames"] / (win / 1e6)
+                       if win is not None else NAN)  # PAUSE frames per ms of window
     qb = s.get("link0_qpeak_bytes")                  # absolute peak occupancy, MB
     qm = s.get("link0_qmean_bytes")                  # -- NOT qpeak_pct: dividing by
     s["qpeak_mb"] = qb / 2**20 if qb is not None else NAN   # the swept buffer is
@@ -216,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
 
         combined = pd.concat(frames, ignore_index=True)
         front = ["workload", "tag", "bottleneck", "buffer_mb",
-                 "pp_skew_ms", "qpeak_mb", "qmean_mb", "pause_frames",
+                 "pp_skew_ms", "qpeak_mb", "qmean_mb", "pause_rate", "pause_frames",
                  "line_rate_pct", "ar_first_over_rest", "ttft_slowdown",
                  "pause_pct_of_window", "qpeak_pct", "skew_over_ar_rest",
                  "kv_gate_over_ttft"]
@@ -244,53 +248,41 @@ def main(argv: list[str] | None = None) -> int:
                 ax.axhline(hline, color="k", linestyle=":", alpha=0.4)
             logx_pow2(ax, combined, "buffer_mb", "Per-switch buffer (MiB)")
             ax.set_ylabel(ylabel)
-            ax.set_title(f"{title}\n(sweep: {a.sweep})")
+            ax.set_title(title)
             ax.grid(True, alpha=0.3, which="both")
             ax.legend(fontsize=8)
             save_fig(fig, outdir, fname, written)
 
         # === Block A: fabric-domain magnitudes, absolute & comparable ========
         line_by_workload(
-            "pp_skew_ms", "PP arrival skew (worst wave, ms)",
-            "PP arrival misalignment vs buffer, across models\n"
-            "(cross-rank arrival delta on the receiving stage -- a network-domain "
-            "delay, so the raw ms is directly comparable across models)",
+            "pp_skew_ms", "PP arrival skew (ms)",
+            "PP arrival skew",
             "pp_skew_ms_by_workload.png")
 
         line_by_workload(
-            "qpeak_mb", "Peak egress-queue occupancy (MB)",
-            "How deep does the bottleneck queue get vs buffer, across models\n"
-            "(absolute bytes at the bottleneck port -- unlike % of buffer, this is "
-            "not circular on a buffer sweep)",
+            "qpeak_mb", "Peak queue occupancy (MB)",
+            "Bottleneck buffer occupancy",
             "qpeak_occupancy_mb_by_workload.png")
 
         line_by_workload(
-            "pause_frames", "PFC PAUSE frames (count)",
-            "Backpressure events vs buffer, across models\n"
-            "(number of PAUSE frames at the bottleneck link; note this is a raw "
-            "count, so it also grows with run duration)",
-            "pause_frames_by_workload.png")
+            "pause_rate", "PFC PAUSE (frames/ms)",
+            "Backpressure intensity",
+            "pause_rate_by_workload.png")
 
         line_by_workload(
-            "line_rate_pct", "Effective KV bandwidth (% of line rate)",
-            "KV delivered vs nominal bottleneck rate, across models\n"
-            "(link0_eff_pct -- independent of how much KV a model moves)",
+            "line_rate_pct", "KV bandwidth (% of line-rate)",
+            "KV bandwidth utilisation",
             "line_rate_efficiency_by_workload.png")
 
         # === Block B: does the fabric effect propagate to the user? ==========
         line_by_workload(
-            "ar_first_over_rest",
-            "First gated all-reduce / steady-state all-reduce (x)",
-            "How much does the skew stall the FIRST all-reduce?, across models\n"
-            "(the first collective in units of that model's own steady-state one; "
-            "1 = skew added nothing, >1 = the skew-induced stall)",
+            "ar_first_over_rest", "First all-reduce (×steady-state)",
+            "Skew-induced all-reduce stall",
             "allreduce_first_over_rest_by_workload.png", hline=1.0)
 
         line_by_workload(
-            "ttft_slowdown", "TTFT / TTFT at largest buffer",
-            "Does the buffer chain reach TTFT?, across models\n"
-            "(TTFT normalised to each model's own largest-buffer run; flat ~1 "
-            "means buffer -> skew -> all-reduce does NOT move TTFT for that model)",
+            "ttft_slowdown", "TTFT (×largest-buffer)",
+            "TTFT sensitivity to buffer",
             "ttft_slowdown_by_workload.png", hline=1.0)
 
         print(f"\nWrote {outdir}:")

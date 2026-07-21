@@ -69,7 +69,7 @@ import matplotlib.pyplot as plt
 from utils import flows as flowlib
 from utils import ns3, paths, roles
 from utils.fabric import Bottleneck, FabricModel, parse_ns3_config, parse_topology
-from utils.plots import save_fig
+from utils.plots import downsample_max, save_fig
 from utils.roles import Placement
 
 KIND = "run"
@@ -134,21 +134,6 @@ def fmt_ms(ns) -> str:
     return f"{float(ns) * 1e-6:.3f} ms"
 
 
-def downsample_max(ts, ys, n: int = 4000):
-    """Keep the max per time bucket. More samples than pixels hides nothing that
-    matters here — the excursion IS the quantity — so averaging would lie where
-    the peak is exactly the point. Returns the arrays unchanged if already small."""
-    ts, ys = np.asarray(ts, float), np.asarray(ys, float)
-    if len(ts) <= n or ts[-1] <= ts[0]:
-        return ts, ys
-    edges = np.linspace(ts[0], ts[-1], n + 1)
-    idx = np.clip(np.searchsorted(edges, ts) - 1, 0, n - 1)
-    hi = np.full(n, -1.0)
-    np.maximum.at(hi, idx, ys)
-    keep = hi >= 0
-    return ((edges[:-1] + edges[1:]) / 2)[keep], hi[keep]
-
-
 def paused_mask(ts: np.ndarray, pfc, clamp: int) -> np.ndarray:
     """Boolean over `ts`: was ANY ingress port paused at that instant. Class-
     agnostic — unions every device's PAUSE intervals, not just a bottleneck's."""
@@ -192,13 +177,12 @@ def plot_queue_timeline(qlen, pfc, topo, model, buffer_bytes, bn, clamp,
         a.plot(ts * ms, ys / 1e6, lw=0.9, color=sw_color(sw, switches),
                drawstyle="steps-post",
                label=f"sw{sw} (peak {fmt_b(qlen.switch_total_max.get(sw,0))})")
-    a.set_ylabel("Switch egress total (MB)")
-    a.set_title(f"{out.name}: buffer occupancy over time "
-                f"(BUFFER_SIZE = {buffer_bytes/2**20:g} MiB)")
+    a.set_ylabel("Queued bytes per switch (MB)")
+    a.set_title("Buffer occupancy over time")
     if buffer_bytes:
         a2 = a.twinx()
         a2.set_ylim(0, 100 * a.get_ylim()[1] * 1e6 / buffer_bytes)
-        a2.set_ylabel("% of physical buffer")
+        a2.set_ylabel("% of buffer")
     a.legend(fontsize=7, loc="upper right", ncol=2)
 
     a = ax[1]
@@ -257,7 +241,7 @@ def plot_pause_timeline(pfc, topo, bn, clamp, out, written):
                label=f"n{n}/if{i} ({len(t)} frames)"
                      + ("  ←ingress of bottleneck" if isv else ""))
     a.set_ylabel("PAUSE frames (cumulative)")
-    a.set_title(f"{out.name}: PFC PAUSE emission over time")
+    a.set_title("PFC PAUSE emission over time")
     a.legend(fontsize=7, loc="upper left", ncol=2)
 
     a = ax[1]
@@ -307,7 +291,7 @@ def plot_overview(qlen, pfc, topo, bn, kmax, clamp, out, written):
         ax[0].axvline(kmax / 1e3, color=GREEN, ls="--", lw=1.1,
                       label=f"KMAX = {kmax/1e3:g} kB")
     ax[0].set_xlabel("Egress queue (kB)")
-    ax[0].set_title(f"Occupancy per switch port (red = analysed {bn})")
+    ax[0].set_title("Queue occupancy per switch port")
     ax[0].grid(True, alpha=0.3, axis="x")
     ax[0].legend(fontsize=8)
 
@@ -325,8 +309,8 @@ def plot_overview(qlen, pfc, topo, bn, kmax, clamp, out, written):
         ax[1].set_yticks(yy)
         ax[1].set_yticklabels(fl, fontsize=8)
         ax[1].invert_yaxis()
-        ax[1].set_xlabel("PAUSE frames received (whole run)")
-        ax[1].set_title(f"Backpressure per device (total {sum(fv)} frames)")
+        ax[1].set_xlabel("PAUSE frames received")
+        ax[1].set_title("Backpressure per device")
         ax[1].grid(True, alpha=0.3, axis="x")
     else:
         ax[1].text(0.5, 0.5, "no PAUSE in pfc.txt\n(DCQCN-only regime)",
@@ -372,9 +356,8 @@ def plot_load_and_concurrency(fabric_flows, out, written):
     if len(ct):
         a2.step(ct * ms, cc, where="post", color=CORAL, lw=1.4,
                 label=f"concurrent flows (peak {int(cc.max())})")
-    a2.set_ylabel("Flows alive (concurrency)", color=CORAL)
-    ax.set_title("Offered/delivered load and concurrency, fabric flows "
-                 f"(n={len(fabric_flows)})")
+    a2.set_ylabel("Concurrent flows", color=CORAL)
+    ax.set_title("Delivered load and flow concurrency over time")
     h1, l1 = ax.get_legend_handles_labels()
     h2, l2 = a2.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, fontsize=8, loc="upper right")
@@ -403,9 +386,6 @@ def plot_slowdown_ecdf(f, has_class, mtu, out, written):
             col, ls = class_style(c)
             ax.step(v, np.arange(1, len(v) + 1) / len(v), where="post", color=col,
                     linestyle=ls, lw=1.6, label=f"{c}  (n={len(v)})")
-        tp = f.loc[(f["flow_class"] == "tp") & f["slowdown"].notna(), "slowdown"]
-        sub = (f"TP excluded: {len(tp)} flows on dedicated links, median "
-               f"{tp.median():.3f}" if len(tp) else "")
     else:
         multi = f[(f["hops"] > 1) & f["slowdown"].notna()]
         for lab, sel, col, ls in (
@@ -416,15 +396,10 @@ def plot_slowdown_ecdf(f, has_class, mtu, out, written):
                 continue
             ax.step(v, np.arange(1, len(v) + 1) / len(v), where="post",
                     color=col, linestyle=ls, lw=1.6, label=f"{lab}  (n={len(v)})")
-        one = f.loc[(f["hops"] == 1) & f["slowdown"].notna(), "slowdown"]
-        sub = (f"1-hop excluded: {len(one)} flows that cannot queue, median "
-               f"{one.median():.3f}" if len(one) else "")
     ax.set_xscale("log")
-    ax.set_xlabel("Slowdown = fct / standalone_fct  (log)")
+    ax.set_xlabel("Slowdown (×ideal, log)")
     ax.set_ylabel("ECDF")
-    ax.set_title("Slowdown distribution, fabric flows only\n"
-                 "(standalone_fct = flow alone on its bottleneck → N sharing it "
-                 f"fairly give slowdown N)\n{sub}")
+    ax.set_title("Slowdown distribution across fabric flows")
     ax.grid(True, alpha=0.3, which="both")
     ax.legend(fontsize=8)
     save_fig(fig, out, "08_slowdown_ecdf.png", written)
@@ -454,14 +429,9 @@ def plot_queue_ecdf(qlen, pfc, bn, kmin, kmax, clamp, out, written):
         ax.axvline(kmax / 1e3, color=MUTED, ls="--", lw=1.4, label=f"KMAX = {kmax/1e3:g} kB")
         ax.axvspan(kmin / 1e3, kmax / 1e3, color=AMBER, alpha=0.08,
                    label="ECN ramp: marks with probability p(q)")
-    inband = 100 * ((ys >= (kmin or 0)) & (ys <= (kmax or np.inf))).mean() if kmax else 0
-    above = 100 * (ys > kmax).mean() if kmax else 0
     ax.set_xlabel("Egress queue (kB)")
-    ax.set_ylabel("ECDF over qlen samples")
-    ax.set_title(f"Where the queue LIVES at {bn}\n"
-                 f"{inband:.1f}% of samples in the ECN ramp, {above:.1f}% above KMAX "
-                 f"(peak = {ys.max()/kmax:.2f} x KMAX)" if kmax else
-                 f"Where the queue LIVES at {bn} (no ECN band for {bn.rate/1e9:g} Gbps)")
+    ax.set_ylabel("ECDF")
+    ax.set_title(f"Queue occupancy vs the ECN band at {bn}")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=7, loc="lower right")
     save_fig(fig, out, "06_queue_ecdf_vs_ecn_band.png", written)
@@ -499,11 +469,9 @@ def plot_pause_ecdf(pfc, bn, topo, clamp, out, written):
         plt.close(fig)
         return
     ax.set_xscale("log")
-    ax.set_xlabel("Duration of one PAUSE interval (ns, log)")
-    ax.set_ylabel("ECDF over intervals")
-    ax.set_title("PFC pause durations: one long stall, or continuous fluttering?\n"
-                 "(a pause total cannot tell them apart; x = intervals the missing "
-                 "qIndex may have mis-paired)")
+    ax.set_xlabel("PAUSE interval duration (ns, log)")
+    ax.set_ylabel("ECDF")
+    ax.set_title("Distribution of PFC pause durations")
     ax.grid(True, alpha=0.3, which="both")
     ax.legend(fontsize=7, loc="lower right")
     save_fig(fig, out, "07_pause_duration_ecdf.png", written)
@@ -526,7 +494,7 @@ def plot_ports(qlen, topo, bn, kmax, out, written):
         ax.axvline(kmax / 1e3, color=GREEN, ls="--", lw=1.2, label=f"KMAX = {kmax/1e3:g} kB")
         ax.legend(fontsize=8)
     ax.set_xlabel("Peak egress queue (kB)")
-    ax.set_title(f"Where the queues actually are (red = {bn}, the analysed link)")
+    ax.set_title("Peak queue per switch port")
     ax.grid(True, alpha=0.3, axis="x")
     save_fig(fig, out, "04_queue_peak_by_port.png", written)
 
@@ -563,12 +531,10 @@ def plot_congestion_heatmap(qlen, topo, model, bn, out, written):
     ax.set_xticklabels([("sw" if topo.is_switch(p) else "h") + str(p) for p in peers], fontsize=8)
     ax.set_yticks(range(len(switches)))
     ax.set_yticklabels([f"sw{s}" for s in switches], fontsize=8)
-    ax.set_xlabel("Egress port's peer (host or switch)")
+    ax.set_xlabel("Port peer (host / switch)")
     ax.set_ylabel("Switch")
-    ax.set_title("Peak egress queue / KMAX, every switch port\n"
-                 f"(black box = analysed {bn}; gray = no such link; "
-                 f"near-white = a real port that never queued)")
-    fig.colorbar(im, ax=ax).set_label("Peak egress queue / KMAX")
+    ax.set_title("Peak queue per port, relative to KMAX")
+    fig.colorbar(im, ax=ax).set_label("Peak queue (×KMAX)")
     save_fig(fig, out, "05_congestion_heatmap.png", written)
 
 
@@ -597,7 +563,7 @@ def plot_kv_timeline(qlen, pfc, f, kv, bn, topo, model, buffer_bytes,
               label=f"MODEL PFC ceiling = {ceil/1e3:.0f} kB")
     a.set_ylabel("Egress queue (kB)")
     a.legend(fontsize=7, loc="upper right", ncol=2)
-    a.set_title(f"{out.name}: queue, backpressure and KV arrivals on one clock")
+    a.set_title("Queue, backpressure and KV arrivals on one clock")
 
     a = ax[1]
     victims = sorted(set(bn.pause_victims(topo)))
@@ -647,26 +613,13 @@ def plot_gantt(kv_bn, bn, out, written):
         ax.barh(0, 0, color=cmap(j % 10), label=f"→ decode rank {r}")
     ax.set_xlabel("Simulated time (ms)")
     ax.set_ylabel("KV flow (sorted by start)")
-    ax.set_title(f"KV flows crossing {bn}: parallel = sharing, staircase = serialising")
+    ax.set_title(f"KV flow timeline at the bottleneck {bn}")
     ax.grid(True, alpha=0.25, axis="x")
     ax.legend(fontsize=8)
     save_fig(fig, out, "11_kv_gantt.png", written)
 
 
 # --------------------------------------------------------------------------- #
-def annotate_base(raw: pd.DataFrame, topo, placement, mtu):
-    """hops + path always; flow_class only if a placement is supplied. Returns
-    (frame, has_class). Without a placement there is no class column, and every
-    class-agnostic path below keys on `hops` instead."""
-    f = raw.copy()
-    f["hops"] = [topo.dist.get(s, {}).get(d, np.nan) for s, d in zip(f["src"], f["dst"])]
-    f["path"] = [topo.path(s, d) for s, d in zip(f["src"], f["dst"])]
-    if placement is None:
-        return f, False
-    f["flow_class"] = roles.classify(f, placement, mtu)
-    return f, True
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -741,13 +694,15 @@ def main(argv: list[str] | None = None) -> int:
                 placement = Placement.parse(a.placement)
             except ValueError as e:
                 say(f"  ! --placement ignored ({e}); analysing class-agnostically.")
-        f, has_class = annotate_base(raw, topo, placement, cfg.payload)
+        f = flowlib.annotate(raw, topo, placement, cfg.payload)
+        has_class = "flow_class" in f.columns
         if has_class:
             warns = roles.check(f, placement)
             if any("no flow is classified 'kv'" in w for w in warns):
                 say("  ! --placement does not match the traffic (no KV flow). "
                     "Falling back to class-agnostic analysis.")
-                f, has_class, placement = annotate_base(raw, topo, None, cfg.payload)[0], False, None
+                f, has_class, placement = (
+                    flowlib.annotate(raw, topo, None, cfg.payload), False, None)
             else:
                 for w in warns:
                     say(f"  ! {w}")

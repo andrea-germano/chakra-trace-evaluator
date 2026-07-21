@@ -51,10 +51,6 @@ class SweepPaths:
     def config_root(self) -> Path:
         return self.root / "configs" / "astra_sim" / "ns3" / self.sweep
 
-    def outdir(self, kind: str) -> Path:
-        return (self.root / "results" / "sweep_analysis" / kind
-                / self.sweep / self.workload)
-
     def astra_run(self, tag: str) -> Path:
         return self.astra_root / tag
 
@@ -93,10 +89,8 @@ class SweepAxis:
     out, so that a SECOND moving knob becomes its own series instead of silently
     averaging into the first."""
 
-    def __init__(self, token: str, column: str, unit: str = ""):
+    def __init__(self, token: str):
         self.token = token
-        self.column = column
-        self.unit = unit
         self._re = re.compile(rf"{token}(\d+(?:\.\d+)?)", re.IGNORECASE)
 
     def value(self, tag: str) -> float | None:
@@ -107,8 +101,8 @@ class SweepAxis:
         return self._re.sub(f"{self.token}*", tag)
 
 
-BANDWIDTH_AXIS = SweepAxis("bx", "bandwidth", "bx")
-BUFFER_AXIS = SweepAxis("buf", "buffer_mb", "MiB")
+BANDWIDTH_AXIS = SweepAxis("bx")
+BUFFER_AXIS = SweepAxis("buf")
 
 # The generation side writes bx straight into physical_topology.txt as Gbps
 # (e.g. bx400 -> "400Gbps" on the leaf links), but the ASTRA-sim CSVs report
@@ -132,8 +126,3 @@ def add_arguments(ap, kind: str) -> None:
     ap.add_argument("-o", "--out", default=None, type=Path,
                     help=f"output dir (default: results/sweep_analysis/{kind}/"
                          f"<sweep>/<workload>)")
-
-
-def from_arguments(a, kind: str) -> tuple[SweepPaths, Path]:
-    p = SweepPaths(sweep=a.sweep, workload=a.workload, root=Path(a.root))
-    return p, (Path(a.out) if a.out else p.outdir(kind))

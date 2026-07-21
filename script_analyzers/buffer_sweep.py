@@ -3,9 +3,9 @@
 buffer_sweep — why does an OVERSUBSCRIBED topology behave differently from
 a non-oversubscribed one at the same nominal bandwidth?
 
-buffer_sweep_v2 answers "what does the buffer cost", deliberately without
-explaining the mechanism (see its own docstring). This is a mechanism question
-again, but a new one, asked by comparing two topologies run at the same buffer
+A plain buffer-cost sweep answers "what does the buffer cost", deliberately
+without explaining the mechanism. This is a mechanism question instead, asked by
+comparing two topologies run at the same buffer
 values: T1 (4 ToR switches, each oversubscribed ~10:1 into one core switch)
 against T2 (one switch, no oversubscription). This script does NOT compare
 them itself — it analyses one sweep at a time, and the comparison is done by
@@ -41,16 +41,15 @@ Seven figures, each answering one part of that:
                                    link, one panel per buffer value, with PFC
                                    PAUSE spans shaded -- the direct picture of
                                    "not smooth, stalls in step with PAUSE".
-    05  QUEUE(t) PER SWITCH        buffer_sweep_v2's grid (rows=switch,
-                                   cols=buffer), now with PAUSE spans shaded.
-    06  OCCUPANCY vs BUFFER        buffer_sweep_v2's fig05 unchanged: is the
-                                   added buffer used, per switch.
+    05  QUEUE(t) PER SWITCH        a grid (rows=switch, cols=buffer), with PFC
+                                   PAUSE spans shaded.
+    06  OCCUPANCY vs BUFFER        is the added buffer actually used, per switch.
     07  TTFT-NORMALISED COST       decode-start and its "fabric tax" as
                                    multiples of TTFT rather than absolute ms,
                                    since TTFT itself now moves with the buffer
                                    (via the skew chain) instead of being flat.
 
-Everything is measured, nothing fitted (same discipline as v2 and utils.pp):
+Everything is measured, nothing fitted (same discipline as utils.pp):
 fct.txt / pfc.txt / qlen.txt plus, for TTFT, this run's ASTRA-sim trace.
 
 Declared, never inferred:
@@ -94,7 +93,7 @@ from utils import astra
 from utils import flows as flowlib
 from utils import ns3, paths, pp, roles
 from utils.fabric import Bottleneck, Topology, parse_ns3_config, parse_topology
-from utils.plots import logx_pow2, save_fig
+from utils.plots import downsample_max, logx_pow2, save_fig
 from utils.roles import Placement
 from utils.paths import BUFFER_AXIS
 
@@ -130,10 +129,10 @@ def warn(msg: str) -> None:
 # --------------------------------------------------------------------------- #
 @dataclass
 class LinkStat:
-    """One candidate KV-crossed link's stats for one run -- scored the same
-    way buffer_sweep_v2 scores its single bottleneck (window/floor/efficiency,
-    queue occupancy, PFC pauses), plus concurrency, which v2 never needed with
-    only one link to look at."""
+    """One candidate KV-crossed link's stats for one run -- scored the way a
+    single bottleneck is (window/floor/efficiency, queue occupancy, PFC pauses),
+    plus concurrency, which a single-link analysis never needed with only one
+    link to look at."""
     label: str = ""
     switch: int = -1
     egress_port: int = -1
@@ -208,6 +207,8 @@ class Row:
             d.pop(k, None)
         for i, ls in enumerate(self.links):
             d[f"link{i}_label"] = ls.label
+            d[f"link{i}_window_ns"] = ls.window_ns      # KV window: normaliser for
+                                                        # the raw PAUSE-frame count
             d[f"link{i}_eff_pct"] = ls.eff_pct
             d[f"link{i}_delivered_gbps"] = ls.delivered_gbps
             d[f"link{i}_conc_peak"] = ls.conc_peak
@@ -243,8 +244,7 @@ def union_len(spans: list[tuple[int, int]], lo: int, hi: int) -> int:
 
 def pause_stats(pfc: ns3.PfcLog, bn: Bottleneck, topo: Topology,
                 lo: int, hi: int) -> dict:
-    """Backpressure on the ingress side of `bn`, over [lo, hi]. See
-    buffer_sweep_v2.pause_stats for the full rationale; identical here, kept
+    """Backpressure on the ingress side of `bn`, over [lo, hi]. Kept
     link-generic so it works for every candidate link, not only one."""
     span = max(hi - lo, 1)
     victims = set(bn.pause_victims(topo))
@@ -290,7 +290,7 @@ def victim_pause_intervals(pfc: ns3.PfcLog, bn: Bottleneck, topo: Topology,
 
 def barrier(kv: pd.DataFrame, placement: Placement) -> dict:
     """The first decode step cannot start until every KV flow feeding a decode
-    rank has arrived (see buffer_sweep_v2.barrier for the full rationale)."""
+    rank has arrived."""
     out = {"decode_ranks": ",".join(map(str, placement.decode_ranks))}
     ready, dur = {}, {}
     for d in placement.decode_ranks:
@@ -311,8 +311,7 @@ def barrier(kv: pd.DataFrame, placement: Placement) -> dict:
 
 
 def ttft_end_of_prefill(tag: str, p: paths.SweepPaths) -> dict:
-    """TTFT = the first token, produced at the END OF PREFILL. See
-    buffer_sweep_v2.ttft_end_of_prefill for the full rationale (FIRSTTOK send,
+    """TTFT = the first token, produced at the END OF PREFILL (FIRSTTOK send,
     NOT DECFB -- DECFB is the second token, one decode pipeline late)."""
     adir = p.astra_run(tag)
     if not adir.is_dir():
@@ -471,22 +470,6 @@ def link_metrics(kv: pd.DataFrame, bn: Bottleneck, topo: Topology,
     return ls
 
 
-def _downsample(ts, ys, n: int = 2000) -> tuple[np.ndarray, np.ndarray]:
-    """Max-per-bucket downsample of a queue time series (see
-    buffer_sweep_v2._downsample)."""
-    ts = np.asarray(ts, float)
-    ys = np.asarray(ys, float)
-    if len(ts) <= n or ts[-1] <= ts[0]:
-        return ts, ys
-    edges = np.linspace(ts[0], ts[-1], n + 1)
-    idx = np.clip(np.searchsorted(edges, ts) - 1, 0, n - 1)
-    hi = np.full(n, -1.0)
-    np.maximum.at(hi, idx, ys)
-    keep = hi >= 0
-    centres = (edges[:-1] + edges[1:]) / 2
-    return centres[keep], hi[keep]
-
-
 # --------------------------------------------------------------------------- #
 # Per-run analysis
 # --------------------------------------------------------------------------- #
@@ -600,7 +583,7 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
     for sw, (ts, ys) in qlen.switch_series.items():
         if not ts:
             continue
-        row.qseries[sw] = _downsample(ts, ys)
+        row.qseries[sw] = downsample_max(ts, ys, 2000)
         row.qswitch_peak[sw] = float(qlen.switch_total_max.get(sw, max(ys)))
         row.qswitch_mean[sw] = float(np.mean(ys))
 
@@ -608,8 +591,7 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
 
 
 def _zoom_y(ax, series, pad: float = 0.15) -> None:
-    """Autoscale one panel's y-axis to its own data, with a small margin --
-    see buffer_sweep_v2._zoom_y."""
+    """Autoscale one panel's y-axis to its own data, with a small margin."""
     v = series.dropna()
     if v.empty:
         return
@@ -657,17 +639,17 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
     if s["ttft_ns"].notna().any():
         panels = []
         if s["pp_skew_ns"].notna().any():
-            panels.append((s["pp_skew_ns"] / 1e3, "PP arrival skew\n(worst wave, µs)",
+            panels.append((s["pp_skew_ns"] / 1e3, "PP arrival skew (µs)",
                            CORAL, "s--"))
         if s["rs_ar_first_ns"].notna().any():
             panels.append((s["rs_ar_first_ns"] / 1e3,
-                           "First gated all-reduce\nstall + collective (µs)",
+                           "First gated all-reduce (µs)",
                            VIOLET, "^:"))
         if s["rs_ar_rest_mean_ns"].notna().any():
             panels.append((s["rs_ar_rest_mean_ns"] / 1e3,
-                           "Steady-state all-reduce\nmean of the rest (µs)",
+                           "Steady-state all-reduce (µs)",
                            GREEN, "D-."))
-        panels.append((s["ttft_ns"] * MS, "TTFT\nend of prefill (ms)", BLUE, "o-"))
+        panels.append((s["ttft_ns"] * MS, "TTFT (ms)", BLUE, "o-"))
 
         n = len(panels)
         fig, axes = plt.subplots(n, 1, sharex=True,
@@ -682,9 +664,7 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
             logx_pow2(a, s, "buffer_mb", "Per-switch buffer (MiB)")
             if i != n - 1:
                 a.set_xlabel("")
-        fig.suptitle("Does PP arrival skew propagate through the all-reduce into "
-                     "TTFT?\nchain reads top-to-bottom; the first all-reduce should "
-                     "move with the skew, the steady-state mean should stay flat", y=0.99)
+        fig.suptitle("Does PP skew propagate into TTFT?", y=0.99)
         save_fig(fig, outdir, "01_causal_chain_to_ttft.png", written)
 
     # 02 KV CUMULATIVE ARRIVAL PER DECODE RANK ------------------------------- #
@@ -707,13 +687,11 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
             if pd.notna(r.kv_gate_ns):
                 a.axvline(r.kv_gate_ns * MS, color="k", linestyle=":", alpha=0.5)
             a.set_title(f"{r.buffer_mb:g} MiB", fontsize=9)
-            a.set_xlabel("time (ms)", fontsize=8)
+            a.set_xlabel("Time (ms)", fontsize=8)
             a.grid(True, alpha=0.3)
-        axes[0].set_ylabel("KV bytes arrived at rank\n(% of that rank's own total)")
+        axes[0].set_ylabel("KV arrived (% of total)")
         axes[0].legend(fontsize=7, loc="lower right")
-        fig.suptitle("Cumulative KV arrival per decode rank -- skew and smoothness\n"
-                    "(dotted line = decode start / kv_gate_ns; a stair with flats "
-                    "is a stall, spread between curves is the skew)", y=1.02)
+        fig.suptitle("Cumulative KV arrival per decode rank", y=1.02)
         save_fig(fig, outdir, "02_kv_cumulative_arrival_per_rank.png", written)
 
     # 03 LINK BANDWIDTH & CONCURRENCY, RANKED -------------------------------- #
@@ -730,17 +708,16 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
             if conc_col in s.columns and s[conc_col].notna().any():
                 axR.plot(x, s[conc_col], marker="s", lw=lw, color=cmap(i % 10), label=label)
         logx_pow2(axL, s, "buffer_mb", "Per-switch buffer (MiB)")
-        axL.set_ylabel("Effective KV bandwidth (% of that link's nominal rate)")
-        axL.set_title("Delivered vs nominal, per link")
+        axL.set_ylabel("KV bandwidth (% of nominal)")
+        axL.set_title("Delivered KV bandwidth per link")
         axL.grid(True, alpha=0.3, which="both")
         axL.legend(fontsize=7)
         logx_pow2(axR, s, "buffer_mb", "Per-switch buffer (MiB)")
         axR.set_ylabel("Peak concurrent KV flows")
-        axR.set_title("Concurrency, per link")
+        axR.set_title("Peak concurrency per link")
         axR.grid(True, alpha=0.3, which="both")
         axR.legend(fontsize=7)
-        fig.suptitle("Does only the measured bottleneck suffer, or do several links?",
-                    y=1.02)
+        fig.suptitle("Congestion across every KV-crossed link", y=1.02)
         save_fig(fig, outdir, "03_link_bandwidth_and_concurrency.png", written)
 
     # 04 KV THROUGHPUT(t) & PFC PAUSES AT THE BOTTLENECK --------------------- #
@@ -764,12 +741,10 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
             for s0, e0 in r.bn_pause_intervals:
                 a.axvspan(s0 * MS, e0 * MS, color=CORAL, alpha=0.25, lw=0)
             a.set_title(f"{r.buffer_mb:g} MiB", fontsize=9)
-            a.set_xlabel("time (ms)", fontsize=8)
+            a.set_xlabel("Time (ms)", fontsize=8)
             a.grid(True, alpha=0.3)
-        axes[0].set_ylabel("KV throughput (Gbit/s)")
-        fig.suptitle(f"KV throughput over time at the bottleneck ({rows[0].bottleneck})\n"
-                    "shaded = PFC PAUSE active on its ingress; thin grey line = "
-                    "concurrent KV flows (right axis) -- stalls line up with pauses",
+        axes[0].set_ylabel("KV throughput (Gb/s)")
+        fig.suptitle(f"KV throughput over time at the bottleneck ({rows[0].bottleneck})",
                     y=1.02)
         save_fig(fig, outdir, "04_kv_throughput_and_pauses.png", written)
 
@@ -807,13 +782,12 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
                     a.set_title(f"{r.buffer_mb:g} MiB", fontsize=9)
                 if j == 0:
                     mark = "\n(bottleneck)" if sw == bn_sw else ""
-                    a.set_ylabel(f"switch {sw}{mark}\nqueue (kB)", fontsize=8)
+                    a.set_ylabel(f"switch {sw}{mark}\n(kB)", fontsize=8)
                 if i == nrows - 1:
-                    a.set_xlabel("time (ms)", fontsize=8)
+                    a.set_xlabel("Time (ms)", fontsize=8)
                     a.locator_params(axis="x", nbins=4)
-        fig.suptitle("Egress-queue occupancy over time — rows = switches, "
-                    "columns = buffer size\n(shaded = PFC PAUSE active on that "
-                    "switch, any port)", y=1.01)
+        fig.suptitle("Queue occupancy over time — rows = switch, columns = buffer",
+                    y=1.01)
         save_fig(fig, outdir, "05_queue_occupancy_timeseries_with_pauses.png", written)
 
     # 06 OCCUPANCY vs BUFFER, PER SWITCH (% of capacity) --------------------- #
@@ -836,8 +810,7 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
             ax.plot(xs, mean, "v--", color=c, alpha=0.5, label=f"switch {sw}{tag} — mean")
         if ax.get_legend_handles_labels()[0]:
             _finish(fig, ax, s, outdir, "06_queue_occupancy_vs_buffer.png",
-                    "Is the extra buffer used? Peak / mean egress occupancy as a %\n"
-                    "of the buffer, per switch (flat-and-low means added buffer is wasted)",
+                    "Is the extra buffer actually used?",
                     "Queue occupancy (% of buffer)", written)
         else:
             plt.close(fig)
@@ -851,12 +824,11 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
         ax2 = ax.twinx()
         cost_frac = (s["kv_gate_ns"] - s["ttft_ns"]) / s["ttft_ns"]
         ax2.plot(x, cost_frac, "s--", color=CORAL,
-                label="(decode start − TTFT) / TTFT")
-        ax2.set_ylabel("Fabric tax / TTFT")
+                label="fabric tax")
+        ax2.set_ylabel("Fabric tax (×TTFT)")
         _finish(fig, ax, s, outdir, "07_ttft_normalised_decode_cost.png",
-                "Decode start as a multiple of TTFT, not absolute ms\n"
-                "(robust to TTFT itself moving with the buffer via the PP-skew chain)",
-                "Decode start / TTFT", written, extra_axes=(ax2,))
+                "Decode start relative to TTFT",
+                "Decode start (×TTFT)", written, extra_axes=(ax2,))
 
     return written
 
@@ -872,8 +844,7 @@ def analyse_sweep(p: paths.SweepPaths, placement: Placement,
                   verbose: bool = True) -> tuple[list[Row], pd.DataFrame, list[str]]:
     """Score one workload's whole buffer sweep, exactly as buffer_sweep.main
     does -- factored out so buffer_compare gets identical numbers (one
-    definition of the v3 metrics, two tools; same discipline as
-    buffer_sweep_v2.analyse_sweep). Returns (rows sorted by buffer, the flat
+    definition of the metrics, two tools). Returns (rows sorted by buffer, the flat
     summary DataFrame, chosen_labels). Raises Abort on any condition main would.
     Does no I/O beyond reading the sweep; writing figures/CSV stays in the
     caller. `verbose` gates the progress prints so a multi-workload caller stays
@@ -988,7 +959,7 @@ def main(argv: list[str] | None = None) -> int:
         plots = make_plots(rows, s, outdir, chosen_labels)
 
         pd.set_option("display.width", 220)
-        print("\n================ BUFFER SWEEP v3 ================")
+        print("\n================ BUFFER SWEEP ================")
         print(s[[c for c in REPORT if c in s.columns]].to_string(index=False))
         print(f"\nWrote {outdir}:")
         for fpath in ["summary.csv", *[q.name for q in plots]]:

@@ -33,7 +33,7 @@ context in the busy-time breakdown.
 
 This analysis lives entirely in the ASTRA-sim CSVs: more bandwidth -> shorter
 transfers, monotone, visible in the logical ticks alone. That is what separates it
-from buffer_analyzer.py, which has to cross into the ns-3 outputs because the
+from buffer_sweep.py, which has to cross into the ns-3 outputs because the
 buffer changes the congestion *regime* and not the drain rate. Different questions,
 different tools; they share readers, not conclusions -- see utils/__init__.py.
 
@@ -322,10 +322,9 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
     ):
         if col in s and s[col].notna().any():
             plot_series(ax, s, "bandwidth", col, lbl, marker=mk, scale=1e-6)
-    ax.set_xlabel("Simulated link bandwidth (bx)")
+    ax.set_xlabel("Link bandwidth (bx)")
     ax.set_ylabel("Completion time (ms)")
-    ax.set_title("What gates the handover to decode?\n"
-                 "(KV completion above prefill compute => the fabric gates it)")
+    ax.set_title("What gates the prefill→decode handover?")
     ax.grid(True, alpha=0.3)
     ax.legend()
     save(fig, "01_phase_completion_vs_bandwidth.png")
@@ -340,9 +339,9 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
     ax.plot([bmin, bmax],
             [bmin * BANDWIDTH_GBPS_TO_BYTES_PER_NS, bmax * BANDWIDTH_GBPS_TO_BYTES_PER_NS],
             "k:", alpha=0.5, label="ideal (nominal link rate, GB/s)")
-    ax.set_xlabel("Simulated link bandwidth (bx)")
-    ax.set_ylabel("Effective bandwidth (bytes/ns \u2248 GB/s)")
-    ax.set_title("KV-cache transfer: delivered vs nominal bandwidth")
+    ax.set_xlabel("Link bandwidth (bx)")
+    ax.set_ylabel("Delivered bandwidth (GB/s)")
+    ax.set_title("KV transfer: delivered vs nominal bandwidth")
     ax.grid(True, alpha=0.3)
     ax.legend()
     save(fig, "02_kv_effective_bandwidth.png")
@@ -352,9 +351,9 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
     plot_series(ax, s, "bandwidth", "kv_mean_duration_ns", "KV mean transfer time", marker="o", scale=1e-6)
     plot_series(ax, s, "bandwidth", "kv_max_duration_ns", "KV max transfer time", marker="s",
             scale=1e-6, linestyle="--")
-    ax.set_xlabel("Simulated link bandwidth (bx)")
+    ax.set_xlabel("Link bandwidth (bx)")
     ax.set_ylabel("KV transfer time (ms)")
-    ax.set_title("KV-cache transfer time vs bandwidth")
+    ax.set_title("KV transfer time vs bandwidth")
     ax.grid(True, alpha=0.3)
     ax.legend()
     save(fig, "03_kv_transfer_time.png")
@@ -372,9 +371,9 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
         ax.plot([bmin, bmax],
                 [bmin * BANDWIDTH_GBPS_TO_BYTES_PER_NS, bmax * BANDWIDTH_GBPS_TO_BYTES_PER_NS],
                 "k:", alpha=0.5, label="ideal (nominal link rate, GB/s)")
-        ax.set_xlabel("Simulated link bandwidth (bx)")
-        ax.set_ylabel("Effective bandwidth (bytes/ns \u2248 GB/s)")
-        ax.set_title("Pipeline-parallel transfer: delivered vs nominal bandwidth")
+        ax.set_xlabel("Link bandwidth (bx)")
+        ax.set_ylabel("Delivered bandwidth (GB/s)")
+        ax.set_title("PP transfer: delivered vs nominal bandwidth")
         ax.grid(True, alpha=0.3)
         ax.legend()
         save(fig, "04_pp_effective_bandwidth.png")
@@ -386,9 +385,9 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
                 marker="o", scale=1e-6)
         plot_series(ax, s, "bandwidth", "pp_decode_mean_duration_ns", "PP decode mean time",
                 marker="s", scale=1e-6)
-        ax.set_xlabel("Simulated link bandwidth (bx)")
+        ax.set_xlabel("Link bandwidth (bx)")
         ax.set_ylabel("PP transfer time (ms)")
-        ax.set_title("Pipeline-parallel transfer time vs bandwidth")
+        ax.set_title("PP transfer time vs bandwidth")
         ax.grid(True, alpha=0.3)
         ax.legend()
         save(fig, "05_pp_transfer_time.png")
@@ -414,10 +413,9 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
             label = c[len("busy__"):-len("_ns")] if c.endswith("_ns") else c
             ax.bar(x, vals, bottom=bottom, label=label)
             bottom += vals
-        ax.set_xlabel("Simulated link bandwidth (bx)")
-        ax.set_ylabel("Summed busy time across all nodes (ms)")
-        ax.set_title("Busy-time breakdown by operation class\n"
-                     "(summed over nodes; comm classes overlap in wall-clock time)")
+        ax.set_xlabel("Link bandwidth (bx)")
+        ax.set_ylabel("Busy time, summed over nodes (ms)")
+        ax.set_title("Busy time by operation class")
         ax.grid(True, axis="y", alpha=0.3)
         ax.legend(ncol=2, fontsize=8)
         save(fig, "06_busy_time_breakdown.png")
@@ -431,9 +429,9 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
         base = s["makespan_ns"].iloc[0]  # lowest bandwidth = baseline
         speedup = base / s["makespan_ns"]
         ax.plot(s["bandwidth"], speedup, marker="o", label="Speedup vs lowest bw")
-        ax.set_xlabel("Simulated link bandwidth (bx)")
-        ax.set_ylabel("Speedup (makespan at lowest bw / makespan)")
-        ax.set_title("Makespan speedup vs bandwidth (normalised to lowest bw)")
+        ax.set_xlabel("Link bandwidth (bx)")
+        ax.set_ylabel("Speedup (×lowest-bw)")
+        ax.set_title("Makespan speedup vs bandwidth")
         ax.grid(True, alpha=0.3)
         ax.legend()
         save(fig, "07_speedup_vs_bandwidth.png")

@@ -74,8 +74,8 @@ NUMERIC_COLS = ["comm_size", "start_tick", "end_tick", "duration", "bw_bytes_per
 # Fields of the MLSynth naming scheme, in canonical order.
 FIELD_KEYS = ("pl", "ss", "ds", "sh", "ssh", "dsh", "L", "it", "op")
 
-# Classes carried by one flow between two ranks, as opposed to collectives.
-POINT_TO_POINT = ("KV", "KVREQ", "PP", "DECFB", "FIRSTTOK")
+# TP is the only collective; every other op class is point-to-point (one flow
+# between two ranks). Only the collective set is needed downstream.
 COLLECTIVE = ("TP",)
 
 # Payloads at or below this are control / signalling traffic (the tiny FIRSTTOK

@@ -343,22 +343,6 @@ class FabricModel:
         self.topo, self.cfg = topo, cfg
 
     # -- PFC ---------------------------------------------------------------- #
-    def pfc_threshold(self, bn: Bottleneck, buffer_bytes: int,
-                      shared_used: int = 0) -> int:
-        """SwitchMmu::GetPfcThreshold
-               (buffer_size - total_hdrm - total_rsrv - shared_used_bytes) >> pfc_a_shift
-
-        shared_used_bytes is a switch-GLOBAL scalar (switch-mmu.h:57), not a
-        per-port one, so this is a moving target: every port filling the pool
-        lowers every other port's threshold. Called with shared_used=0 it is the
-        transient value at t=0, NOT the steady state -- use steady_threshold().
-        Note that ``buffer/8`` is not an acceptable approximation: on a leaf whose
-        host ports are fast (large rate*delay headroom) the subtracted terms can
-        be ~half the buffer at small sizes, exactly where the regime flips."""
-        sw = bn.switch
-        avail = buffer_bytes - self.topo.total_hdrm[sw] - self.topo.total_rsrv[sw] - shared_used
-        return max(0, int(avail) >> self.topo.shift[sw][bn.egress_port])
-
     def steady_threshold(self, bn: Bottleneck, buffer_bytes: int) -> int:
         """The fixed point of the dynamic threshold, which is where PAUSE
         actually fires.

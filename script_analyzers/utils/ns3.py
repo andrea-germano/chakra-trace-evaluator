@@ -305,11 +305,6 @@ class QlenLog:
     switch_hist: dict[int, dict[int, int]] = field(default_factory=dict)
     switch_count: dict[int, int] = field(default_factory=dict)
 
-    def busiest_port(self) -> tuple[int, int] | None:
-        if not self.port_max:
-            return None
-        return max(self.port_max.items(), key=lambda kv: kv[1])[0]
-
 
 def read_qlen(path: Path, series: bool = False) -> QlenLog | None:
     """`series=True` also retains the per-sample time series and histograms, which

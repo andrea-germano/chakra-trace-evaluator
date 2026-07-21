@@ -29,6 +29,27 @@ matplotlib.use("Agg")          # headless: no display needed
 import matplotlib.pyplot as plt
 
 
+def downsample_max(ts, ys, n: int = 4000) -> tuple[np.ndarray, np.ndarray]:
+    """Max-per-bucket downsample of a queue time series to at most `n` points.
+
+    A qlen.txt series is millions of 100 ns samples -- more points than the
+    figure has pixels. The bucket keeps the MAX, not the mean, because the peak
+    is the quantity being compared to KMAX/the buffer, and averaging would erase
+    exactly the excursion that matters. Series already under `n` points, or with
+    no time span, are returned unchanged."""
+    ts = np.asarray(ts, float)
+    ys = np.asarray(ys, float)
+    if len(ts) <= n or ts[-1] <= ts[0]:
+        return ts, ys
+    edges = np.linspace(ts[0], ts[-1], n + 1)
+    idx = np.clip(np.searchsorted(edges, ts) - 1, 0, n - 1)
+    hi = np.full(n, -1.0)
+    np.maximum.at(hi, idx, ys)
+    keep = hi >= 0
+    centres = (edges[:-1] + edges[1:]) / 2
+    return centres[keep], hi[keep]
+
+
 def plot_series(ax, data: pd.DataFrame, xcol: str, ycol: str, label: str,
                 marker: str = "o", scale: float = 1.0, linestyle: str = "-",
                 color: str | None = None) -> bool:

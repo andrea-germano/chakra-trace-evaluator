@@ -46,21 +46,27 @@ from .fabric import Bottleneck, Topology
 from .roles import Placement
 
 
-def annotate(fct: pd.DataFrame, topo: Topology, placement: Placement,
+def annotate(fct: pd.DataFrame, topo: Topology, placement: Placement | None,
              mtu: int) -> pd.DataFrame:
-    """Attach hops / path / flow_class.
+    """Attach hops / path always, and flow_class when a placement is declared.
 
-    Both arguments are required. Without the topology there are no hop counts,
-    so a TP collective on a dedicated host-to-host link is indistinguishable
-    from a congested KV transfer -- and mixing them is not a rounding error, it
-    is a bimodal mixture whose mean and CV describe the mixing ratio rather than
-    the fabric. On the reference T1 run that is 2880 direct flows against 82
-    fabric ones: the statistics could not move no matter what the buffer did.
-    Without the placement there is no class. Neither has a default."""
+    The topology is required. Without it there are no hop counts, so a TP
+    collective on a dedicated host-to-host link is indistinguishable from a
+    congested KV transfer -- and mixing them is not a rounding error, it is a
+    bimodal mixture whose mean and CV describe the mixing ratio rather than the
+    fabric. On the reference T1 run that is 2880 direct flows against 82 fabric
+    ones: the statistics could not move no matter what the buffer did.
+
+    `placement` is optional. hops and path are structural (topology alone), so
+    they are always attached; the class is not -- without a declared placement
+    there is nothing to say what a (src, dst) pair MEANS. When placement is None
+    the flow_class column is simply absent, and callers that want it test
+    `"flow_class" in f.columns` rather than being handed a column of NaN."""
     f = fct.copy()
     f["hops"] = [topo.dist.get(s, {}).get(d, np.nan) for s, d in zip(f["src"], f["dst"])]
     f["path"] = [topo.path(s, d) for s, d in zip(f["src"], f["dst"])]
-    f["flow_class"] = roles.classify(f, placement, mtu)
+    if placement is not None:
+        f["flow_class"] = roles.classify(f, placement, mtu)
     return f
 
 
