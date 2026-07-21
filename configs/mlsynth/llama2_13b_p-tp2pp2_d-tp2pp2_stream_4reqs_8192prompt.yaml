@@ -1,0 +1,28 @@
+model:
+  name: "llama2_13b_p-tp2pp2_d-tp2pp2_stream_4reqs_8192prompt"
+  num_layers: 40
+  hidden_size: 5120
+  vocab_size: 32000
+  bytes_per_val: 2          # bf16
+  scale: 1.0                
+  num_attention_heads: 40
+  num_kv_heads: 40          # == num_attention_heads  ->  MHA (kv_dim = 5120)
+  head_dim: 128             # 5120/40, esplicito per chiarezza
+  intermediate_size: 13824  # FFN reale di Llama-2-13B
+  ffn_type: "swiglu"        # Llama usa SwiGLU
+
+prefill_parallelism:
+  tp_size: 2
+  pp_size: 2
+
+decode_parallelism:
+  tp_size: 2
+  pp_size: 2
+
+inference:
+  serialize_decode_iterations: true
+  kv_transfer: streaming        # bulk | streaming
+
+  num_requests: 4
+  prompt_len: 8192
+  gen_len: 8
