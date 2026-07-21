@@ -70,17 +70,20 @@ def main() -> int:
     tag = build_fabric_tag(topo_token, bx, cc, buffer_size)
     print(f"\n==> derived tag: {tag}")
 
-    # path segment used wherever the template appends the tag to a base dir
-    # (__CONF_DIR__/__TAG__, __OUT_DIR__/__TAG__); must include subdir when set
-    # so it matches the folder actually created below.
+    # path segment used by __CONF_DIR__/__TAG__ (TOPOLOGY_FILE, pointing at this
+    # config's own folder); must include subdir when set so it matches the
+    # folder actually created below.
     tag_path = f"{subdir}/{tag}" if subdir else tag
 
-    # NOTE: __MODEL__ is deliberately NOT resolved here. A fabric config is
-    # model-agnostic and reused across models; the model name is only known at
-    # run time, so generate_log_ns3.sh substitutes __MODEL__ just before the
-    # ns-3 run. This keeps ns-3 outputs at output/ns3/<model>/<tag>, mirroring
-    # the astra_logs/<model>/<tag> layout, so different models no longer
-    # overwrite each other's fct/pfc/qlen.txt. Do not add __MODEL__ to `repl`.
+    # NOTE: __RUN_DIR__ (in the *_OUTPUT_FILE/QLEN_MON_FILE lines) is
+    # deliberately NOT resolved here. A fabric config is model-agnostic and
+    # reused across models/experiments; which run is using it is only known at
+    # launch time, so generate_log_ns3.sh substitutes __RUN_DIR__ with the
+    # exact output-dir name it was given, right before the ns-3 run. This makes
+    # ns-3 outputs at output/ns3/<output_dir_name> mirror
+    # output/astra_logs/<output_dir_name> exactly, whatever <output_dir_name>
+    # is chosen at launch time and regardless of this fabric config's own
+    # folder location. Do not add __RUN_DIR__ to `repl`.
     repl = {
         "__CONF_DIR__":     str(CONF_DIR),
         "__OUT_DIR__":      str(OUT_DIR),

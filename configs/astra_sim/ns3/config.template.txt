@@ -6,10 +6,10 @@ PACKET_PAYLOAD_SIZE 3500
 TOPOLOGY_FILE __CONF_DIR__/__TAG__/physical_topology.txt
 FLOW_FILE __CONF_DIR__/additional_configs/add_flow.txt
 TRACE_FILE __CONF_DIR__/additional_configs/trace_link.txt
-TRACE_OUTPUT_FILE __OUT_DIR__/__MODEL__/__TAG__/traces.tr
-FCT_OUTPUT_FILE __OUT_DIR__/__MODEL__/__TAG__/fct.txt
-PFC_OUTPUT_FILE __OUT_DIR__/__MODEL__/__TAG__/pfc.txt
-QLEN_MON_FILE __OUT_DIR__/__MODEL__/__TAG__/qlen.txt
+TRACE_OUTPUT_FILE __OUT_DIR__/__RUN_DIR__/traces.tr
+FCT_OUTPUT_FILE __OUT_DIR__/__RUN_DIR__/fct.txt
+PFC_OUTPUT_FILE __OUT_DIR__/__RUN_DIR__/pfc.txt
+QLEN_MON_FILE __OUT_DIR__/__RUN_DIR__/qlen.txt
 QLEN_MON_START __QLEN_START__
 QLEN_MON_END __QLEN_END__
 
