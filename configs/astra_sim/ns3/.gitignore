@@ -1,5 +1,4 @@
 bandwidth_sweep/
-buffer_sweep_T1/
-buffer_sweep_T2/
+buffer_sweep_*/
 incast_sweep/
 cc_sweep/
