@@ -187,38 +187,31 @@ def main(argv: list[str] | None = None) -> int:
                 ax.plot(grp["bandwidth"], grp[ycol], marker="o", label=w)
             if hline is not None:
                 ax.axhline(hline, color="k", linestyle=":", alpha=0.4)
-            ax.set_xlabel("Simulated link bandwidth (bx)")
+            ax.set_xlabel("Link bandwidth (bx)")
             ax.set_ylabel(ylabel)
-            ax.set_title(f"{title}\n(sweep: {a.sweep})")
+            ax.set_title(title)
             ax.grid(True, alpha=0.3)
             ax.legend(fontsize=8)
             save_fig(fig, outdir, fname, written)
 
         line_by_workload(
-            "speedup", "Speedup (makespan at lowest bw / makespan)",
-            "Makespan speedup vs bandwidth, across workloads\n"
-            "(each normalised to its own lowest-bw run)",
+            "speedup", "Speedup (×lowest-bw)",
+            "Makespan speedup vs bandwidth",
             "speedup_by_workload.png", hline=1.0)
 
         line_by_workload(
-            "kv_exposed_frac", "KV transfer exposed time / makespan",
-            "KV-cache transfer exposure vs bandwidth, across workloads\n"
-            "(fraction of the run where KV is in flight AND no compute masks it "
-            "anywhere in the system -- time genuinely added to the critical path)",
+            "kv_exposed_frac", "Exposed KV time (fraction of makespan)",
+            "KV transfer exposure vs bandwidth",
             "kv_exposed_fraction_by_workload.png")
 
         line_by_workload(
-            "kv_over_prefill_compute", "KV completion / prefill compute completion",
-            "Does the fabric gate the prefill→decode handover?, across workloads\n"
-            "(>1 means the KV transfer outlasts the prefill compute that feeds it)",
+            "kv_over_prefill_compute", "KV completion (×prefill-compute)",
+            "Does the fabric gate the prefill→decode handover?",
             "kv_over_prefill_compute_by_workload.png", hline=1.0)
 
         line_by_workload(
-            "kv_bw_efficiency", "Mean per-transfer KV rate / nominal link rate",
-            "KV bandwidth efficiency vs nominal, across workloads\n"
-            "(close to 1 once kv_over_prefill_compute -> ~1: each transfer runs "
-            "near the wire rate; a low value at low bandwidth is real contention, "
-            "not a metric artifact)",
+            "kv_bw_efficiency", "KV rate (% of nominal)",
+            "KV bandwidth efficiency vs nominal",
             "kv_bandwidth_efficiency_by_workload.png", hline=1.0)
 
         print(f"\nWrote {outdir}:")
