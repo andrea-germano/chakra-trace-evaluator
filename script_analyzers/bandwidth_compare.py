@@ -134,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
              f"all of them out)")
 
         outdir = (Path(a.out) if a.out else
-                  root / "results" / "sweep_analysis" / "bandwidth_compare" / a.sweep)
+                  root / "results" / "sweep_analysis" / "bandwidth_compare")
 
         frames = []
         print(f"\nScanning {len(workloads)} workload(s):")

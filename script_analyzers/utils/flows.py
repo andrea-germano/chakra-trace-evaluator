@@ -36,6 +36,8 @@ times.)
 
 from __future__ import annotations
 
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 
@@ -97,6 +99,23 @@ def concurrency_stats(intervals: list[tuple[int, int]]) -> tuple[float, float]:
     return float(peak), (float(np.mean(means)) if means else float("nan"))
 
 
+def _ingress_ports(topo: Topology, sw: int, peer: int,
+                   congesting: pd.DataFrame) -> tuple[int, ...]:
+    """Port indices on `sw` that feed traffic into the (sw, peer) egress, per
+    the paths of `congesting`. Shared by find_bottleneck (the single deepest
+    queue) and candidate_links (every link at least one flow crosses) so both
+    derive F_ports the same way -- from the flow paths, never guessed."""
+    ingress: set[int] = set()
+    for path in congesting["path"]:
+        if not path:
+            continue
+        for i, (x, y) in enumerate(path):
+            if (x, y) == (sw, peer) and i > 0:
+                if (q := topo.port_facing(sw, path[i - 1][0])) is not None:
+                    ingress.add(q)
+    return tuple(sorted(ingress))
+
+
 def find_bottleneck(topo: Topology, port_max: dict[tuple[int, int], int],
                     congesting: pd.DataFrame) -> Bottleneck:
     """The congested directed link, plus the ingress ports feeding it.
@@ -124,15 +143,66 @@ def find_bottleneck(topo: Topology, port_max: dict[tuple[int, int], int],
             f"{sorted(topo.ports.get(sw, {}))}). physical_topology.txt and this "
             f"run's ns-3 output do not describe the same fabric.")
     peer = topo.ports[sw][port].peer
-    ingress: set[int] = set()
+    ingress = _ingress_ports(topo, sw, peer, congesting)
+    return Bottleneck(sw, port, peer, topo.ports[sw][port].rate, ingress)
+
+
+def candidate_links(topo: Topology, port_max: dict[tuple[int, int], int],
+                    congesting: pd.DataFrame) -> list[Bottleneck]:
+    """Every directed (switch, egress_port) at least one row of `congesting`
+    crosses, as a Bottleneck, sorted by that port's peak queue (deepest first
+    -- so element 0 is find_bottleneck's link whenever qlen.txt and the flow
+    paths agree on which one that is).
+
+    Where find_bottleneck starts from qlen.txt's argmax and asks which flows
+    feed it, this starts from the flows and asks which links they touch: it
+    walks every path once, collecting the (sw, peer) edges seen and, for each,
+    the ingress ports the SAME way _ingress_ports does. That is the only
+    difference -- one deepest link vs. every link the KV population could
+    possibly have congested, which is what a single global bottleneck cannot
+    show on a topology with several independently-congestible uplinks (e.g.
+    one oversubscribed ToR->core link per ToR)."""
+    ingress_by_link: dict[tuple[int, int], set[int]] = defaultdict(set)
     for path in congesting["path"]:
         if not path:
             continue
         for i, (x, y) in enumerate(path):
-            if (x, y) == (sw, peer) and i > 0:
-                if (q := topo.port_facing(sw, path[i - 1][0])) is not None:
-                    ingress.add(q)
-    return Bottleneck(sw, port, peer, topo.ports[sw][port].rate, tuple(sorted(ingress)))
+            if not topo.is_switch(x):
+                continue
+            if i > 0 and (q := topo.port_facing(x, path[i - 1][0])) is not None:
+                ingress_by_link[(x, y)].add(q)
+            else:
+                ingress_by_link.setdefault((x, y), set())
+
+    out = []
+    for (sw, peer), ingress in ingress_by_link.items():
+        port = topo.port_facing(sw, peer)
+        if port is None:
+            continue
+        out.append(Bottleneck(sw, port, peer, topo.ports[sw][port].rate,
+                              tuple(sorted(ingress))))
+    out.sort(key=lambda bn: port_max.get((bn.switch, bn.egress_port), 0),
+             reverse=True)
+    return out
+
+
+def concurrency_series(intervals: list[tuple[int, int]]) -> tuple[np.ndarray, np.ndarray]:
+    """Step series (times, concurrent-flow count) built from the same
+    sweep-line event list concurrency_stats collapses to peak/mean -- for
+    plotting the count over time instead of summarising it. One point per
+    open/close event; the count is the value AFTER that event, so plotting
+    with drawstyle='steps-post' reproduces the true step function. Empty
+    arrays on empty input."""
+    if not intervals:
+        return np.array([]), np.array([])
+    ev = sorted([(s, 1) for s, _ in intervals] + [(e, -1) for _, e in intervals],
+               key=lambda x: (x[0], x[1]))       # closes before opens at a tie
+    times, counts, cur = [], [], 0
+    for t, delta in ev:
+        cur += delta
+        times.append(t)
+        counts.append(cur)
+    return np.asarray(times, dtype=float), np.asarray(counts, dtype=float)
 
 
 def intervals(flows: pd.DataFrame) -> list[tuple[int, int]]:

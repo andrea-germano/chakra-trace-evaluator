@@ -27,7 +27,7 @@ RESULT_DIR = "./results/timeline_graphs"
 # signalling traffic (the "serialize" / 8-byte FIRSTTOK messages).  They are
 # excluded from the bandwidth / impact analysis and from the timeline clutter,
 # but FIRSTTOK is still used as a marker for the first-token instant.
-CONTROL_MAX_BYTES = 128
+CONTROL_MAX_BYTES = 1
 
 # Colours (kept consistent between the HTML timeline and the PNG charts).
 CAT_COLORS = {
