@@ -5,13 +5,16 @@
 # Requires MLSynth traces to already exist for MODEL_FILE_NAME (run
 # generate_traces.sh once beforehand).
 #
-# ns-3 packet-level outputs are keyed by model: output/ns3/<model>/<ns3subdir>/,
-# mirroring the astra_logs/<model>/<ns3subdir>/ layout. The config carries a
-# __MODEL__ placeholder that is resolved here, into a per-run temporary config,
-# just before launching ns-3. As a result:
-#   - the SAME NS3_SUBDIR with DIFFERENT models no longer collides (each model
-#     writes to its own output/ns3/<model>/... subtree);
-#   - two instances sharing BOTH the same model AND the same NS3_SUBDIR still
+# ns-3 packet-level outputs are keyed by the same label as the astra_logs
+# output dir: output/ns3/<label>/<ns3subdir>/, mirroring
+# astra_logs/<label>/<ns3subdir>/ exactly (<label> is the first path segment
+# of OUTPUT_DIR_NAME, i.e. MODEL_FILE_NAME when OUTPUT_DIR_NAME is left at its
+# default of <model>/<ns3subdir>). The config carries a __MODEL__ placeholder
+# that is resolved here, into a per-run temporary config, just before
+# launching ns-3. As a result:
+#   - the SAME NS3_SUBDIR with a DIFFERENT label no longer collides (each
+#     label writes to its own output/ns3/<label>/... subtree);
+#   - two instances sharing BOTH the same label AND the same NS3_SUBDIR still
 #     collide on ns-3 outputs and must not run concurrently.
 
 # 1. Ask for user input (supports command line args or interactive prompt)
@@ -42,6 +45,13 @@ if [ -z "$OUTPUT_DIR_NAME" ]; then
   echo "Output directory not specified, using: $OUTPUT_DIR_NAME"
 fi
 
+# Label used for the ns-3 output subtree and for the __MODEL__ placeholder:
+# the first path segment of OUTPUT_DIR_NAME, so output/ns3/<label>/... mirrors
+# output/astra_logs/<OUTPUT_DIR_NAME> exactly (e.g. OUTPUT_DIR_NAME
+# "test/T2_bx200_dcqcn_buf32" -> label "test"). Falls back to MODEL_FILE_NAME
+# when OUTPUT_DIR_NAME is left at its default.
+NS3_MODEL_LABEL="${OUTPUT_DIR_NAME%%/*}"
+
 echo "---------------------------------------------------"
 
 # 2. Paths
@@ -66,7 +76,7 @@ LOGGING_CFG="$BASE_DIR/configs/astra_sim/logging_config.toml"
 TRACES_DIR="$BASE_DIR/output/mlsynth"
 WORKLOAD_PREFIX="$TRACES_DIR/$MODEL_FILE_NAME/et/$MODEL_FILE_NAME"
 COMM_GROUPS="$TRACES_DIR/$MODEL_FILE_NAME/comm_groups.json"
-NS3_OUT_DIR="$BASE_DIR/output/ns3/$MODEL_FILE_NAME/$NS3_SUBDIR"
+NS3_OUT_DIR="$BASE_DIR/output/ns3/$NS3_MODEL_LABEL/$NS3_SUBDIR"
 OUTPUT_DIR="$BASE_DIR/output/astra_logs/${OUTPUT_DIR_NAME}"
 
 # ESSENTIAL CHECK 2: Verify all required files and binaries exist
@@ -120,9 +130,9 @@ if ! grep -q "__MODEL__" "$NET_CFG"; then
   exit 1
 fi
 
-RESOLVED_CFG="$(mktemp "${TMPDIR:-/tmp}/ns3_config.${MODEL_FILE_NAME//\//_}.XXXXXX.txt")"
+RESOLVED_CFG="$(mktemp "${TMPDIR:-/tmp}/ns3_config.${NS3_MODEL_LABEL//\//_}.XXXXXX.txt")"
 trap 'rm -f "$RESOLVED_CFG"' EXIT
-sed "s#__MODEL__#${MODEL_FILE_NAME}#g" "$NET_CFG" > "$RESOLVED_CFG"
+sed "s#__MODEL__#${NS3_MODEL_LABEL}#g" "$NET_CFG" > "$RESOLVED_CFG"
 
 echo "==> Starting ASTRA-sim (ns-3 backend)..."
 "$NS3_BIN" \
