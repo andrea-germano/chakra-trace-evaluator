@@ -110,6 +110,14 @@ class SweepAxis:
 BANDWIDTH_AXIS = SweepAxis("bx", "bandwidth", "bx")
 BUFFER_AXIS = SweepAxis("buf", "buffer_mb", "MiB")
 
+# The generation side writes bx straight into physical_topology.txt as Gbps
+# (e.g. bx400 -> "400Gbps" on the leaf links), but the ASTRA-sim CSVs report
+# bw_bytes_per_ns, i.e. GB/s decimal (bytes/ns). The two are off by a factor of
+# 8 (bits vs bytes), not by anything about the run: comparing a CSV bandwidth
+# column to BANDWIDTH_AXIS.value(tag) 1:1 -- an "ideal y=x" line, a delivered/
+# nominal ratio -- silently compares Gbps to GB/s unless divided by this first.
+BANDWIDTH_GBPS_TO_BYTES_PER_NS = 1 / 8
+
 
 def add_arguments(ap, kind: str) -> None:
     """The four path flags every sweep analyzer shares. `kind` only picks the

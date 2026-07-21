@@ -40,16 +40,22 @@ different tools; they share readers, not conclusions -- see utils/__init__.py.
 Outputs (results/sweep_analysis/bandwidth/<sweep>/<workload>/ by default):
   * summary.csv            one row per run with all aggregated metrics
   * per_node.csv           per-node / per-class breakdown (long format)
-  * six PNG graphs
+  * seven PNG graphs
 
-Nine used to be six + three derivations of the other six, which is a way of
-showing the same number three times and calling it corroboration:
+Nine used to be seven + two derivations of the other seven, which is a way of
+showing the same number twice and calling it corroboration. Dropped:
 
-    01_makespan            a subset of 02, which already draws makespan_ns
-    08_speedup             makespan[0] / makespan -- 01, renormalised
-    09_kv_bound_ratio      kv_completion / makespan -- two curves of 02, divided
+    makespan (plain)       a subset of phase_completion, which already draws makespan_ns
+    kv_bound_ratio         kv_completion / makespan -- two curves of phase_completion, divided
 
-and the metric behind the last one did not measure its own name. `makespan` is
+speedup_vs_bandwidth (makespan[0] / makespan, i.e. makespan renormalised) went
+the same way at first, then came back on request: still a strict rescaling of
+the curve already on phase_completion, but normalising to the lowest-bandwidth
+run keeps the relative scaling readable when the absolute-ms range would
+otherwise dwarf the shape. (Numbering below runs 01-07 through whatever
+survived; it does not match any number quoted above.)
+
+and kv_bound_ratio did not measure its own name. `makespan` is
 max(end) over ALL rows, and under disaggregation decode runs AFTER the KV
 transfer, so kv_completion/makespan measures what fraction of the run had
 elapsed when KV finished -- which is set by how many decode steps you simulate.
@@ -105,7 +111,7 @@ matplotlib.use("Agg")          # headless: no display needed
 import matplotlib.pyplot as plt
 
 from utils import astra, paths
-from utils.paths import BANDWIDTH_AXIS
+from utils.paths import BANDWIDTH_AXIS, BANDWIDTH_GBPS_TO_BYTES_PER_NS
 from utils.plots import plot_series, save_fig
 
 KIND = "bandwidth"
@@ -218,6 +224,15 @@ def summarise_run(df: pd.DataFrame) -> dict:
     # concurrent transfers twice.
     out["kv_busy_union_ns"] = (astra.interval_union(kv["start_tick"], kv["end_tick"])
                                if len(kv) else np.nan)
+    # Exposed: the part of kv_busy_union_ns NOT masked by compute running
+    # anywhere in the system. kv_busy_union_ns alone answers "when is KV in
+    # flight"; it says nothing about whether that time was free (some GPU busy
+    # elsewhere, so the transfer rides for free) or added to the critical path.
+    comp = df[comp_mask]
+    out["kv_exposed_ns"] = out["kv_busy_union_ns"]
+    if len(kv) and len(comp):
+        out["kv_exposed_ns"] -= astra.interval_overlap(
+            kv["start_tick"], kv["end_tick"], comp["start_tick"], comp["end_tick"])
 
     # ---- Pipeline-parallel transfer (prefill + decode separately) ---------- #
     for label, mask in (("pp", pp_mask), ("pp_prefill", pp_pre_mask),
@@ -296,7 +311,7 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
     def save(fig, name):
         save_fig(fig, outdir, name, written)
 
-    # 2) Phase completion crossover ----------------------------------------- #
+    # 1) Phase completion crossover ----------------------------------------- #
     fig, ax = plt.subplots(figsize=(8, 5))
     for col, lbl, mk in (
         ("makespan_ns", "Makespan (overall)", "o"),
@@ -313,22 +328,26 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
                  "(KV completion above prefill compute => the fabric gates it)")
     ax.grid(True, alpha=0.3)
     ax.legend()
-    save(fig, "02_phase_completion_vs_bandwidth.png")
+    save(fig, "01_phase_completion_vs_bandwidth.png")
 
-    # 3) KV effective bandwidth vs nominal ---------------------------------- #
+    # 2) KV effective bandwidth vs nominal ---------------------------------- #
     fig, ax = plt.subplots(figsize=(8, 5))
     plot_series(ax, s, "bandwidth", "kv_agg_bw_bytes_per_ns", "KV aggregate delivered", marker="o")
     plot_series(ax, s, "bandwidth", "kv_mean_link_bw", "KV mean per-transfer", marker="s", linestyle="--")
     bmin, bmax = s["bandwidth"].min(), s["bandwidth"].max()
-    ax.plot([bmin, bmax], [bmin, bmax], "k:", alpha=0.5, label="ideal (y = x)")
+    # bandwidth is bx, written into physical_topology.txt as Gbps; the y-axis is
+    # bw_bytes_per_ns (GB/s decimal) -- an 8x unit gap, so "ideal" is bx/8, not bx.
+    ax.plot([bmin, bmax],
+            [bmin * BANDWIDTH_GBPS_TO_BYTES_PER_NS, bmax * BANDWIDTH_GBPS_TO_BYTES_PER_NS],
+            "k:", alpha=0.5, label="ideal (nominal link rate, GB/s)")
     ax.set_xlabel("Simulated link bandwidth (bx)")
     ax.set_ylabel("Effective bandwidth (bytes/ns \u2248 GB/s)")
     ax.set_title("KV-cache transfer: delivered vs nominal bandwidth")
     ax.grid(True, alpha=0.3)
     ax.legend()
-    save(fig, "03_kv_effective_bandwidth.png")
+    save(fig, "02_kv_effective_bandwidth.png")
 
-    # 4) KV duration vs bandwidth ------------------------------------------- #
+    # 3) KV duration vs bandwidth ------------------------------------------- #
     fig, ax = plt.subplots(figsize=(8, 5))
     plot_series(ax, s, "bandwidth", "kv_mean_duration_ns", "KV mean transfer time", marker="o", scale=1e-6)
     plot_series(ax, s, "bandwidth", "kv_max_duration_ns", "KV max transfer time", marker="s",
@@ -338,9 +357,9 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
     ax.set_title("KV-cache transfer time vs bandwidth")
     ax.grid(True, alpha=0.3)
     ax.legend()
-    save(fig, "04_kv_transfer_time.png")
+    save(fig, "03_kv_transfer_time.png")
 
-    # 5) PP effective bandwidth (prefill vs decode) ------------------------- #
+    # 4) PP effective bandwidth (prefill vs decode) ------------------------- #
     if s[["pp_prefill_agg_bw_bytes_per_ns", "pp_decode_agg_bw_bytes_per_ns"]].notna().any().any():
         fig, ax = plt.subplots(figsize=(8, 5))
         plot_series(ax, s, "bandwidth", "pp_prefill_agg_bw_bytes_per_ns", "PP prefill (aggregate)", marker="o")
@@ -350,15 +369,17 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
         plot_series(ax, s, "bandwidth", "pp_decode_mean_link_bw", "PP decode (per-transfer)",
                 marker="v", linestyle="--")
         bmin, bmax = s["bandwidth"].min(), s["bandwidth"].max()
-        ax.plot([bmin, bmax], [bmin, bmax], "k:", alpha=0.5, label="ideal (y = x)")
+        ax.plot([bmin, bmax],
+                [bmin * BANDWIDTH_GBPS_TO_BYTES_PER_NS, bmax * BANDWIDTH_GBPS_TO_BYTES_PER_NS],
+                "k:", alpha=0.5, label="ideal (nominal link rate, GB/s)")
         ax.set_xlabel("Simulated link bandwidth (bx)")
         ax.set_ylabel("Effective bandwidth (bytes/ns \u2248 GB/s)")
         ax.set_title("Pipeline-parallel transfer: delivered vs nominal bandwidth")
         ax.grid(True, alpha=0.3)
         ax.legend()
-        save(fig, "05_pp_effective_bandwidth.png")
+        save(fig, "04_pp_effective_bandwidth.png")
 
-    # 6) PP transfer time vs bandwidth -------------------------------------- #
+    # 5) PP transfer time vs bandwidth -------------------------------------- #
     if s[["pp_prefill_mean_duration_ns", "pp_decode_mean_duration_ns"]].notna().any().any():
         fig, ax = plt.subplots(figsize=(8, 5))
         plot_series(ax, s, "bandwidth", "pp_prefill_mean_duration_ns", "PP prefill mean time",
@@ -370,9 +391,9 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
         ax.set_title("Pipeline-parallel transfer time vs bandwidth")
         ax.grid(True, alpha=0.3)
         ax.legend()
-        save(fig, "06_pp_transfer_time.png")
+        save(fig, "05_pp_transfer_time.png")
 
-    # 7) Busy-time breakdown (stacked) -------------------------------------- #
+    # 6) Busy-time breakdown (stacked) -------------------------------------- #
     busy_cols = [c for c in s.columns if c.startswith("busy__")]
     if busy_cols:
         # order so KV / PP stand out, TP & compute as context
@@ -399,7 +420,23 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
                      "(summed over nodes; comm classes overlap in wall-clock time)")
         ax.grid(True, axis="y", alpha=0.3)
         ax.legend(ncol=2, fontsize=8)
-        save(fig, "07_busy_time_breakdown.png")
+        save(fig, "06_busy_time_breakdown.png")
+
+    # 7) Speedup vs bandwidth ------------------------------------------------ #
+    # Renormalises makespan_ns (already on 01) to the lowest-bandwidth run, kept
+    # on request even though it is derived from an existing curve: useful for
+    # eyeballing relative scaling when the absolute ms range dwarfs the shape.
+    if s["makespan_ns"].notna().any():
+        fig, ax = plt.subplots(figsize=(8, 5))
+        base = s["makespan_ns"].iloc[0]  # lowest bandwidth = baseline
+        speedup = base / s["makespan_ns"]
+        ax.plot(s["bandwidth"], speedup, marker="o", label="Speedup vs lowest bw")
+        ax.set_xlabel("Simulated link bandwidth (bx)")
+        ax.set_ylabel("Speedup (makespan at lowest bw / makespan)")
+        ax.set_title("Makespan speedup vs bandwidth (normalised to lowest bw)")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        save(fig, "07_speedup_vs_bandwidth.png")
 
     return written
 

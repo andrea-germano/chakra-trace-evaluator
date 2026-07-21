@@ -1369,11 +1369,12 @@ function draw(){
     const ln = LANES[i];
     ctx.fillStyle = ln.role==='decode' ? '#9fb4d8' : (ln.role==='prefill'?'#cdb88c':'#8a96ab');
     ctx.fillText(ln.label, 8, y + Math.min(lh-4, 12));
-    // concurrency badge for lanes that fan out (depth > 1)
+    // row-count badge for lanes with more than one transfer row
     if((ln.depth||1) > 1){
       ctx.fillStyle = '#ff8f8f';
       ctx.font='10px ui-monospace,monospace';
-      ctx.fillText('\u00d7'+ln.depth+(stacked?'':' \u26a0'), 8, y + Math.min(lh-4, 12) + 12);
+      const warn = !stacked && (ln.peak||1) > 1;   // truly-overlapping bars hidden while flat
+      ctx.fillText('\u00d7'+ln.depth+(warn?' \u26a0':''), 8, y + Math.min(lh-4, 12) + 12);
       ctx.font='11px ui-monospace,monospace';
     }
   }
@@ -1477,7 +1478,9 @@ function showTip(h, px, py){
     html += '<div class="row">payload: <span>'+(b.s/1e6).toFixed(2)+' MB</span> &middot; eff.bw: <span>'+(b.d!=null?b.d.toFixed(2)+' GB/s':'n/a')+'</span></div>';
   }
   if(isKV(b) && stacked && (ln.depth||1)>1){
-    html += '<div class="row">concurrent transfers in this lane: <span style="color:#ff9a9a">'+ln.depth+'</span></div>';
+    html += '<div class="row">transfer rows in this lane: <span style="color:#ff9a9a">'+ln.depth+'</span>'
+          + (ln.peak>1 ? ' &middot; peak concurrent: <span style="color:#ff9a9a">'+ln.peak+'</span>' : '')
+          + '</div>';
   }
   if(b.w){ html += '<div class="warn">&#9888; wait-dominated &mdash; scheduled early, mostly blocked; reported bandwidth unreliable</div>'; }
   tip.innerHTML=html;
@@ -1581,6 +1584,7 @@ def build_timeline_html(df, metrics, roles, title):
 
     lanes = []          # list of dicts {label, role}
     lane_index = {}     # (sys, lane_key) -> idx
+    lane_key_by_idx = []  # idx -> lane_key ("compute"/"TP"/"KV"/...)
     for sid in sorted(vis["sys_id"].unique()):
         sid = int(sid)
         role = roles.get(sid, {}).get("role", "?")
@@ -1591,13 +1595,40 @@ def build_timeline_html(df, metrics, roles, title):
                 lane_index[(sid, lk)] = idx
                 pretty = "compute" if lk == "compute" else lk
                 lanes.append({"label": f"sys{sid} \u00b7 {pretty}", "role": role})
+                lane_key_by_idx.append(lk)
 
     # ---- category index table ----
     cats = sorted(vis["category"].unique())
     cat_idx = {c: i for i, c in enumerate(cats)}
 
     # ---- bars ----
+    # `flow_key` identifies the *physical* flow a comm event belongs to (its
+    # src/dst stage + shard pair, from the node name), independent of
+    # layer/iteration -- used below only to order rows so a connection's
+    # repeated transfers land on adjacent lines; it never causes two bars to
+    # share a row.
+    def flow_key_of(r):
+        if r.is_compute:
+            return None
+        parts = [f"{k}={v}" for k in ("ss", "ds", "ssh", "dsh", "sh")
+                 if (v := getattr(r, k, None)) is not None and not (isinstance(v, float) and np.isnan(v))]
+        return "|".join(parts) or None
+
+    # In "Hide concurrent comms" (flat) mode every bar in a lane is drawn on sub-row
+    # 0, so overlapping transfers stack on the canvas and only the last-drawn one is
+    # visible -- painter's algorithm. That draw order is just `vis`'s row order
+    # unless we fix it, which is CSV read order and carries no meaning. The one
+    # class where transfers carry a destination layer is KV (`L=` in the name; PP
+    # and DECFB don't -- they move a whole stage boundary, not a per-layer chunk),
+    # so sort by L: whichever recv is hiding the others in the flat view is then
+    # always the highest-layer one in flight, not whichever happened to be read
+    # from disk last. Rows without an L (compute, PP, DECFB, TP, ...) keep their
+    # relative order -- `stable` only reorders the KV rows that actually have one.
+    l_num = pd.to_numeric(vis["L"], errors="coerce") if "L" in vis.columns else np.nan
+    vis = vis.assign(_lsort=l_num).sort_values("_lsort", kind="stable", na_position="last")
+
     bars = []
+    flow_keys = []
     for r in vis.itertuples(index=False):
         li = lane_index.get((int(r.sys_id), r.lane_key))
         if li is None:
@@ -1614,15 +1645,23 @@ def build_timeline_html(df, metrics, roles, title):
             bar["d"] = (float(r.eff_bw) if np.isfinite(r.eff_bw) else None)
             bar["w"] = bool(r.wait_dominated)
         bars.append(bar)
+        flow_keys.append(flow_key_of(r))
 
-    # ---- sub-row packing --------------------------------------------------- #
-    # Within a single lane many communications can be *in flight at the same
-    # time* (this is exactly the concurrent KV-cache transfer behaviour we want
-    # to expose).  Drawn flat, they stack on top of each other and look like one
-    # solid block.  We greedily partition each lane's bars into the minimum
-    # number of non-overlapping tracks ("sub-rows"), so every concurrent
-    # transfer gets its own visible slot.  `k` = sub-row index, and the lane's
-    # `depth` = how many transfers are concurrent at its busiest instant.
+    # ---- sub-row layout ------------------------------------------------------ #
+    # Most lanes (compute, TP, PP, ...) rarely have genuinely overlapping bars,
+    # so they use the original greedy minimal-track packing: reuse a track as
+    # soon as it frees up, so a non-overlapping lane stays a single flat row.
+    #
+    # The KV lane is different: this is exactly where concurrent transfers to
+    # distinct destinations matter, and reusing tracks there hides that a row
+    # can splice together segments from unrelated flows.  So for KV only,
+    # every transfer gets its OWN permanent row -- never shared with any other
+    # bar, overlapping or not.  Rows are ordered by flow identity (src/dst
+    # stage + shard, from the node name), then start time, purely so a
+    # connection's repeated transfers land on adjacent lines.
+    #
+    # `depth` = rows needed for layout; `peak` = true simultaneous-overlap
+    # count, kept separately for the concurrency badge/tooltip.
     from collections import defaultdict
     lane_bar_idx = defaultdict(list)
     for bi, b in enumerate(bars):
@@ -1630,22 +1669,44 @@ def build_timeline_html(df, metrics, roles, title):
 
     for li in range(len(lanes)):
         idxs = lane_bar_idx.get(li, [])
-        idxs.sort(key=lambda i: (bars[i]["a"], bars[i]["b"]))
-        track_end = []                       # last end tick per open track
+
+        events = []
         for i in idxs:
-            a, bnd = bars[i]["a"], bars[i]["b"]
-            slot = None
-            for k in range(len(track_end)):
-                if track_end[k] <= a:        # this track is free again
-                    slot = k
-                    break
-            if slot is None:
-                slot = len(track_end)
-                track_end.append(bnd)
-            else:
-                track_end[slot] = bnd
-            bars[i]["k"] = slot
-        lanes[li]["depth"] = max(1, len(track_end))
+            events.append((bars[i]["a"], 1))
+            events.append((bars[i]["b"], -1))
+        events.sort()
+        cur = peak = 0
+        for _, d in events:
+            cur += d
+            peak = max(peak, cur)
+
+        if lane_key_by_idx[li] == "KV":
+            groups = defaultdict(list)
+            for i in idxs:
+                groups[flow_keys[i]].append(i)
+            ordered_keys = sorted(groups, key=lambda fk: min(bars[i]["a"] for i in groups[fk]))
+
+            row = 0
+            for fk in ordered_keys:
+                for i in sorted(groups[fk], key=lambda i: bars[i]["a"]):
+                    bars[i]["k"] = row
+                    row += 1
+            lanes[li]["depth"] = max(1, row)
+        else:
+            idxs_sorted = sorted(idxs, key=lambda i: (bars[i]["a"], bars[i]["b"]))
+            track_end = []                       # last end tick per open track
+            for i in idxs_sorted:
+                a, bnd = bars[i]["a"], bars[i]["b"]
+                slot = next((k for k in range(len(track_end)) if track_end[k] <= a), None)
+                if slot is None:
+                    slot = len(track_end)
+                    track_end.append(bnd)
+                else:
+                    track_end[slot] = bnd
+                bars[i]["k"] = slot
+            lanes[li]["depth"] = max(1, len(track_end))
+
+        lanes[li]["peak"] = max(1, peak)
 
     # ---- peak concurrent KV transfers (header metric) ---------------------- #
     # Count how many KV-cache transfers are simultaneously on the wire at the

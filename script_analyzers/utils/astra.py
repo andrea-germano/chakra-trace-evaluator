@@ -292,3 +292,33 @@ def interval_union(starts, ends) -> float:
             total += cur_e - cur_s
             cur_s, cur_e = s, e
     return total + (cur_e - cur_s) if cur_s is not None else 0.0
+
+
+def _merge(starts, ends) -> list[tuple[float, float]]:
+    """Sorted intervals, overlapping ones fused -- the shared first step of
+    union and overlap so both agree on what "an interval" means."""
+    merged: list[list[float]] = []
+    for s, e in sorted(zip(starts, ends)):
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def interval_overlap(a_starts, a_ends, b_starts, b_ends) -> float:
+    """Total time covered by BOTH interval sets -- how much of A is masked by B.
+    Classic two-pointer sweep over two already-merged, sorted interval lists."""
+    a, b = _merge(a_starts, a_ends), _merge(b_starts, b_ends)
+    i = j = 0
+    total = 0.0
+    while i < len(a) and j < len(b):
+        s = max(a[i][0], b[j][0])
+        e = min(a[i][1], b[j][1])
+        if s < e:
+            total += e - s
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
