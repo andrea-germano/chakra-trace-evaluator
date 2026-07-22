@@ -944,7 +944,7 @@ def chart_sync_skew(df, metrics, roles, out):
 #  Interactive HTML timeline (canvas, raster)
 # --------------------------------------------------------------------------- #
 
-_TEMPLATE_PATH = Path(__file__).with_name("utils/astra_timeline_template.html")
+_TEMPLATE_PATH = Path(__file__).parent / "utils" / "astra_timeline_template.html"
 
 
 @lru_cache(maxsize=1)
