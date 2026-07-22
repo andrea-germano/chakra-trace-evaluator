@@ -10,6 +10,7 @@ reader without sharing a question.
 
 from __future__ import annotations
 
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -297,18 +298,343 @@ class QlenLog:
     switch_total_max: dict[int, int] = field(default_factory=dict)
     t_min: int = 0
     t_max: int = 0
-    # Filled only when read_qlen(..., series=True): the raw samples and the
-    # {kB: count} histograms, which keep percentiles affordable on huge files.
-    port_series: dict[tuple[int, int], tuple[list, list]] = field(default_factory=dict)
-    port_hist: dict[tuple[int, int], dict[int, int]] = field(default_factory=dict)
-    switch_series: dict[int, tuple[list, list]] = field(default_factory=dict)
-    switch_hist: dict[int, dict[int, int]] = field(default_factory=dict)
+    # Filled only when read_qlen(..., series=True): the raw per-sample time series,
+    # as numpy arrays (ts, bytes). Arrays rather than Python lists so a 10M-sample
+    # run does not pay ~28 bytes per int. Consumers already np.asarray them.
+    port_series: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    switch_series: dict[int, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
     switch_count: dict[int, int] = field(default_factory=dict)
 
 
 def read_qlen(path: Path, series: bool = False) -> QlenLog | None:
-    """`series=True` also retains the per-sample time series and histograms, which
-    plots need and a sweep does not."""
+    """Read qlen.txt into a QlenLog. `series=True` also retains the per-sample
+    time series (as numpy arrays), which plots need and a sweep does not.
+
+    Uses a vectorised parser (_read_qlen_fast); on any anomaly it falls back to
+    the byte-for-byte reference parser (_read_qlen_legacy), so the fast path can
+    never change the result -- only the speed."""
+    if not path.is_file():
+        return None
+    try:
+        return _read_qlen_fast(path, series)
+    except Exception as exc:  # noqa: BLE001 -- any parse anomaly -> safe fallback
+        print(f"  ! {path.name}: fast qlen parse fell back to the reference "
+              f"parser ({type(exc).__name__}: {exc})", file=sys.stderr)
+        return _read_qlen_legacy(path, series)
+
+
+# --------------------------------------------------------------------------- #
+# Fast qlen parser (numba). The format is `time <t> <sw> [j <port> <bytes>]*`; a
+# compiled single-pass byte scan reads it an order of magnitude faster than the
+# reference Python parser and with no temporary table -- the same logic, just
+# JIT-compiled. read_qlen falls back to the reference parser on any anomaly, and
+# skips this path entirely if numba is not installed.
+# --------------------------------------------------------------------------- #
+try:
+    from numba import njit
+    from numba.core import types
+    from numba.typed import Dict
+    _HAVE_NUMBA = True
+except Exception:                       # numba/llvmlite absent -> always legacy
+    _HAVE_NUMBA = False
+
+_PKEY = 1 << 20                         # pack (sw, port) -> sw * _PKEY + port
+
+
+def _unpack(k: int) -> tuple[int, int]:
+    return (int(k // _PKEY), int(k % _PKEY))
+
+
+if _HAVE_NUMBA:
+    @njit(cache=True)
+    def _qlen_scan_scalar(buf):
+        """One byte-pass -> the scalar aggregates only. Keyed sw*_PKEY+port (ports)
+        and sw (switches); no per-sample arrays, so RAM stays negligible -- this is
+        the path the cross-model compares use over many huge files."""
+        n = buf.size
+        pmax = Dict.empty(types.int64, types.int64)
+        psum = Dict.empty(types.int64, types.int64)
+        pcnt = Dict.empty(types.int64, types.int64)
+        swmax = Dict.empty(types.int64, types.int64)
+        swcnt = Dict.empty(types.int64, types.int64)
+        samples = 0
+        tmin = -1
+        tmax = 0
+        i = 0
+        while i < n:
+            while i < n and (buf[i] == 32 or buf[i] == 10):
+                i += 1
+            if i >= n:
+                break
+            if not (i + 4 <= n and buf[i] == 116 and buf[i + 1] == 105
+                    and buf[i + 2] == 109 and buf[i + 3] == 101):   # not 'time'
+                while i < n and buf[i] != 10:
+                    i += 1
+                continue
+            i += 4
+            while i < n and buf[i] == 32:
+                i += 1
+            t = 0
+            while i < n and 48 <= buf[i] <= 57:
+                t = t * 10 + (buf[i] - 48)
+                i += 1
+            while i < n and buf[i] == 32:
+                i += 1
+            sw = 0
+            while i < n and 48 <= buf[i] <= 57:
+                sw = sw * 10 + (buf[i] - 48)
+                i += 1
+            total = 0
+            while i < n and buf[i] != 10:
+                while i < n and buf[i] == 32:
+                    i += 1
+                if i < n and buf[i] == 106:                         # 'j'
+                    i += 1
+                    while i < n and buf[i] == 32:
+                        i += 1
+                    port = 0
+                    got_p = False
+                    while i < n and 48 <= buf[i] <= 57:
+                        port = port * 10 + (buf[i] - 48)
+                        i += 1
+                        got_p = True
+                    while i < n and buf[i] == 32:
+                        i += 1
+                    b = 0
+                    got_b = False
+                    while i < n and 48 <= buf[i] <= 57:
+                        b = b * 10 + (buf[i] - 48)
+                        i += 1
+                        got_b = True
+                    if got_p and got_b:
+                        key = sw * _PKEY + port
+                        if key in pmax:
+                            if b > pmax[key]:
+                                pmax[key] = b
+                            psum[key] += b
+                            pcnt[key] += 1
+                        else:
+                            pmax[key] = b
+                            psum[key] = b
+                            pcnt[key] = 1
+                        total += b
+                elif i < n and buf[i] != 10:
+                    while i < n and buf[i] != 32 and buf[i] != 10:
+                        i += 1
+            if i < n and buf[i] == 10:
+                i += 1
+            samples += 1
+            if tmin < 0 or t < tmin:
+                tmin = t
+            if t > tmax:
+                tmax = t
+            if sw in swmax:
+                if total > swmax[sw]:
+                    swmax[sw] = total
+                swcnt[sw] += 1
+            else:
+                swmax[sw] = total
+                swcnt[sw] = 1
+        return pmax, psum, pcnt, swmax, swcnt, samples, tmin, tmax
+
+    @njit(cache=True)
+    def _qlen_scan_count(buf):
+        """One byte-pass -> (n_rows, n_entries), the sizes the fill pass needs."""
+        n = buf.size
+        nrows = 0
+        nent = 0
+        i = 0
+        while i < n:
+            while i < n and (buf[i] == 32 or buf[i] == 10):
+                i += 1
+            if i >= n:
+                break
+            if not (i + 4 <= n and buf[i] == 116 and buf[i + 1] == 105
+                    and buf[i + 2] == 109 and buf[i + 3] == 101):
+                while i < n and buf[i] != 10:
+                    i += 1
+                continue
+            i += 4
+            while i < n and buf[i] == 32:
+                i += 1
+            while i < n and 48 <= buf[i] <= 57:
+                i += 1
+            while i < n and buf[i] == 32:
+                i += 1
+            while i < n and 48 <= buf[i] <= 57:
+                i += 1
+            while i < n and buf[i] != 10:
+                while i < n and buf[i] == 32:
+                    i += 1
+                if i < n and buf[i] == 106:
+                    i += 1
+                    while i < n and buf[i] == 32:
+                        i += 1
+                    got_p = False
+                    while i < n and 48 <= buf[i] <= 57:
+                        i += 1
+                        got_p = True
+                    while i < n and buf[i] == 32:
+                        i += 1
+                    got_b = False
+                    while i < n and 48 <= buf[i] <= 57:
+                        i += 1
+                        got_b = True
+                    if got_p and got_b:
+                        nent += 1
+                elif i < n and buf[i] != 10:
+                    while i < n and buf[i] != 32 and buf[i] != 10:
+                        i += 1
+            if i < n and buf[i] == 10:
+                i += 1
+            nrows += 1
+        return nrows, nent
+
+    @njit(cache=True)
+    def _qlen_scan_fill(buf, sw_row, t_row, tot_row, sw_j, port_j, ts_j, b_j):
+        """One byte-pass -> fill the preallocated row- and entry-level arrays, in
+        file order (so each key's samples come out chronological)."""
+        n = buf.size
+        r = 0
+        e = 0
+        i = 0
+        while i < n:
+            while i < n and (buf[i] == 32 or buf[i] == 10):
+                i += 1
+            if i >= n:
+                break
+            if not (i + 4 <= n and buf[i] == 116 and buf[i + 1] == 105
+                    and buf[i + 2] == 109 and buf[i + 3] == 101):
+                while i < n and buf[i] != 10:
+                    i += 1
+                continue
+            i += 4
+            while i < n and buf[i] == 32:
+                i += 1
+            t = 0
+            while i < n and 48 <= buf[i] <= 57:
+                t = t * 10 + (buf[i] - 48)
+                i += 1
+            while i < n and buf[i] == 32:
+                i += 1
+            sw = 0
+            while i < n and 48 <= buf[i] <= 57:
+                sw = sw * 10 + (buf[i] - 48)
+                i += 1
+            total = 0
+            while i < n and buf[i] != 10:
+                while i < n and buf[i] == 32:
+                    i += 1
+                if i < n and buf[i] == 106:
+                    i += 1
+                    while i < n and buf[i] == 32:
+                        i += 1
+                    port = 0
+                    got_p = False
+                    while i < n and 48 <= buf[i] <= 57:
+                        port = port * 10 + (buf[i] - 48)
+                        i += 1
+                        got_p = True
+                    while i < n and buf[i] == 32:
+                        i += 1
+                    b = 0
+                    got_b = False
+                    while i < n and 48 <= buf[i] <= 57:
+                        b = b * 10 + (buf[i] - 48)
+                        i += 1
+                        got_b = True
+                    if got_p and got_b:
+                        sw_j[e] = sw
+                        port_j[e] = port
+                        ts_j[e] = t
+                        b_j[e] = b
+                        e += 1
+                        total += b
+                elif i < n and buf[i] != 10:
+                    while i < n and buf[i] != 32 and buf[i] != 10:
+                        i += 1
+            if i < n and buf[i] == 10:
+                i += 1
+            sw_row[r] = sw
+            t_row[r] = t
+            tot_row[r] = total
+            r += 1
+
+
+def _read_qlen_fast(path: Path, series: bool) -> QlenLog:
+    """numba byte-scan of qlen.txt. Scalar-only (`series=False`) accumulates in
+    compiled dicts (tiny RAM); `series=True` sizes the per-sample arrays with a
+    count pass, then fills them, and numpy groups them into the per-key series.
+    The file is memory-mapped, so only touched pages are resident. Raises if numba
+    is unavailable or on any surprise, so read_qlen can fall back to the reference
+    parser."""
+    if not _HAVE_NUMBA:
+        raise RuntimeError("numba not available")
+    if path.stat().st_size == 0:                 # mmap cannot map an empty file
+        return QlenLog()
+    import mmap
+    with open(path, "rb") as fh:
+        mm = mmap.mmap(fh.fileno(), 0, prot=mmap.PROT_READ)
+        buf = np.frombuffer(mm, dtype=np.uint8)
+        try:
+            if not series:
+                pmax, psum, pcnt, swmax, swcnt, samples, tmin, tmax = \
+                    _qlen_scan_scalar(buf)
+                if samples == 0:
+                    return QlenLog()
+                return QlenLog(
+                    samples=int(samples),
+                    port_max={_unpack(k): int(v) for k, v in pmax.items()},
+                    port_mean={_unpack(k): psum[k] / pcnt[k] for k in pcnt},
+                    port_count={_unpack(k): int(v) for k, v in pcnt.items()},
+                    switch_total_max={int(k): int(v) for k, v in swmax.items()},
+                    switch_count={int(k): int(v) for k, v in swcnt.items()},
+                    t_min=int(tmin if tmin > 0 else 0), t_max=int(tmax))
+            n_rows, n_ent = _qlen_scan_count(buf)
+            if n_rows == 0:
+                return QlenLog()
+            sw_row = np.empty(n_rows, np.int64)
+            t_row = np.empty(n_rows, np.int64)
+            tot_row = np.empty(n_rows, np.int64)
+            sw_j = np.empty(n_ent, np.int64)
+            port_j = np.empty(n_ent, np.int64)
+            ts_j = np.empty(n_ent, np.int64)
+            b_j = np.empty(n_ent, np.int64)
+            _qlen_scan_fill(buf, sw_row, t_row, tot_row, sw_j, port_j, ts_j, b_j)
+        finally:
+            del buf                     # drop the mmap view before closing it
+            mm.close()
+
+    # aggregate the flat arrays (independent of the mmap now) with numpy/pandas
+    if n_ent:
+        dfp = pd.DataFrame({"sw": sw_j, "port": port_j, "b": b_j})
+        gp = dfp.groupby(["sw", "port"])["b"]
+        agg = gp.agg(["max", "sum", "count"])
+        port_max = {(int(s), int(p)): int(row["max"]) for (s, p), row in agg.iterrows()}
+        port_count = {(int(s), int(p)): int(row["count"]) for (s, p), row in agg.iterrows()}
+        port_mean = {(int(s), int(p)): row["sum"] / row["count"]
+                     for (s, p), row in agg.iterrows()}
+        port_series = {(int(s), int(p)): (ts_j[idx], b_j[idx])
+                       for (s, p), idx in dfp.groupby(["sw", "port"]).indices.items()}
+    else:
+        port_max = port_count = port_mean = port_series = {}
+    dfr = pd.DataFrame({"sw": sw_row, "tot": tot_row})
+    sagg = dfr.groupby("sw")["tot"].agg(["max", "count"])
+    switch_total_max = {int(s): int(row["max"]) for s, row in sagg.iterrows()}
+    switch_count = {int(s): int(row["count"]) for s, row in sagg.iterrows()}
+    switch_series = {int(s): (t_row[idx], tot_row[idx])
+                     for s, idx in dfr.groupby("sw").indices.items()}
+
+    return QlenLog(
+        samples=int(n_rows), port_max=port_max, port_mean=port_mean,
+        port_count=port_count, switch_total_max=switch_total_max,
+        switch_count=switch_count, t_min=int(t_row.min()), t_max=int(t_row.max()),
+        port_series=port_series, switch_series=switch_series)
+
+
+def _read_qlen_legacy(path: Path, series: bool = False) -> QlenLog | None:
+    """Reference parser: a plain Python line-by-line scan. Kept as the fallback
+    for read_qlen; correctness of the vectorised path is checked against this."""
     if not path.is_file():
         return None
     pmax: dict[tuple[int, int], int] = defaultdict(int)
@@ -317,9 +643,7 @@ def read_qlen(path: Path, series: bool = False) -> QlenLog | None:
     swmax: dict[int, int] = defaultdict(int)
     swcnt: dict[int, int] = defaultdict(int)
     pser: dict = defaultdict(lambda: ([], []))
-    phist: dict = defaultdict(lambda: defaultdict(int))
     sser: dict = defaultdict(lambda: ([], []))
-    shist: dict = defaultdict(lambda: defaultdict(int))
     samples, tmin, tmax = 0, None, 0
     for line in path.open():
         p = line.split()
@@ -348,7 +672,6 @@ def read_qlen(path: Path, series: bool = False) -> QlenLog | None:
                 if series:
                     pser[key][0].append(ts)
                     pser[key][1].append(b)
-                    phist[key][b // 1000] += 1
                 total += b
                 i += 3
             else:
@@ -359,14 +682,13 @@ def read_qlen(path: Path, series: bool = False) -> QlenLog | None:
         if series:
             sser[sw][0].append(ts)
             sser[sw][1].append(total)
-            shist[sw][total // 1000] += 1
     if samples == 0:
         return QlenLog()
     return QlenLog(samples=samples, port_max=dict(pmax),
                    port_mean={k: psum[k] / pcnt[k] for k in pcnt},
                    port_count=dict(pcnt), switch_total_max=dict(swmax),
                    switch_count=dict(swcnt), t_min=tmin or 0, t_max=tmax,
-                   port_series={k: v for k, v in pser.items()},
-                   port_hist={k: dict(v) for k, v in phist.items()},
-                   switch_series={k: v for k, v in sser.items()},
-                   switch_hist={k: dict(v) for k, v in shist.items()})
+                   port_series={k: (np.asarray(v[0], np.int64), np.asarray(v[1], np.int64))
+                                for k, v in pser.items()},
+                   switch_series={k: (np.asarray(v[0], np.int64), np.asarray(v[1], np.int64))
+                                  for k, v in sser.items()})

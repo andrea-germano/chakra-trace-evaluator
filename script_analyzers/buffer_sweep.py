@@ -455,7 +455,7 @@ def link_metrics(kv: pd.DataFrame, bn: Bottleneck, topo: Topology,
 # Per-run analysis
 # --------------------------------------------------------------------------- #
 def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
-           chosen_labels: list[str]) -> Row:
+           chosen_labels: list[str], want_series: bool = True) -> Row:
     buf = BUFFER_AXIS.value(tag)
     need(buf is not None, f"{tag}: no 'buf<num>' token in the directory name; "
                           f"the swept axis is unreadable.")
@@ -488,7 +488,10 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
     kv = f[f["flow_class"] == "kv"]
     need(len(kv), f"{tag}: no KV flow after classification.")
 
-    qlen = ns3.read_qlen(ns3_dir / "qlen.txt", series=True)
+    # series (the per-sample queue timeline) feed only the per-tag plots; a
+    # cross-model compare (want_series=False) needs just the scalars, so it skips
+    # building them -- the big saving on qlen.txt reads across many workloads.
+    qlen = ns3.read_qlen(ns3_dir / "qlen.txt", series=want_series)
     need(qlen is not None and qlen.port_max, f"{tag}: qlen.txt has no samples.")
 
     pfc = ns3.read_pfc(ns3_dir / "pfc.txt")
@@ -562,7 +565,7 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
     row.kv_rank_series = kv_rank_series(kv, placement)
 
     for sw, (ts, ys) in qlen.switch_series.items():
-        if not ts:
+        if len(ts) == 0:
             continue
         row.qseries[sw] = downsample_max(ts, ys, 2000)
         row.qswitch_peak[sw] = float(qlen.switch_total_max.get(sw, max(ys)))
@@ -822,7 +825,8 @@ REPORT = ["buffer_mb", "ttft_ns", "kv_gate_ns", "kv_gate_over_ttft",
 
 def analyse_sweep(p: paths.SweepPaths, placement: Placement,
                   top_links: int = 6, bn_force: str | None = None,
-                  verbose: bool = True) -> tuple[list[Row], pd.DataFrame, list[str]]:
+                  verbose: bool = True,
+                  want_series: bool = True) -> tuple[list[Row], pd.DataFrame, list[str]]:
     """Score one workload's whole buffer sweep, exactly as buffer_sweep.main
     does -- factored out so buffer_compare gets identical numbers (one
     definition of the metrics, two tools). Returns (rows sorted by buffer, the flat
@@ -864,7 +868,7 @@ def analyse_sweep(p: paths.SweepPaths, placement: Placement,
     ref_f = flowlib.annotate(ref_raw, ref_topo, placement, ref_cfg.payload)
     ref_kv = ref_f[ref_f["flow_class"] == "kv"]
     need(len(ref_kv), f"{ref_tag}: no KV flow after classification.")
-    ref_qlen = ns3.read_qlen(p.ns3_run(ref_tag) / "qlen.txt", series=True)
+    ref_qlen = ns3.read_qlen(p.ns3_run(ref_tag) / "qlen.txt", series=False)
     need(ref_qlen is not None and ref_qlen.port_max,
          f"{ref_tag}: qlen.txt has no samples.")
     canonical = flowlib.candidate_links(ref_topo, ref_qlen.port_max, ref_kv)
@@ -887,7 +891,7 @@ def analyse_sweep(p: paths.SweepPaths, placement: Placement,
             print(f"  - {lab}")
         print(f"\nAnalysing {len(tags)} runs:")
 
-    rows = [analyse(t, p, placement, chosen_labels) for t in tags]
+    rows = [analyse(t, p, placement, chosen_labels, want_series) for t in tags]
     if verbose:
         for r in sorted(rows, key=lambda r: r.buffer_mb):
             print(f"  + buf{r.buffer_mb:<5g} bn={r.bottleneck:<8} "

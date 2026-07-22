@@ -109,8 +109,10 @@ def load_workload(root: Path, workload: str, sweep: str,
     need(not p.missing_roots(),
          f"{workload}: derived root(s) do not exist:\n    "
          + "\n    ".join(p.missing_roots()))
+    # want_series=False: this cross-model compare plots only scalars, so the
+    # per-tag queue timelines are never built -- the big saving on qlen.txt reads.
     _, s, _ = analyse_sweep(p, placement, top_links=top_links,
-                            bn_force=None, verbose=False)
+                            bn_force=None, verbose=False, want_series=False)
 
     s = s.copy()
     # --- Block A: fabric-domain quantities, comparable in ABSOLUTE units ------
