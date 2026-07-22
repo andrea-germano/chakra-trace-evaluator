@@ -129,6 +129,14 @@ trap 'rm -f "$RESOLVED_CFG"' EXIT
 sed "s#__RUN_DIR__#${OUTPUT_DIR_NAME}#g" "$NET_CFG" > "$RESOLVED_CFG"
 
 echo "==> Starting ASTRA-sim (ns-3 backend)..."
+# Packet drops ("Headroom full" + a companion per-port state line) are printed by
+# ns-3 ONLY to stdout, and a lossy run prints thousands of them. Keep the console
+# clean: route the drop lines to drops.txt (created only if at least one drop
+# occurs), discard the companion state dump, and let all other (info) output
+# through to the screen. No full stdout log is kept: it is redundant with
+# astra_logs/.../log.log. Convention: drops.txt ABSENT == lossless.
+NS3_DROPS="$NS3_OUT_DIR/drops.txt"
+set -o pipefail
 "$NS3_BIN" \
   --workload-configuration="$WORKLOAD_PREFIX" \
   --system-configuration="$SYSTEM_CFG" \
@@ -136,9 +144,20 @@ echo "==> Starting ASTRA-sim (ns-3 backend)..."
   --remote-memory-configuration="$REMOTE_MEM_CFG" \
   --logical-topology-configuration="$LOGICAL_TOPO" \
   --comm-group-configuration="$COMM_GROUPS" \
-  --logging-folder="$OUTPUT_DIR" 
+  --logging-folder="$OUTPUT_DIR" 2>&1 \
+  | awk -v drops="$NS3_DROPS" '
+      /Headroom full/ { print > drops; expect=1; next }  # drop -> drops.txt (created here), off stdout
+      expect && /^\(/ { expect=0; next }                 # its (a,b)... companion line -> discarded
+      { expect=0; print }'                               # info -> stdout (on screen)
   # --logging-configuration="$LOGGING_CFG" \
-RC=$?
+RC=${PIPESTATUS[0]}
+set +o pipefail
+
+if [ -f "$NS3_DROPS" ]; then
+  echo "==> WARNING: $(wc -l < "$NS3_DROPS") dropped packet(s) ('Headroom full') — run is NOT lossless (see $NS3_DROPS)."
+else
+  echo "==> lossless: 0 dropped packets."
+fi
 
 if [ $RC -ne 0 ]; then
   echo "==> ERROR: ASTRA-sim ns-3 backend exited with code $RC."

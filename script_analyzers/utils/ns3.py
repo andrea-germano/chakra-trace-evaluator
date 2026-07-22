@@ -249,6 +249,47 @@ def read_pfc(path: Path) -> PfcLog | None:
                   qidx_state="n/a" if n == 0 else ("present" if has_q else "MISSING"))
 
 
+# --------------------------------------------------------------------------- #
+# drops.txt  — packet loss ("Headroom full"), a lossless-fabric violation
+# --------------------------------------------------------------------------- #
+@dataclass
+class DropStat:
+    """Packets dropped by switch ingress admission ("Headroom full", printed by
+    switch-mmu.cc only to stdout; generate_log_ns3.sh persists those lines to
+    drops.txt). One line == one dropped packet.
+
+        generate_log_ns3.sh writes drops.txt ONLY when at least one packet was
+        dropped, so:
+          * file ABSENT   (total == 0) -> run is lossless
+          * file present, total  > 0   -> run is LOSSY (per_switch says where)
+        captured is kept True always (the "unknown" tri-state is gone: an absent
+        file now means lossless, not un-measured).
+    """
+    total: int                       # dropped packets
+    per_switch: dict[int, int]       # switch node id -> dropped packets
+    captured: bool                   # always True; retained for API stability
+
+
+def read_drops(path: Path) -> DropStat:
+    """Read drops.txt. Line: '<t> <node> Drop: queue:<port>,<q>: Headroom full'.
+    The generator writes the file only when there are drops, so a missing file
+    means zero drops == lossless (NOT unknown)."""
+    if not path.is_file():
+        return DropStat(total=0, per_switch={}, captured=True)
+    per_sw: dict[int, int] = defaultdict(int)
+    total = 0
+    for line in path.open(errors="ignore"):
+        if "Headroom full" not in line:
+            continue
+        p = line.split()
+        total += 1
+        try:
+            per_sw[int(p[1])] += 1
+        except (IndexError, ValueError):
+            pass
+    return DropStat(total=total, per_switch=dict(per_sw), captured=True)
+
+
 PFC_QIDX_PATCH = r"""
 --- a/src/point-to-point/model/qbb-net-device.h
 -    TracedCallback<uint32_t> m_tracePfc;              // 0: resume, 1: pause
