@@ -68,6 +68,7 @@ import matplotlib.pyplot as plt
 
 from utils import flows as flowlib
 from utils import ns3, paths, roles
+from utils.cli import Abort, need
 from utils.fabric import Bottleneck, FabricModel, parse_ns3_config, parse_topology
 from utils.plots import downsample_max, save_fig
 from utils.roles import Placement
@@ -90,15 +91,6 @@ def class_style(c: str) -> tuple[str, str]:
 
 def sw_color(sw: int, switches: list[int]) -> str:
     return _SW_CYCLE[switches.index(sw) % len(_SW_CYCLE)]
-
-
-class Abort(Exception):
-    pass
-
-
-def need(cond, msg: str) -> None:
-    if not cond:
-        raise Abort(msg)
 
 
 class Report:
@@ -720,7 +712,7 @@ def main(argv: list[str] | None = None) -> int:
         for sz, cnt in raw["size"].value_counts().sort_index(ascending=False).head(10).items():
             tag = "  (<=MTU, 1 packet -> control)" if sz <= cfg.payload else ""
             say(f"    {fmt_b(sz):>10}  x {cnt}{tag}")
-        conc_peak, conc_mean = flowlib.concurrency_stats(flowlib.intervals(fabric_flows))
+        conc_peak, conc_mean = flowlib.concurrency_stats(flowlib.flow_spans(fabric_flows))
         say(f"\n  fabric-flow concurrency: peak {conc_peak:.0f}  "
             f"mean-experienced {conc_mean:.2f}  (upper bound on fair-share slowdown)")
         if len(fabric_flows):

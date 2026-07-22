@@ -110,24 +110,16 @@ import matplotlib
 matplotlib.use("Agg")          # headless: no display needed
 import matplotlib.pyplot as plt
 
-from utils import astra, paths
+from utils import astra, intervals, paths
+from utils.cli import Abort, need
 from utils.paths import BANDWIDTH_AXIS, BANDWIDTH_GBPS_TO_BYTES_PER_NS
 from utils.plots import plot_series, save_fig
 
 KIND = "bandwidth"
 
 
-class Abort(Exception):
-    pass
-
-
-def need(cond, msg: str) -> None:
-    if not cond:
-        raise Abort(msg)
-
-
 def _phase_of(pl) -> str:
-    return {"p": "prefill", "d": "decode"}.get(pl, "other")
+    return astra.role_of_pool(pl) or "other"
 
 
 def combo(row) -> str:
@@ -222,7 +214,7 @@ def summarise_run(df: pd.DataFrame) -> dict:
     # Wall-clock time during which at least one KV send was in flight. Unlike the
     # window it excludes the gaps, and unlike the busy sum it does not count
     # concurrent transfers twice.
-    out["kv_busy_union_ns"] = (astra.interval_union(kv["start_tick"], kv["end_tick"])
+    out["kv_busy_union_ns"] = (intervals.union_len(zip(kv["start_tick"], kv["end_tick"]))
                                if len(kv) else np.nan)
     # Exposed: the part of kv_busy_union_ns NOT masked by compute running
     # anywhere in the system. kv_busy_union_ns alone answers "when is KV in
@@ -231,8 +223,9 @@ def summarise_run(df: pd.DataFrame) -> dict:
     comp = df[comp_mask]
     out["kv_exposed_ns"] = out["kv_busy_union_ns"]
     if len(kv) and len(comp):
-        out["kv_exposed_ns"] -= astra.interval_overlap(
-            kv["start_tick"], kv["end_tick"], comp["start_tick"], comp["end_tick"])
+        out["kv_exposed_ns"] -= intervals.overlap_len(
+            zip(kv["start_tick"], kv["end_tick"]),
+            zip(comp["start_tick"], comp["end_tick"]))
 
     # ---- Pipeline-parallel transfer (prefill + decode separately) ---------- #
     for label, mask in (("pp", pp_mask), ("pp_prefill", pp_pre_mask),

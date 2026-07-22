@@ -112,6 +112,21 @@ BUFFER_AXIS = SweepAxis("buf")
 # nominal ratio -- silently compares Gbps to GB/s unless divided by this first.
 BANDWIDTH_GBPS_TO_BYTES_PER_NS = 1 / 8
 
+# The generation side writes each domain's runs under a fixed output root.
+_SOURCE_ROOT = {"astra": "astra_logs", "ns3": "ns3"}
+
+
+def discover_workloads(root: Path, sweep: str, source: str = "astra") -> list[str]:
+    """Every workload that ran `sweep`: the sub-directories of output/<source>
+    that contain a `<workload>/<sweep>` directory. `source` is 'astra'
+    (output/astra_logs, the compute domain) or 'ns3' (output/ns3, the fabric
+    domain). The cross-model companions use this to find who to overlay."""
+    base = Path(root) / "output" / _SOURCE_ROOT[source]
+    if not base.is_dir():
+        return []
+    return sorted(p.name for p in base.iterdir()
+                  if p.is_dir() and (p / sweep).is_dir())
+
 
 def add_arguments(ap, kind: str) -> None:
     """The four path flags every sweep analyzer shares. `kind` only picks the

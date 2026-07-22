@@ -1,7 +1,9 @@
 """
 utils — shared machinery for the MLSynth sweep analyzers.
 
-    paths    every path, derived from one --sweep name; and the swept-axis parsing.
+    paths    every path, derived from one --sweep name; the swept-axis parsing;
+             and the cross-model workload discovery the companions share.
+    cli      the Abort/need convention every analyzer raises through.
     roles    the declared rank -> role map, and flow classification from it.
     fabric   what the ns-3 switch does: topology, config, the PFC/ECN physics.
              Reads no simulation output; predicts from design parameters alone.
@@ -9,7 +11,10 @@ utils — shared machinery for the MLSynth sweep analyzers.
     flows    fct rows + topology + placement -> classified, path-annotated flows.
     pp       pipeline-parallel activation handoffs: how skewed is the arrival of
              one stage's output at the next, measured from fct.txt + placement.
-    astra    readers for the ASTRA-sim stats_sys*.csv.
+    astra    readers for the ASTRA-sim stats_sys*.csv, the counted-once transfer
+             de-dup, and the shared derived instants (first-token send, roles).
+    intervals  interval-set algebra (union / overlap / subtract / concurrency),
+             pure geometry over (start, end) pairs; used by astra and the analyzers.
     plots    the plotting mechanics (not the plots): series, log-2 axes, save,
              and the max-per-bucket queue-series downsampler both sweeps share.
 

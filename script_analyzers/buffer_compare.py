@@ -92,17 +92,10 @@ import matplotlib.pyplot as plt
 from utils import paths, roles
 from utils.plots import logx_pow2, save_fig
 from utils.roles import Placement
-from buffer_sweep import analyse_sweep, Abort, need
+from buffer_sweep import analyse_sweep
+from utils.cli import Abort, need
 
 NAN = float("nan")
-
-
-def discover_workloads(root: Path, sweep: str) -> list[str]:
-    ns3_root = root / "output" / "ns3"
-    if not ns3_root.is_dir():
-        return []
-    return sorted(p.name for p in ns3_root.iterdir()
-                  if p.is_dir() and (p / sweep).is_dir())
 
 
 def load_workload(root: Path, workload: str, sweep: str,
@@ -181,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     root = Path(a.root)
-    workloads = discover_workloads(root, a.sweep)
+    workloads = paths.discover_workloads(root, a.sweep, "ns3")
     if a.workloads:
         workloads = [w for w in workloads
                     if any(fnmatch.fnmatch(w, pat) for pat in a.workloads)]

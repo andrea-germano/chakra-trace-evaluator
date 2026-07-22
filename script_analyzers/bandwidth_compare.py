@@ -49,15 +49,8 @@ import matplotlib.pyplot as plt
 from utils import paths
 from utils.paths import BANDWIDTH_AXIS, BANDWIDTH_GBPS_TO_BYTES_PER_NS
 from utils.plots import save_fig
-from bandwidth_sweep import load_run, summarise_run, Abort, need
-
-
-def discover_workloads(root: Path, sweep: str) -> list[str]:
-    astra_logs = root / "output" / "astra_logs"
-    if not astra_logs.is_dir():
-        return []
-    return sorted(p.name for p in astra_logs.iterdir()
-                  if p.is_dir() and (p / sweep).is_dir())
+from bandwidth_sweep import load_run, summarise_run
+from utils.cli import Abort, need
 
 
 def load_workload(root: Path, workload: str, sweep: str, pattern: str) -> pd.DataFrame:
@@ -111,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     root = Path(a.root)
-    workloads = discover_workloads(root, a.sweep)
+    workloads = paths.discover_workloads(root, a.sweep, "astra")
     if a.workloads:
         workloads = [w for w in workloads
                     if any(fnmatch.fnmatch(w, pat) for pat in a.workloads)]

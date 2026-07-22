@@ -123,6 +123,18 @@ def classify_op(name: str) -> tuple[str, str]:
 # --------------------------------------------------------------------------- #
 # Roles and direction
 # --------------------------------------------------------------------------- #
+def role_of_pool(pl) -> str | None:
+    """The pool short form 'p'/'d' -> 'prefill'/'decode' (None for anything else).
+    The single home for this mapping so readers, sweeps and the time-domain
+    analyzer name the two pools identically."""
+    return {"p": "prefill", "d": "decode"}.get(pl)
+
+
+def pool_of_role(role) -> str | None:
+    """The inverse of role_of_pool: 'prefill'/'decode' -> 'p'/'d' (else None)."""
+    return {"prefill": "p", "decode": "d"}.get(role)
+
+
 def sys_roles(df: pd.DataFrame) -> dict[int, dict]:
     """sys_id -> {'role': 'prefill'|'decode'|None, 'ss': stage, 'sh': shard}.
 
@@ -138,7 +150,7 @@ def sys_roles(df: pd.DataFrame) -> dict[int, dict]:
                   f"its send/recv tagging is unreliable", file=sys.stderr)
         pl = next(iter(pls)) if len(pls) == 1 else None
         ss, sh = grp["ss"].dropna(), grp["sh"].dropna()
-        roles[int(sid)] = {"role": {"p": "prefill", "d": "decode"}.get(pl),
+        roles[int(sid)] = {"role": role_of_pool(pl),
                            "ss": ss.iloc[0] if len(ss) else None,
                            "sh": sh.iloc[0] if len(sh) else None}
     return roles
@@ -173,12 +185,21 @@ def tag_comm_role(df: pd.DataFrame, roles: dict[int, dict]) -> pd.Series:
 
 def flag_wait_dominated(df: pd.DataFrame) -> pd.Series:
     """True where the reported duration is a scheduling artefact rather than time
-    on the wire: the pre-posted recvs, identified by start_tick == the global
-    simulation origin. The fallback when a class has no role information."""
+    on the wire: a pre-posted recv, blocked until the data is produced upstream.
+
+    Recognised two ways, whichever is available: its ``comm_role`` is ``recv`` (a
+    send and its recv share a name, so the recv side is the blocked one), or -- the
+    fallback when roles could not be resolved -- it is pre-posted at the global
+    simulation origin. Both are payload-size- and topology-independent signals,
+    unlike a bandwidth threshold, which would wrongly punish legitimately slow
+    transfers. The recv-role signal also catches a blocked recv that happens not
+    to sit exactly at the origin, which the origin test alone would miss."""
     if df.empty:
         return pd.Series(dtype=bool)
-    origin = int(df["start_tick"].min())
-    return df["is_comm"] & (df["start_tick"] <= origin)
+    at_origin = df["start_tick"] <= int(df["start_tick"].min())
+    if "comm_role" in df.columns:
+        at_origin = at_origin | (df["comm_role"] == "recv")
+    return df["is_comm"] & at_origin
 
 
 # --------------------------------------------------------------------------- #
@@ -278,47 +299,30 @@ def unique_transfers(df: pd.DataFrame, op_class: str) -> pd.DataFrame:
     return sends(df, mask)
 
 
-def interval_union(starts, ends) -> float:
-    """Total time covered by the union of intervals. Summing durations
-    double-counts concurrent transfers; the union is the honest busy time."""
-    iv = sorted(zip(starts, ends))
-    total, cur_s, cur_e = 0.0, None, None
-    for s, e in iv:
-        if cur_s is None:
-            cur_s, cur_e = s, e
-        elif s <= cur_e:
-            cur_e = max(cur_e, e)
-        else:
-            total += cur_e - cur_s
-            cur_s, cur_e = s, e
-    return total + (cur_e - cur_s) if cur_s is not None else 0.0
+def firsttok_send_instant(df: pd.DataFrame) -> float | None:
+    """The first-token handoff instant: the START of the FIRSTTOK send.
+
+    Taken as the MAX over the TP shards, because the final all-reduce that
+    produces the token is a barrier -- the token is only ready once the slowest
+    shard has sent. Returns None when there is no FIRSTTOK at all; callers decide
+    the fallback (a prefill-compute end). When send/recv roles were not resolved,
+    the send is recovered as the FIRSTTOK row not pre-posted at the run origin.
+
+    Shared by the end-of-prefill TTFT of the sweeps and the full first-token
+    metric of the time-domain analyzer, so both mark the same instant."""
+    ft = df[df["op_class"] == "FIRSTTOK"]
+    if not len(ft):
+        return None
+    if "comm_role" in ft.columns and (ft["comm_role"] == "send").any():
+        return float(ft.loc[ft["comm_role"] == "send", "start_tick"].max())
+    non_origin = ft[ft["start_tick"] > float(df["start_tick"].min())]
+    if len(non_origin):
+        return float(non_origin["start_tick"].max())
+    return None
 
 
-def _merge(starts, ends) -> list[tuple[float, float]]:
-    """Sorted intervals, overlapping ones fused -- the shared first step of
-    union and overlap so both agree on what "an interval" means."""
-    merged: list[list[float]] = []
-    for s, e in sorted(zip(starts, ends)):
-        if merged and s <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], e)
-        else:
-            merged.append([s, e])
-    return [(s, e) for s, e in merged]
-
-
-def interval_overlap(a_starts, a_ends, b_starts, b_ends) -> float:
-    """Total time covered by BOTH interval sets -- how much of A is masked by B.
-    Classic two-pointer sweep over two already-merged, sorted interval lists."""
-    a, b = _merge(a_starts, a_ends), _merge(b_starts, b_ends)
-    i = j = 0
-    total = 0.0
-    while i < len(a) and j < len(b):
-        s = max(a[i][0], b[j][0])
-        e = min(a[i][1], b[j][1])
-        if s < e:
-            total += e - s
-        if a[i][1] < b[j][1]:
-            i += 1
-        else:
-            j += 1
-    return total
+# Interval-set algebra (union / overlap / subtract / concurrency) lives in
+# utils.intervals -- it is pure geometry, not an ASTRA reader. Callers that used
+# astra.interval_union / astra.interval_overlap now import utils.intervals and
+# pass (start, end) pairs: intervals.union_len(zip(starts, ends)),
+# intervals.overlap_len(zip(a_s, a_e), zip(b_s, b_e)).

@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Execution timeline &mdash; __TITLE__</title>
+<style>
+  :root{
+    --bg:#0e1320; --panel:#161d2e; --panel2:#1d2740; --ink:#e7ecf3;
+    --muted:#8a96ab; --line:#2a3550; --accent:#4f9bff;
+    --ttft:#ff6b6b; --second:#22c08a; --dstart:#ff9f43;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--ink);
+       font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+       font-size:13px;overflow:hidden}
+  header{padding:14px 18px;border-bottom:1px solid var(--line);
+         display:flex;align-items:center;gap:26px;flex-wrap:wrap;background:var(--panel)}
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px}
+  header h1 .sub{color:var(--muted);font-weight:400;margin-left:8px}
+  .metrics{display:flex;gap:22px;margin-left:auto;flex-wrap:wrap}
+  .metric{display:flex;flex-direction:column;line-height:1.15}
+  .metric .v{font-size:20px;font-weight:700}
+  .metric .k{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+  .metric.ttft .v{color:var(--ttft)}
+  .metric.kvexp .v{color:var(--dstart)}
+  .metric.second .v{color:var(--second)}
+  .metric.tpot .v{color:#7c5cff}
+  .metric.kvpeak .v{color:#ff6b6b}
+  #toolbar{display:flex;gap:10px;align-items:center;padding:8px 18px;
+           border-bottom:1px solid var(--line);background:var(--panel2);flex-wrap:wrap}
+  #toolbar button{background:#26314d;color:var(--ink);border:1px solid var(--line);
+           border-radius:6px;padding:5px 11px;cursor:pointer;font:inherit;font-size:12px}
+  #toolbar button:hover{background:#30406a}
+  #toolbar button.toggle.active{background:#ff6b6b22;border-color:#ff6b6b;color:#ffd0d0}
+  #toolbar button.toggle.active:hover{background:#ff6b6b33}
+  #toolbar .hint{color:var(--muted);font-size:11.5px}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;margin-left:auto}
+  .legend span{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted)}
+  .legend i{width:12px;height:12px;border-radius:3px;display:inline-block}
+  #wrap{position:absolute;inset:0;top:var(--top);}
+  #cv{display:block;width:100%;height:100%;cursor:grab}
+  #cv.drag{cursor:grabbing}
+  #tip{position:fixed;pointer-events:none;z-index:10;display:none;max-width:460px;
+       background:#0a0f1ae6;border:1px solid var(--line);border-radius:8px;
+       padding:9px 11px;font-size:12px;line-height:1.5;backdrop-filter:blur(3px);
+       box-shadow:0 8px 30px #0009}
+  #tip b{color:var(--accent)}
+  #tip .name{color:#fff;word-break:break-all;font-size:12.5px;margin-bottom:4px}
+  #tip .row{color:var(--muted)}
+  #tip .row span{color:var(--ink)}
+  #tip .warn{color:var(--ttft);margin-top:3px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Execution timeline<span class="sub">__TITLE__</span></h1>
+  <div class="metrics">
+    <div class="metric ttft"><span class="v">__TTFT__</span><span class="k">TTFT (first token, prefill)</span></div>
+    <div class="metric kvexp"><span class="v">__KVEXP__</span><span class="k">KV transfer exposed</span></div>
+    <div class="metric second"><span class="v">__SECOND__</span><span class="k">2nd token (prefill+KV+decode 1)</span></div>
+    <div class="metric tpot"><span class="v">__TPOT__</span><span class="k">TPOT (per token)</span></div>
+    <div class="metric kvpeak"><span class="v">__KVPEAK__</span><span class="k">peak concurrent KV transfers</span></div>
+    <div class="metric"><span class="v">__MAKESPAN__</span><span class="k">total makespan</span></div>
+  </div>
+</header>
+<div id="toolbar">
+  <button id="reset">Reset view</button>
+  <button id="zin">Zoom +</button>
+  <button id="zout">Zoom &minus;</button>
+  <button id="fit">Fit width</button>
+  <button id="stack" class="toggle active" title="Show or hide concurrent communication by splitting overlapping transfers into separate tracks">Show concurrent comms</button>
+  <span class="hint">drag = pan &nbsp;&middot;&nbsp; wheel = zoom (x) &nbsp;&middot;&nbsp; shift+wheel = scroll &nbsp;&middot;&nbsp; hover = node name</span>
+  <div class="legend" id="legend"></div>
+</div>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="tip"></div>
+<script>
+const DATA = __DATA__;
+const root = document.documentElement;
+const headerH = document.querySelector('header').offsetHeight + document.getElementById('toolbar').offsetHeight;
+root.style.setProperty('--top', headerH + 'px');
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const tip = document.getElementById('tip');
+
+const COLORS = DATA.colors;          // catName -> hex
+const CATS   = DATA.cats;            // index -> catName
+const LANES  = DATA.lanes;           // [{label, role, depth}]
+const BARS   = DATA.bars;            // {l,a,b,c,n,s,w,d,k}
+const t0 = DATA.t0, tEnd = DATA.tEnd;
+const ttftX = DATA.ttft, secondX = DATA.second; // absolute ticks or null
+const decodeStartX = DATA.decodeStart;          // absolute tick or null
+
+// layout constants
+const LEFT = 168, TOP = 26, PLOT_TOP = TOP;
+const FLAT_H = 16, LANE_GAP = 6, BASE_SUB = 14, MIN_SUB = 4, TARGET = 150;
+
+// view / display state
+let stacked = true;      // show concurrent transfers as separate stacked tracks
+
+// per-lane vertical layout, recomputed whenever `stacked` flips
+let laneY = [], laneH = [], subH = [], contentH = 0;
+function computeLayout(){
+  laneY = new Array(LANES.length);
+  laneH = new Array(LANES.length);
+  subH  = new Array(LANES.length);
+  let acc = 0;
+  for(let i=0;i<LANES.length;i++){
+    const d = Math.max(1, LANES[i].depth || 1);
+    let sh, inner;
+    if(stacked && d > 1){
+      sh = Math.max(MIN_SUB, Math.min(BASE_SUB, Math.floor(TARGET / d)));
+      inner = d * sh;
+    }else{
+      sh = FLAT_H; inner = FLAT_H;
+    }
+    subH[i] = sh;
+    laneY[i] = acc;
+    laneH[i] = inner + LANE_GAP;
+    acc += laneH[i];
+  }
+  contentH = acc + 20;
+}
+computeLayout();
+
+// build per-lane bar buckets for faster hit-testing
+const laneBars = LANES.map(()=>[]);
+for(const bar of BARS){ laneBars[bar.l].push(bar); }
+
+// view transform (x only zoom/pan; y = vertical scroll)
+let scaleX, offX, offY = 0;
+let dpr = Math.max(1, window.devicePixelRatio || 1);
+
+function maxScroll(){ return Math.max(0, contentH - (cv.clientHeight - PLOT_TOP)); }
+
+function resize(){
+  dpr = Math.max(1, window.devicePixelRatio || 1);
+  const w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = Math.floor(w*dpr); cv.height = Math.floor(h*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  offY = Math.max(0, Math.min(offY, maxScroll()));
+  draw();
+}
+function fitWidth(){
+  const w = cv.clientWidth;
+  const span = (tEnd - t0) || 1;
+  scaleX = (w - LEFT - 20) / span;
+  offX = LEFT;
+  offY = 0;
+  draw();
+}
+function tickToX(t){ return offX + (t - t0)*scaleX; }
+function xToTick(x){ return t0 + (x - offX)/scaleX; }
+
+function colorFor(b){ return COLORS[CATS[b.c]] || '#888'; }
+function isKV(b){ return CATS[b.c] === 'KV'; }
+
+function fmtTime(ns){
+  if(ns==null||!isFinite(ns)) return 'n/a';
+  const a=Math.abs(ns);
+  if(a>=1e9) return (ns/1e9).toFixed(3)+' s';
+  if(a>=1e6) return (ns/1e6).toFixed(3)+' ms';
+  if(a>=1e3) return (ns/1e3).toFixed(3)+' \u00b5s';
+  return ns.toFixed(0)+' ns';
+}
+
+function draw(){
+  const w = cv.clientWidth, h = cv.clientHeight;
+  ctx.clearRect(0,0,w,h);
+
+  // --- time grid ---
+  ctx.save();
+  ctx.beginPath(); ctx.rect(LEFT,0,w-LEFT,h); ctx.clip();
+  const leftTick = xToTick(LEFT), rightTick = xToTick(w);
+  const span = rightTick-leftTick;
+  let step = Math.pow(10, Math.floor(Math.log10(span/6)));
+  [1,2,5,10].some(m=>{ if(span/(step*m) <= 8){ step*=m; return true;} return false;});
+  const first = Math.ceil(leftTick/step)*step;
+  ctx.font='10px ui-monospace,monospace';
+  for(let t=first;t<rightTick;t+=step){
+    const x=tickToX(t);
+    ctx.strokeStyle='#1c2538'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(x,TOP-6); ctx.lineTo(x,h); ctx.stroke();
+    ctx.fillStyle='#6b7689';
+    ctx.fillText(fmtTime(t-t0), x+3, TOP-8);
+  }
+  ctx.restore();
+
+  // --- lane backgrounds + labels ---
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0,PLOT_TOP,w,h-PLOT_TOP); ctx.clip();
+  ctx.font='11px ui-monospace,monospace';
+  for(let i=0;i<LANES.length;i++){
+    const y = PLOT_TOP + laneY[i] - offY;
+    const lh = laneH[i];
+    if(y+lh<PLOT_TOP||y>h) continue;
+    ctx.fillStyle = (i%2)? '#121829':'#0f1422';
+    ctx.fillRect(0,y,w,lh);
+    const ln = LANES[i];
+    ctx.fillStyle = ln.role==='decode' ? '#9fb4d8' : (ln.role==='prefill'?'#cdb88c':'#8a96ab');
+    ctx.fillText(ln.label, 8, y + Math.min(lh-4, 12));
+    // row-count badge for lanes with more than one transfer row
+    if((ln.depth||1) > 1){
+      ctx.fillStyle = '#ff8f8f';
+      ctx.font='10px ui-monospace,monospace';
+      const warn = !stacked && (ln.peak||1) > 1;   // truly-overlapping bars hidden while flat
+      ctx.fillText('\u00d7'+ln.depth+(warn?' \u26a0':''), 8, y + Math.min(lh-4, 12) + 12);
+      ctx.font='11px ui-monospace,monospace';
+    }
+  }
+  ctx.restore();
+  // separator under labels
+  ctx.strokeStyle='#2a3550'; ctx.beginPath(); ctx.moveTo(LEFT,0); ctx.lineTo(LEFT,h); ctx.stroke();
+
+  // --- bars ---
+  ctx.save();
+  ctx.beginPath(); ctx.rect(LEFT,PLOT_TOP,w-LEFT,h-PLOT_TOP); ctx.clip();
+  for(let i=0;i<LANES.length;i++){
+    const y = PLOT_TOP + laneY[i] - offY;
+    const lh = laneH[i];
+    if(y+lh<PLOT_TOP||y>h) continue;
+    const sh = subH[i];
+    for(const b of laneBars[i]){
+      let x0 = tickToX(b.a), x1 = tickToX(b.b);
+      if(x1<LEFT||x0>w) continue;
+      let bw = Math.max(1, x1-x0);
+      const kv = isKV(b);
+      // sub-row placement: stacked -> each track its own slot; flat -> overlap
+      const k = stacked ? (b.k||0) : 0;
+      const by = y + k*sh + 1;
+      const bh = sh - 2;
+      let col = colorFor(b);
+      if(b.w){ // wait-dominated -> hollow/light to show it's mostly blocked
+        ctx.fillStyle = col+'33';
+        ctx.fillRect(x0, by, bw, bh);
+        ctx.strokeStyle = col; ctx.lineWidth=1;
+        ctx.strokeRect(x0+0.5, by+0.5, Math.max(1,bw-1), Math.max(1,bh-1));
+      }else{
+        ctx.fillStyle = col;
+        ctx.fillRect(x0, by, bw, bh);
+        // outline KV transfers when stacked so adjacent tracks stay distinct
+        if(kv && stacked && bh>=5){
+          ctx.strokeStyle='#0e1320'; ctx.lineWidth=1;
+          ctx.strokeRect(x0+0.5, by+0.5, Math.max(1,bw-1), bh-1);
+        }
+      }
+    }
+  }
+  // --- markers ---
+  function marker(tick,color,label,tier){
+    if(tick==null) return;
+    const x=tickToX(tick); if(x<LEFT||x>w) return;
+    ctx.strokeStyle=color; ctx.lineWidth=2; ctx.setLineDash([5,4]);
+    ctx.beginPath(); ctx.moveTo(x,PLOT_TOP); ctx.lineTo(x,h); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle=color; ctx.font='bold 11px ui-monospace,monospace';
+    const ty = PLOT_TOP+14 + (tier||0)*15;
+    ctx.fillText(label, x+4, ty);
+  }
+  marker(ttftX,'#ff6b6b','TTFT '+fmtTime(ttftX!=null?ttftX-t0:null), 0);
+  marker(decodeStartX,'#ff9f43','decode start '+fmtTime(decodeStartX!=null?decodeStartX-t0:null), 1);
+  marker(secondX,'#22c08a','2nd '+fmtTime(secondX!=null?secondX-t0:null), 2);
+  ctx.restore();
+}
+
+
+// --- hit testing for tooltip ---
+function laneAt(py){
+  const yl = py - PLOT_TOP + offY;         // y within lane content space
+  if(yl < 0) return -1;
+  // laneY is sorted ascending; small N so linear scan is fine
+  for(let i=0;i<LANES.length;i++){
+    if(yl >= laneY[i] && yl < laneY[i] + laneH[i]) return i;
+  }
+  return -1;
+}
+function hit(px,py){
+  if(px<LEFT || py<PLOT_TOP) return null;
+  const i = laneAt(py);
+  if(i<0) return null;
+  const laneTop = laneY[i];
+  const within = (py - PLOT_TOP + offY) - laneTop;   // offset inside the lane
+  const sh = subH[i];
+  const k = stacked ? Math.floor(within / sh) : -1;  // -1 = any sub-row (flat)
+  const t = xToTick(px);
+  // prefer the narrowest containing bar (thin bars win); restrict to sub-row k
+  let best=null, bestW=Infinity;
+  for(const b of laneBars[i]){
+    if(stacked && (b.k||0)!==k) continue;
+    const bwT=b.b-b.a;
+    if(t>=b.a && t<=b.b){
+      if(bwT<bestW){best=b;bestW=bwT;}
+    } else {
+      const x0=tickToX(b.a),x1=tickToX(b.b);
+      if(px>=x0-3 && px<=x1+3){ if(bwT<bestW){best=b;bestW=bwT;} }
+    }
+  }
+  return best ? {bar:best, lane:LANES[i]} : null;
+}
+
+function showTip(h, px, py){
+  const b=h.bar, ln=h.lane;
+  let html = '<div class="name">'+b.n+'</div>';
+  html += '<div class="row">lane: <span>'+ln.label+'</span> &middot; cat: <span style="color:'+colorFor(b)+'">'+CATS[b.c]+'</span></div>';
+  html += '<div class="row">start: <span>'+fmtTime(b.a-t0)+'</span> &rarr; end: <span>'+fmtTime(b.b-t0)+'</span></div>';
+  html += '<div class="row">duration: <span>'+fmtTime(b.b-b.a)+'</span></div>';
+  if(b.s!=null && b.s>0){
+    html += '<div class="row">payload: <span>'+(b.s/1e6).toFixed(2)+' MB</span> &middot; eff.bw: <span>'+(b.d!=null?b.d.toFixed(2)+' GB/s':'n/a')+'</span></div>';
+  }
+  if(isKV(b) && stacked && (ln.depth||1)>1){
+    html += '<div class="row">transfer rows in this lane: <span style="color:#ff9a9a">'+ln.depth+'</span>'
+          + (ln.peak>1 ? ' &middot; peak concurrent: <span style="color:#ff9a9a">'+ln.peak+'</span>' : '')
+          + '</div>';
+  }
+  if(b.w){ html += '<div class="warn">&#9888; wait-dominated &mdash; scheduled early, mostly blocked; reported bandwidth unreliable</div>'; }
+  tip.innerHTML=html;
+  tip.style.display='block';
+  let tx=px+14, ty=py+14;
+  const r=tip.getBoundingClientRect();
+  if(tx+r.width>window.innerWidth) tx=px-r.width-14;
+  if(ty+r.height>window.innerHeight) ty=py-r.height-14;
+  tip.style.left=tx+'px'; tip.style.top=ty+'px';
+}
+
+// --- interaction ---
+let dragging=false, lastX=0, lastY=0, moved=false;
+cv.addEventListener('mousedown',e=>{dragging=true;moved=false;lastX=e.clientX;lastY=e.clientY;cv.classList.add('drag');});
+window.addEventListener('mouseup',()=>{dragging=false;cv.classList.remove('drag');});
+window.addEventListener('mousemove',e=>{
+  const rect=cv.getBoundingClientRect();
+  const px=e.clientX-rect.left, py=e.clientY-rect.top;
+  if(dragging){
+    moved=true;
+    offX += e.clientX-lastX;
+    offY -= e.clientY-lastY;
+    offY = Math.max(0, Math.min(offY, maxScroll()));
+    lastX=e.clientX; lastY=e.clientY;
+    tip.style.display='none';
+    draw();
+    return;
+  }
+  const h=hit(px,py);
+  if(h){ showTip(h,e.clientX,e.clientY); } else { tip.style.display='none'; }
+});
+cv.addEventListener('mouseleave',()=>tip.style.display='none');
+
+cv.addEventListener('wheel',e=>{
+  e.preventDefault();
+  const rect=cv.getBoundingClientRect();
+  const px=e.clientX-rect.left, py=e.clientY-rect.top;
+  if(e.shiftKey){
+    offY += e.deltaY;
+    offY = Math.max(0, Math.min(offY, maxScroll()));
+  }else{
+    const tAtCursor = xToTick(px);
+    const factor = Math.exp(-e.deltaY*0.0015);
+    scaleX *= factor;
+    // keep cursor tick fixed
+    offX = px - (tAtCursor - t0)*scaleX;
+  }
+  tip.style.display='none';
+  draw();
+},{passive:false});
+
+document.getElementById('reset').onclick=fitWidth;
+document.getElementById('fit').onclick=fitWidth;
+document.getElementById('zin').onclick=()=>{ scaleX*=1.4; draw(); };
+document.getElementById('zout').onclick=()=>{ scaleX/=1.4; draw(); };
+
+const stackBtn=document.getElementById('stack');
+stackBtn.onclick=()=>{
+  stacked=!stacked;
+  stackBtn.classList.toggle('active',stacked);
+  stackBtn.textContent = stacked ? 'Hide concurrent comms' : 'Show concurrent comms';
+  computeLayout();
+  offY=Math.max(0, Math.min(offY, maxScroll()));
+  draw();
+};
+stackBtn.textContent='Hide concurrent comms';   // starts shown (stacked)
+
+// legend
+const lg=document.getElementById('legend');
+const order=['COMPUTE_attn','COMPUTE_ffw','TP','KV','PP','KVREQ','DECFB'];
+const seen=new Set(CATS);
+for(const c of order){ if(seen.has(c)){
+  const s=document.createElement('span');
+  s.innerHTML='<i style="background:'+(COLORS[c]||'#888')+'"></i>'+c.replace('COMPUTE_','compute:');
+  lg.appendChild(s);
+}}
+
+window.addEventListener('resize',resize);
+fitWidth();
+resize();
+</script>
+</body>
+</html>

@@ -211,7 +211,8 @@ def concurrency_series(intervals: list[tuple[int, int]]) -> tuple[np.ndarray, np
     return np.asarray(times, dtype=float), np.asarray(counts, dtype=float)
 
 
-def intervals(flows: pd.DataFrame) -> list[tuple[int, int]]:
+def flow_spans(flows: pd.DataFrame) -> list[tuple[int, int]]:
     """(start, arrival) per flow, for concurrency_stats. The caller decides the
-    population; this does not filter."""
+    population; this does not filter. Named flow_spans, not intervals, so it does
+    not read as the utils.intervals module."""
     return list(zip(flows["start"].astype(int), flows["arrival"].astype(int)))

@@ -89,9 +89,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from utils import astra
+from utils import astra, intervals
 from utils import flows as flowlib
 from utils import ns3, paths, pp, roles
+from utils.cli import Abort, need
 from utils.fabric import Bottleneck, Topology, parse_ns3_config, parse_topology
 from utils.plots import downsample_max, logx_pow2, save_fig
 from utils.roles import Placement
@@ -106,16 +107,6 @@ BLUE, CORAL, GREEN, VIOLET, MUTED = \
 
 
 # --------------------------------------------------------------------------- #
-class Abort(Exception):
-    """A condition under which no number this script could print would mean
-    anything. Never caught, never downgraded to a default."""
-
-
-def need(cond, msg: str) -> None:
-    if not cond:
-        raise Abort(msg)
-
-
 WARNINGS: list[str] = []
 
 
@@ -227,19 +218,10 @@ class Row:
 # Measurement helpers
 # --------------------------------------------------------------------------- #
 def union_len(spans: list[tuple[int, int]], lo: int, hi: int) -> int:
-    """Measure of the union of `spans` clipped to [lo, hi]."""
-    clipped = sorted((max(s, lo), min(e, hi)) for s, e in spans
-                     if min(e, hi) > max(s, lo))
-    total, cs, ce = 0, None, None
-    for s, e in clipped:
-        if cs is None:
-            cs, ce = s, e
-        elif s <= ce:
-            ce = max(ce, e)
-        else:
-            total += ce - cs
-            cs, ce = s, e
-    return total + (ce - cs if cs is not None else 0)
+    """Covered length of the union of `spans` clipped to [lo, hi]. The union
+    algebra is utils.intervals; only the clip window is this function's own."""
+    clipped = [(max(s, lo), min(e, hi)) for s, e in spans if min(e, hi) > max(s, lo)]
+    return int(intervals.union_len(clipped))
 
 
 def pause_stats(pfc: ns3.PfcLog, bn: Bottleneck, topo: Topology,
@@ -321,10 +303,9 @@ def ttft_end_of_prefill(tag: str, p: paths.SweepPaths) -> dict:
     if df is None:
         warn(f"{tag}: no readable stats_sys*.csv under {adir}; TTFT unavailable.")
         return {}
-    ft = df.loc[(df["op_class"] == "FIRSTTOK") & (df["comm_role"] == "send"),
-                "start_tick"]
-    if len(ft):
-        return {"ttft_ns": float(ft.max())}
+    inst = astra.firsttok_send_instant(df)
+    if inst is not None:
+        return {"ttft_ns": inst}
     pre = df.loc[(df["op_class"] == "COMP") & (df["phase"] == "prefill"),
                  "end_tick"]
     if len(pre):
@@ -441,7 +422,7 @@ def bn_time_series(kv_bn: pd.DataFrame, lo: int, hi: int,
     np.add.at(bytes_per_bucket, idx, kv_bn["size"].to_numpy(dtype=float))
     gbps = bytes_per_bucket * 8.0 / widths        # bytes/ns * 8 = bit/ns = Gbit/s
     centres = (edges[:-1] + edges[1:]) / 2
-    t_conc, conc = flowlib.concurrency_series(flowlib.intervals(kv_bn))
+    t_conc, conc = flowlib.concurrency_series(flowlib.flow_spans(kv_bn))
     return (centres, gbps), (t_conc, conc)
 
 
@@ -463,7 +444,7 @@ def link_metrics(kv: pd.DataFrame, bn: Bottleneck, topo: Topology,
     ls.qmean_bytes = float(qlen.port_mean.get((bn.switch, bn.egress_port), NAN))
     if buffer_bytes and pd.notna(ls.qpeak_bytes):
         ls.qpeak_pct = 100 * ls.qpeak_bytes / buffer_bytes
-    ls.conc_peak, ls.conc_mean = flowlib.concurrency_stats(flowlib.intervals(kv_bn))
+    ls.conc_peak, ls.conc_mean = flowlib.concurrency_stats(flowlib.flow_spans(kv_bn))
     pstats = pause_stats(pfc, bn, topo, lo, hi)
     ls.pause_frames = pstats["pause_frames_bn"]
     ls.pause_pct_of_window = pstats["pause_pct_of_window"]
