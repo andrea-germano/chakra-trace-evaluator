@@ -37,10 +37,11 @@ Seven figures, each answering one part of that:
     03  LINK BANDWIDTH/CONCURRENCY every link any KV flow crosses (not just the
                                    one deepest-queue bottleneck), ranked: does
                                    ONLY the measured link suffer, or several?
-    04  KV THROUGHPUT & PAUSES    binned KV throughput(t) at the top-ranked
-                                   link, one panel per buffer value, with PFC
-                                   PAUSE spans shaded -- the direct picture of
-                                   "not smooth, stalls in step with PAUSE".
+    04  THROUGHPUT / BUFFER(t)    binned KV throughput(t) at the top-ranked link
+                                   (top row) over that switch's buffer occupancy
+                                   (bottom row, % of BUFFER_SIZE), one column per
+                                   buffer value, PFC PAUSE spans shaded on both --
+                                   throughput dips line up with a full buffer.
     05  QUEUE(t) PER SWITCH        a grid (rows=switch, cols=buffer), with PFC
                                    PAUSE spans shaded.
     06  OCCUPANCY vs BUFFER        is the added buffer actually used, per switch.
@@ -48,6 +49,8 @@ Seven figures, each answering one part of that:
                                    multiples of TTFT rather than absolute ms,
                                    since TTFT itself now moves with the buffer
                                    (via the skew chain) instead of being flat.
+    08  PFC COUNT vs BUFFER        the raw PAUSE-frame count at the bottleneck,
+                                   one point per buffer -- just the "how many".
 
 Everything is measured, nothing fitted (same discipline as utils.pp):
 fct.txt / pfc.txt / qlen.txt plus, for TTFT, this run's ASTRA-sim trace.
@@ -162,16 +165,19 @@ class Row:
     pp_last_ns: float = NAN
     pp_stage: object = None               # destination stage of the worst wave
     pp_n_waves: int = 0
-    rs_ar_first_ns: float = NAN           # first GATED all-reduce: completion minus
-                                          # first_ns -- the skew-induced idle stall
-                                          # PLUS the collective itself (the skew shows
-                                          # up as idle time BEFORE the collective, not
-                                          # as a stretched transfer, so this is anchored
-                                          # at first_ns, not at the collective's start)
-    rs_ar_rest_mean_ns: float = NAN       # mean duration of the steady-state all-reduces
-                                          # AFTER the first -- the buffer-independent
-                                          # baseline W the first one is compared against
-    rs_ar_n: int = 0                      # post-wave TP collectives detected
+    # All-reduce metrics come from the ASTRA stats CSV (authoritative per-collective
+    # duration/bytes), for the receiving stage's PREFILL TP all-reduce.
+    rs_ar_first_ns: float = NAN           # duration of the GATED all-reduce (the
+                                          # receiving stage's first, skew-stalled)
+    rs_ar_rest_mean_ns: float = NAN       # mean duration of the steady-state ones
+    rs_ar_first_bw: float = NAN           # gated all-reduce effective bw (bytes/ns
+                                          # = GB/s): comm_size / duration
+    rs_ar_rest_bw: float = NAN            # steady-state effective bw (mean)
+    rs_ar_first_stage_bw: float = NAN     # effective bw of the FIRST prefill stage's
+                                          # all-reduce (stage 0, ungated -- starts
+                                          # immediately); the reference the steady
+                                          # receiving-stage bw is compared against
+    rs_ar_n: int = 0                      # receiving-stage prefill TP collectives
 
     # -- 02 KV skew / smoothness ---------------------------------------------- #
     kv_ready_min_ns: float = NAN
@@ -317,73 +323,60 @@ def ttft_end_of_prefill(tag: str, p: paths.SweepPaths) -> dict:
     return {}
 
 
-def tp_collectives(starts: np.ndarray, arrivals: np.ndarray,
-                   gap_k: float = 5.0, min_gap_ns: float = 1e5) -> list[tuple]:
-    """Group a stage's intra-stage TP flows into individual all-reduce
-    collectives, by gaps in their send times. fct.txt does not label which
-    collective a flow belongs to, but the receiving stage runs one all-reduce
-    per prefill layer, each a tight burst of TP chunks separated from the next
-    by an idle gap; a gap larger than gap_k x the median inter-flow gap (floored
-    at min_gap_ns to survive a near-uniform stream) starts a new collective.
-    Returns [(start, end)] per collective, sorted by start."""
-    if len(starts) == 0:
-        return []
-    order = np.argsort(starts)
-    st, ar = starts[order], arrivals[order]
-    if len(st) == 1:
-        return [(float(st[0]), float(ar[0]))]
-    gaps = np.diff(st)
-    thr = max(gap_k * float(np.median(gaps)), min_gap_ns)
-    bnds = np.where(gaps > thr)[0]
-    segs = np.split(np.arange(len(st)), bnds + 1)
-    return [(float(st[s[0]]), float(ar[s].max())) for s in segs]
+def rs_allreduce_stats(adf: pd.DataFrame | None, placement: Placement, ppr) -> dict:
+    """The prefill TP all-reduce, read from the ASTRA stats CSV (the authoritative
+    per-collective duration and bytes -- the ns-3 fct.txt only sees the on-wire
+    bursts, which under-count the collective's wall-clock ~10x).
 
+    Reported as EFFECTIVE BANDWIDTH, comm_size / duration in bytes/ns (= GB/s,
+    the CSV's own bw_bytes_per_ns), for three all-reduces:
 
-def rs_allreduce_stats(f: pd.DataFrame, placement: Placement, ppr) -> dict:
-    """The receiving stage's post-wave all-reduce behaviour, split into the
-    FIRST (skew-gated) collective and the STEADY-STATE mean of the rest.
+        rs_ar_first_bw        the receiving stage's FIRST prefill all-reduce --
+                              the one gated by the PP wave, so its duration is
+                              stretched by the skew stall and its effective bw is
+                              depressed. rs_ar_first_ns keeps its raw duration.
+        rs_ar_rest_bw         the mean over that stage's remaining (steady-state)
+                              all-reduces -- flat, buffer-independent.
+        rs_ar_first_stage_bw  the FIRST prefill stage's all-reduce (stage 0), which
+                              starts immediately and is never gated: the reference
+                              the steady receiving-stage bw is compared against.
 
-    utils.pp says the collective is 'RS gated on the local wake, AG on
-    max(Delta, W)'. The consequence, seen on the fabric, is NOT a stretched
-    transfer: every all-reduce moves the same bytes in the same ~W regardless
-    of buffer. The skew Delta instead appears as IDLE TIME -- the early-fed rank
-    finishes its share at first_ns but the collective cannot complete until the
-    straggler lands at first_ns+Delta, so the first gated all-reduce sits idle
-    for ~Delta before it can finish. So:
-
-        rs_ar_first_ns    = completion of the first collective that finishes
-                            AFTER the straggler (last_ns), minus first_ns:
-                            the stall (~Delta) PLUS the collective (~W). This is
-                            the number that should move with the buffer.
-        rs_ar_rest_mean_ns = mean (end-start) of every collective after it:
-                            the steady-state W, which should be flat -- the
-                            control that proves the first one's motion is the
-                            skew and not a global slowdown.
-
-    All NaN/0 when there is no wave (PP=1) or no intra-stage TP flow (TP=1)."""
-    out = {"rs_ar_first_ns": NAN, "rs_ar_rest_mean_ns": NAN, "rs_ar_n": 0}
-    if not ppr.available or ppr.stage is None:
+    Stages are the ASTRA `ss` field. All NaN/0 with no ASTRA run, no wave (PP=1),
+    or no prefill TP (TP=1)."""
+    out = {"rs_ar_first_ns": NAN, "rs_ar_rest_mean_ns": NAN, "rs_ar_n": 0,
+           "rs_ar_first_bw": NAN, "rs_ar_rest_bw": NAN, "rs_ar_first_stage_bw": NAN}
+    if adf is None or not ppr.available or ppr.stage is None:
         return out
-    if not (0 <= ppr.stage < len(placement.prefill)):
+    tp = adf[(adf["op_class"] == "TP") & (adf["phase"] == "prefill")]
+    if not len(tp) or "ss" not in tp.columns:
         return out
-    stage_ranks = set(placement.prefill[ppr.stage])
-    tp = f[(f["flow_class"] == "tp") & f["src"].isin(stage_ranks)
-          & f["dst"].isin(stage_ranks)]
-    if not len(tp):
+    keys = [c for c in ("pl", "ss", "L", "it", "op") if c in tp.columns]
+    # One row per collective: slowest shard sets the wall-clock duration, comm_size
+    # is the identical per-rank payload. bw is the CSV's effective rate for that
+    # collective (bytes moved / how long it took).
+    g = (tp.groupby(keys, dropna=False)
+           .agg(start=("start_tick", "min"), dur=("duration", "max"),
+                cs=("comm_size", "first")).reset_index())
+    g = g[g["dur"] > 0].copy()
+    if g.empty:
         return out
-    cols = tp_collectives(tp["start"].to_numpy(dtype=float),
-                          tp["arrival"].to_numpy(dtype=float))
-    # The first all-reduce genuinely gated by THIS wave is the first collective
-    # that COMPLETES at/after the straggler's arrival (last_ns); any collective
-    # ending before that finished without ever waiting on the wave.
-    gated = [(c0, c1) for (c0, c1) in cols if c1 >= ppr.last_ns]
-    if not gated:
+    g["bw"] = g["cs"] / g["dur"]                       # bytes/ns = GB/s
+    g["ss"] = pd.to_numeric(g["ss"], errors="coerce")
+
+    recv = g[g["ss"] == ppr.stage].sort_values("start")
+    if recv.empty:
         return out
-    out["rs_ar_first_ns"] = gated[0][1] - ppr.first_ns
-    out["rs_ar_n"] = len(gated)
-    rest = [c1 - c0 for (c0, c1) in gated[1:]]
-    if rest:
-        out["rs_ar_rest_mean_ns"] = float(np.mean(rest))
+    first = recv.iloc[0]
+    out["rs_ar_first_bw"] = float(first["bw"])
+    out["rs_ar_first_ns"] = float(first["dur"])
+    out["rs_ar_n"] = int(len(recv))
+    rest = recv.iloc[1:]
+    if len(rest):
+        out["rs_ar_rest_bw"] = float(rest["bw"].mean())
+        out["rs_ar_rest_mean_ns"] = float(rest["dur"].mean())
+    first_stage = g[g["ss"] == 0]
+    if len(first_stage):
+        out["rs_ar_first_stage_bw"] = float(first_stage["bw"].mean())
     return out
 
 
@@ -556,11 +549,15 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
     row.pp_last_ns = ppr.last_ns
     row.pp_stage = ppr.stage
     row.pp_n_waves = ppr.n_waves
-    for k, v in rs_allreduce_stats(f, placement, ppr).items():
+    # All-reduce bandwidths come from the ASTRA stats CSV (per-collective duration
+    # and bytes), not the ns-3 fabric flows -- see rs_allreduce_stats.
+    adir = p.astra_run(tag)
+    adf = astra.read_run(adir) if adir.is_dir() else None
+    for k, v in rs_allreduce_stats(adf, placement, ppr).items():
         setattr(row, k, v)
-    if ppr.available and pd.isna(row.rs_ar_first_ns):
-        warn(f"{tag}: no post-arrival TP all-reduce found for the receiving "
-             f"stage {ppr.stage}; rs_ar_first_ns unavailable.")
+    if ppr.available and pd.isna(row.rs_ar_first_bw):
+        warn(f"{tag}: no prefill TP all-reduce in the ASTRA stats for the "
+             f"receiving stage {ppr.stage}; all-reduce bandwidths unavailable.")
 
     row.kv_rank_series = kv_rank_series(kv, placement)
 
@@ -621,31 +618,41 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
     # each panel keeps its own autoscaled scale. Order = causal order:
     # buffer -> PFC/PAUSE -> PP skew -> receiving-stage all-reduce -> TTFT.
     if s["ttft_ns"].notna().any():
+        # each panel: (ylabel, [(series, color, style, label), ...])
         panels = []
         if s["pp_skew_ns"].notna().any():
-            panels.append((s["pp_skew_ns"] / 1e3, "PP arrival skew (µs)",
-                           CORAL, "s--"))
-        if s["rs_ar_first_ns"].notna().any():
-            panels.append((s["rs_ar_first_ns"] / 1e3,
-                           "First gated all-reduce (µs)",
-                           VIOLET, "^:"))
-        if s["rs_ar_rest_mean_ns"].notna().any():
-            panels.append((s["rs_ar_rest_mean_ns"] / 1e3,
-                           "Steady-state all-reduce (µs)",
-                           GREEN, "D-."))
-        panels.append((s["ttft_ns"] * MS, "TTFT (ms)", BLUE, "o-"))
+            panels.append(("PP arrival skew (µs)",
+                           [(s["pp_skew_ns"] / 1e3, CORAL, "s--", None)]))
+        # All-reduce panels are EFFECTIVE BANDWIDTH (bytes/ns = GB/s) from the
+        # ASTRA stats CSV, not duration. The gated one's bw is depressed because
+        # its duration carries the skew stall; the steady one is compared against
+        # the first prefill stage's all-reduce, which starts immediately (ungated).
+        if s["rs_ar_first_bw"].notna().any():
+            panels.append(("Gated all-reduce\neff. bw (GB/s)",
+                           [(s["rs_ar_first_bw"], VIOLET, "^:", None)]))
+        steady = []
+        if s["rs_ar_rest_bw"].notna().any():
+            steady.append((s["rs_ar_rest_bw"], GREEN, "D-.", "receiving stage (steady)"))
+        if s["rs_ar_first_stage_bw"].notna().any():
+            steady.append((s["rs_ar_first_stage_bw"], BLUE, "o--", "first prefill stage"))
+        if steady:
+            panels.append(("Steady all-reduce\neff. bw (GB/s)", steady))
+        panels.append(("TTFT (ms)", [(s["ttft_ns"] * MS, BLUE, "o-", None)]))
 
         n = len(panels)
         fig, axes = plt.subplots(n, 1, sharex=True,
                                  figsize=(8.5, 2.0 * n + 1.0))
         axes = np.atleast_1d(axes)
-        for i, (series, ylabel, color, style) in enumerate(panels):
+        for i, (ylabel, curves) in enumerate(panels):
             a = axes[i]
-            a.plot(x, series, style, color=color)
-            _zoom_y(a, series)
+            for series, color, style, label in curves:
+                a.plot(x, series, style, color=color, label=label)
+            _zoom_y(a, pd.concat([c[0] for c in curves]))
             a.set_ylabel(ylabel, fontsize=9)
             a.grid(True, alpha=0.3, which="both")
             logx_pow2(a, s, "buffer_mb", "Per-switch buffer (MiB)")
+            if any(c[3] for c in curves):
+                a.legend(fontsize=7, loc="best")
             if i != n - 1:
                 a.set_xlabel("")
         fig.suptitle("Does PP skew propagate into TTFT?", y=0.99)
@@ -704,32 +711,46 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
         fig.suptitle("Congestion across every KV-crossed link", y=1.02)
         save_fig(fig, outdir, "03_link_bandwidth_and_concurrency.png", written)
 
-    # 04 KV THROUGHPUT(t) & PFC PAUSES AT THE BOTTLENECK --------------------- #
+    # 04 KV THROUGHPUT(t) OVER BOTTLENECK BUFFER OCCUPANCY(t), PFC PAUSES ----- #
+    # Two stacked rows sharing each column's time axis: TOP = KV throughput at
+    # the bottleneck link, BOTTOM = how full that switch's buffer is (% of the
+    # swept BUFFER_SIZE). PFC PAUSE spans are shaded across both, so a throughput
+    # dip, the buffer that has backed up underneath it, and the pause that links
+    # them line up vertically -- the direct picture of "stalls in step with a
+    # full buffer / PAUSE". (The old thin twin-axis line was per-flow CONCURRENCY,
+    # not throughput; it answered "how many flows" and only muddied this figure.)
     bn_runs = [r for r in runs if r.bn_throughput_series and len(r.bn_throughput_series[0])]
     if bn_runs:
+        bn_sw = int(rows[0].bottleneck.split("->")[0])
         ncols = len(bn_runs)
-        fig, axes = plt.subplots(1, ncols, figsize=(max(3.0 * ncols, 6), 4.3),
-                                 sharey=True)
-        axes = np.atleast_1d(axes)
+        fig, axes = plt.subplots(2, ncols, squeeze=False, sharex="col", sharey="row",
+                                 figsize=(max(3.0 * ncols, 6), 5.4),
+                                 gridspec_kw={"height_ratios": [2, 1]})
         for j, r in enumerate(bn_runs):
-            a = axes[j]
+            top, bot = axes[0][j], axes[1][j]
+            # top: KV throughput at the bottleneck link
             t, gbps = r.bn_throughput_series
-            a.fill_between(t * MS, gbps, color=BLUE, alpha=0.6, step="mid")
-            if r.bn_concurrency_series and len(r.bn_concurrency_series[0]):
-                a2 = a.twinx()
-                tc, cc = r.bn_concurrency_series
-                a2.step(tc * MS, cc, where="post", color=MUTED, lw=0.8, alpha=0.7)
-                a2.set_ylim(bottom=0)
-                if j != ncols - 1:
-                    a2.set_yticklabels([])
+            top.fill_between(np.asarray(t) * MS, gbps, color=BLUE, alpha=0.6, step="mid")
+            top.set_title(f"{r.buffer_mb:g} MiB", fontsize=9)
+            top.grid(True, alpha=0.3)
+            # bottom: bottleneck switch buffer occupancy, as % of the buffer size
+            q = r.qseries.get(bn_sw)
+            if q and r.buffer_bytes:
+                ts, ys = q
+                occ = np.asarray(ys) / r.buffer_bytes * 100.0
+                bot.fill_between(np.asarray(ts) * MS, occ, color=VIOLET, alpha=0.5, step="mid")
+                bot.plot(np.asarray(ts) * MS, occ, color=VIOLET, lw=0.6, alpha=0.8)
+            bot.set_ylim(0, 100)
+            bot.set_xlabel("Time (ms)", fontsize=8)
+            bot.grid(True, alpha=0.3)
+            # PFC PAUSE spans on both rows
             for s0, e0 in r.bn_pause_intervals:
-                a.axvspan(s0 * MS, e0 * MS, color=CORAL, alpha=0.25, lw=0)
-            a.set_title(f"{r.buffer_mb:g} MiB", fontsize=9)
-            a.set_xlabel("Time (ms)", fontsize=8)
-            a.grid(True, alpha=0.3)
-        axes[0].set_ylabel("KV throughput (Gb/s)")
-        fig.suptitle(f"KV throughput over time at the bottleneck ({rows[0].bottleneck})",
-                    y=1.02)
+                for a in (top, bot):
+                    a.axvspan(s0 * MS, e0 * MS, color=CORAL, alpha=0.25, lw=0)
+        axes[0][0].set_ylabel("KV throughput\n(Gb/s)", fontsize=9)
+        axes[1][0].set_ylabel(f"Buffer occupancy\nswitch {bn_sw} (% of buffer)", fontsize=9)
+        fig.suptitle(f"KV throughput over bottleneck buffer occupancy ({rows[0].bottleneck})"
+                     "  —  shaded = PFC PAUSE", y=1.01)
         save_fig(fig, outdir, "04_kv_throughput_and_pauses.png", written)
 
     # 05 QUEUE OCCUPANCY(t) PER SWITCH, WITH PFC PAUSES ---------------------- #
@@ -813,6 +834,19 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
         _finish(fig, ax, s, outdir, "07_ttft_normalised_decode_cost.png",
                 "Decode start relative to TTFT",
                 "Decode start (×TTFT)", written, extra_axes=(ax2,))
+
+    # 08 PFC PAUSE-FRAME COUNT vs BUFFER ------------------------------------- #
+    # Just the raw number of PAUSE frames the bottleneck's ingress received,
+    # one point per buffer value. Plots 04/05 show WHEN pauses happen; this is
+    # the single scalar "how many", so the buffer -> backpressure trend reads
+    # off one line. link0 is the measured bottleneck (see chosen_labels[0]).
+    if "link0_pause_frames" in s.columns and s["link0_pause_frames"].notna().any():
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(x, s["link0_pause_frames"], "o-", color=CORAL,
+               label="PFC PAUSE frames (bottleneck)")
+        _finish(fig, ax, s, outdir, "08_pfc_pause_frame_count.png",
+                "PFC PAUSE frames at the bottleneck",
+                "PAUSE frames (count)", written)
 
     return written
 

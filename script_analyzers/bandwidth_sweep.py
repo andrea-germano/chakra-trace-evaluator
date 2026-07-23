@@ -83,12 +83,16 @@ therefore corrupted three things at once:
              min(start_tick) was 0;
     duration kv_mean_duration_ns averaged real send times with wait times.
 
-The window error dominates, and it does not merely shift kv_agg_bw -- it FLATTENS
-it. On a synthetic sweep with a known answer (aggregate must equal the nominal bx)
-the old metric read 12.2 / 13.9 / 15.0 / 15.5 / 15.9 for bx = 25..400: a 1.3x
-spread over a 16x range of nominal bandwidth, i.e. "the fabric does not scale".
-The size of the error is workload-dependent (it is the ratio of prefill compute to
-transfer time), so it cannot be corrected after the fact.
+Dropping the recv rows is what makes kv_window_ns, kv_mean_duration_ns and the
+per-transfer rate kv_mean_link_bw measure the wire rather than the schedule.
+
+A fabric-wide aggregate rate (total bytes / global window) used to be surfaced too,
+but it was removed: with no per-link path info in the ASTRA CSVs it sums every
+parallel KV flow into one numerator over one window, so with K concurrent transfers
+it reads ~K x a single link's nominal rate and looks like it beats the wire. The
+link-bounded view is kv_mean_link_bw (each transfer's own bytes/duration), which
+sits at ~0.99x nominal on saturated links. For a true per-link delivered rate use
+buffer_sweep.py's link_metrics (it has the ns-3 path info this sweep lacks).
 
 ``astra.sends()`` keeps the send side of every point-to-point class and
 ``astra.collapse_collectives()`` keeps one representative per TP all-reduce;
@@ -202,11 +206,15 @@ def summarise_run(df: pd.DataFrame) -> dict:
     # ---- KV-cache transfer ------------------------------------------------- #
     kv = astra.sends(df, kv_mask)
     out["kv_count"] = len(kv)                          # transfers, not CSV rows
-    kv_bytes, kv_window, kv_agg = _win_bw(kv)
+    # _win_bw's aggregate rate (bytes / global window) is deliberately NOT stored:
+    # it sums bytes across every KV flow on every parallel link into one number, so
+    # with K concurrent transfers it reads ~K x a single link's rate and looks like
+    # it exceeds the wire. The per-transfer rate below (kv_mean_link_bw) is the one
+    # actually bounded by the link. Bytes and window are still first-order and kept.
+    kv_bytes, kv_window, _ = _win_bw(kv)
     out["kv_total_bytes"] = kv_bytes
     out["kv_total_GB"] = kv_bytes / 1e9 if pd.notna(kv_bytes) else np.nan
     out["kv_window_ns"] = kv_window
-    out["kv_agg_bw_bytes_per_ns"] = kv_agg            # delivered aggregate throughput
     out["kv_mean_link_bw"] = kv["bw_bytes_per_ns"].mean() if len(kv) else np.nan
     out["kv_mean_duration_ns"] = kv["duration"].mean() if len(kv) else np.nan
     out["kv_max_duration_ns"] = kv["duration"].max() if len(kv) else np.nan
@@ -231,10 +239,9 @@ def summarise_run(df: pd.DataFrame) -> dict:
     for label, mask in (("pp", pp_mask), ("pp_prefill", pp_pre_mask),
                         ("pp_decode", pp_dec_mask)):
         sub = astra.sends(df, mask)
-        b, w, agg = _win_bw(sub)
+        b, w, _ = _win_bw(sub)                        # aggregate rate dropped (see kv note)
         out[f"{label}_count"] = len(sub)
         out[f"{label}_total_bytes"] = b
-        out[f"{label}_agg_bw_bytes_per_ns"] = agg
         out[f"{label}_mean_link_bw"] = sub["bw_bytes_per_ns"].mean() if len(sub) else np.nan
         out[f"{label}_mean_duration_ns"] = sub["duration"].mean() if len(sub) else np.nan
         out[f"{label}_total_busy_ns"] = sub["duration"].sum(min_count=1) if len(sub) else np.nan
@@ -323,9 +330,11 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
     save(fig, "01_phase_completion_vs_bandwidth.png")
 
     # 2) KV effective bandwidth vs nominal ---------------------------------- #
+    # Per-transfer wire rate only. The fabric-wide aggregate (bytes / global
+    # window) was removed: it sums every parallel KV link into one number and so
+    # sits at ~concurrency x a single link, which reads as "faster than the wire".
     fig, ax = plt.subplots(figsize=(8, 5))
-    plot_series(ax, s, "bandwidth", "kv_agg_bw_bytes_per_ns", "KV aggregate delivered", marker="o")
-    plot_series(ax, s, "bandwidth", "kv_mean_link_bw", "KV mean per-transfer", marker="s", linestyle="--")
+    plot_series(ax, s, "bandwidth", "kv_mean_link_bw", "KV mean per-transfer", marker="s")
     bmin, bmax = s["bandwidth"].min(), s["bandwidth"].max()
     # bandwidth is bx, written into physical_topology.txt as Gbps; the y-axis is
     # bw_bytes_per_ns (GB/s decimal) -- an 8x unit gap, so "ideal" is bx/8, not bx.
@@ -352,14 +361,13 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
     save(fig, "03_kv_transfer_time.png")
 
     # 4) PP effective bandwidth (prefill vs decode) ------------------------- #
-    if s[["pp_prefill_agg_bw_bytes_per_ns", "pp_decode_agg_bw_bytes_per_ns"]].notna().any().any():
+    # Per-transfer wire rate only; the fabric-wide aggregate was removed (see 2).
+    if s[["pp_prefill_mean_link_bw", "pp_decode_mean_link_bw"]].notna().any().any():
         fig, ax = plt.subplots(figsize=(8, 5))
-        plot_series(ax, s, "bandwidth", "pp_prefill_agg_bw_bytes_per_ns", "PP prefill (aggregate)", marker="o")
-        plot_series(ax, s, "bandwidth", "pp_decode_agg_bw_bytes_per_ns", "PP decode (aggregate)", marker="s")
         plot_series(ax, s, "bandwidth", "pp_prefill_mean_link_bw", "PP prefill (per-transfer)",
-                marker="^", linestyle="--")
+                marker="^")
         plot_series(ax, s, "bandwidth", "pp_decode_mean_link_bw", "PP decode (per-transfer)",
-                marker="v", linestyle="--")
+                marker="v")
         bmin, bmax = s["bandwidth"].min(), s["bandwidth"].max()
         ax.plot([bmin, bmax],
                 [bmin * BANDWIDTH_GBPS_TO_BYTES_PER_NS, bmax * BANDWIDTH_GBPS_TO_BYTES_PER_NS],
@@ -504,9 +512,9 @@ def main(argv: list[str] | None = None) -> int:
 
         pd.set_option("display.width", 180)
         report = [c for c in ["bandwidth", "makespan_ms", "kv_over_prefill_compute",
-                              "kv_agg_bw_bytes_per_ns", "kv_mean_duration_ns",
-                              "pp_prefill_agg_bw_bytes_per_ns",
-                              "pp_decode_agg_bw_bytes_per_ns"] if c in summary.columns]
+                              "kv_mean_link_bw", "kv_mean_duration_ns",
+                              "pp_prefill_mean_link_bw",
+                              "pp_decode_mean_link_bw"] if c in summary.columns]
         print("\n================ BANDWIDTH SWEEP ================")
         print(summary[report].to_string(index=False))
         print(f"\nWrote {outdir}:")
