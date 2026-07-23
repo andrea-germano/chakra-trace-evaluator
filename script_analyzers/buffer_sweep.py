@@ -533,14 +533,24 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
     row.bn_throughput_series, row.bn_concurrency_series = bn_time_series(kv_bn, lo, hi)
     row.bn_pause_intervals = victim_pause_intervals(pfc, bn, topo, clamp_to=run_end)
 
-    for k, v in barrier(kv, placement).items():
+    # KV arrival, PP skew and all-reduce metrics all read the ASTRA stats CSV
+    # (per-op end_tick = arrival, cleanly labelled by op/stage/iteration) rather
+    # than reconstructing them from fct.txt flows -- identical nanosecond values,
+    # none of the flow classification / send-recv dedup / wave-grouping heuristics.
+    # (Queue occupancy, PFC and per-physical-link stats above stay on ns-3: ASTRA
+    # has no equivalent.)
+    adir = p.astra_run(tag)
+    adf = astra.read_run(adir) if adir.is_dir() else None
+    kv_arr = astra.kv_arrivals(adf)
+
+    for k, v in barrier(kv_arr, placement).items():
         setattr(row, k, v)
     row.kv_gate_over_ttft = (row.kv_gate_ns / row.ttft_ns
                              if pd.notna(row.ttft_ns) and row.ttft_ns > 0 else NAN)
 
-    ppr = pp.measure(f, placement)
+    ppr = pp.measure(adf)
     if not ppr.available:
-        warn(f"{tag}: no inter-stage PP-prefill flow found; the causal-chain "
+        warn(f"{tag}: no inter-stage PP-prefill activation found; the causal-chain "
              f"figure will be empty for this run. (PP=1, or placement has "
              f"one prefill stage.)")
     row.pp_skew_ns = ppr.skew_ns
@@ -549,17 +559,13 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
     row.pp_last_ns = ppr.last_ns
     row.pp_stage = ppr.stage
     row.pp_n_waves = ppr.n_waves
-    # All-reduce bandwidths come from the ASTRA stats CSV (per-collective duration
-    # and bytes), not the ns-3 fabric flows -- see rs_allreduce_stats.
-    adir = p.astra_run(tag)
-    adf = astra.read_run(adir) if adir.is_dir() else None
     for k, v in rs_allreduce_stats(adf, placement, ppr).items():
         setattr(row, k, v)
     if ppr.available and pd.isna(row.rs_ar_first_bw):
         warn(f"{tag}: no prefill TP all-reduce in the ASTRA stats for the "
              f"receiving stage {ppr.stage}; all-reduce bandwidths unavailable.")
 
-    row.kv_rank_series = kv_rank_series(kv, placement)
+    row.kv_rank_series = kv_rank_series(kv_arr, placement)
 
     for sw, (ts, ys) in qlen.switch_series.items():
         if len(ts) == 0:

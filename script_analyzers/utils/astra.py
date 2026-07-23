@@ -299,6 +299,52 @@ def unique_transfers(df: pd.DataFrame, op_class: str) -> pd.DataFrame:
     return sends(df, mask)
 
 
+def kv_arrivals(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per KV transfer AT ITS RECEIVING RANK, columns dst, arrival, size --
+    the same shape the fct.txt-based KV frame used, so barrier() / kv_rank_series()
+    / kv_stage_skew() consume it unchanged, only sourced from ASTRA.
+
+    From the recv side (op_class KV, comm_role recv): sys_id is the receiver and
+    end_tick the delivery instant. A recv row is pre-posted at the run origin, so
+    its start_tick/duration are wait-dominated -- but end_tick is the real arrival,
+    and equals the ns-3 fct arrival (start+fct), verified to the nanosecond. This
+    drops the placement-based flow classification, MTU heuristic and incast
+    dst-rank matching the fct path needed. Empty frame if roles were not resolved."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["dst", "arrival", "size"])
+    kv = df[df["op_class"] == "KV"]
+    if "comm_role" not in kv.columns or not (kv["comm_role"] == "recv").any():
+        return pd.DataFrame(columns=["dst", "arrival", "size"])
+    kv = kv[kv["comm_role"] == "recv"]
+    return pd.DataFrame({"dst": kv["sys_id"].astype(int),
+                         "arrival": kv["end_tick"].astype(float),
+                         "size": kv["comm_size"].astype(float)})
+
+
+def pp_arrivals(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per inter-stage PP-prefill activation AT ITS RECEIVING RANK, columns
+    dst_stage, wave, dst, arrival -- the shape utils.pp.wave_skew consumes.
+
+    From the recv side (op_class PP, phase prefill, comm_role recv): sys_id is the
+    receiver, end_tick the arrival, `ds` the destination stage, and the name's `it`
+    is the wave index DIRECTLY -- no sort-by-start cumcount heuristic, no inter-stage
+    src!=dst guard, no TP-vs-PP size/hops split. Empty frame if roles unresolved."""
+    cols = ["dst_stage", "wave", "dst", "arrival"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    pp = df[(df["op_class"] == "PP") & (df["phase"] == "prefill")]
+    if pp.empty or "comm_role" not in pp.columns or not (pp["comm_role"] == "recv").any():
+        return pd.DataFrame(columns=cols)
+    pp = pp[pp["comm_role"] == "recv"]
+    out = pd.DataFrame({
+        "dst_stage": pd.to_numeric(pp["ds"], errors="coerce"),
+        "wave": pd.to_numeric(pp["it"], errors="coerce"),
+        "dst": pp["sys_id"].astype(int),
+        "arrival": pp["end_tick"].astype(float)})
+    out = out.dropna(subset=["dst_stage", "wave"])
+    return out.astype({"dst_stage": int, "wave": int}).reset_index(drop=True)
+
+
 def firsttok_send_instant(df: pd.DataFrame) -> float | None:
     """The first-token handoff instant: the START of the FIRSTTOK send.
 

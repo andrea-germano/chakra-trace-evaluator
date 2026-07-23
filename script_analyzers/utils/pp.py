@@ -13,40 +13,33 @@ then propagates to KV readiness. The buffer moves Delta via the PFC/DCQCN regime
 on the oversubscribed uplink; Delta moves everything else. So Delta(buffer) is the
 curve that explains the sweep, and it is not drawn today.
 
-What a PP activation is, on T1, and how it is told apart from TP
+What a PP activation is, and how it is identified
 --------------------------------------------------------------------------------
-Between prefill ranks fct.txt holds two very different populations:
-
-    41 943 040 B, 80 per ordered pair, hops == 1   -> TP all-reduce chunks
-                                                      (INTRA-stage, dedicated link)
-    83 886 080 B,  1 per ordered pair, hops  > 1   -> PP activation handoff
-                                                      (INTER-stage, over the fabric)
-
-The PP activation is the INTER-stage flow: source rank in stage i, destination
-rank in stage i+1. utils.flows already labels these 'pp_prefill'; on top of that
-we keep only the ones that actually cross stages (src_stage != dst_stage), which
-drops any same-stage flow that a coarse role check would let through. The 40 MiB
-TP chunks are hops==1 and classed 'tp', so they never enter here — but the
-inter-stage test is the belt-and-braces that makes this robust if a future
-topology puts a TP group behind a switch.
+The PP activation is the inter-stage handoff: a prefill rank in stage i sends its
+output to a rank in stage i+1. In the ASTRA stats CSV it is an op with op_class
+'PP' and phase 'prefill'; the op name carries `ss` (source stage), `ds` (dest
+stage) and `it` (iteration) directly, so no size/hops discrimination against the
+intra-stage TP chunks and no src!=dst guard are needed -- the classification the
+fct.txt path had to reconstruct is already in the name.
 
 The skew, precisely
 --------------------------------------------------------------------------------
 A wave is the set of PP activations that feed the SAME destination stage in the
-SAME iteration. For that wave:
+SAME iteration `it`. For that wave:
 
     Delta = max_r arrival[r] - min_r arrival[r]     over the destination ranks
 
 the synchronisation cost: how long the earliest-fed rank of the receiving stage
 waits for the latest before its all-reduce can progress. On T1 there is one wave
-per (dst_stage, it) — e.g. {0->2, 1->3} feeding stage 1 — so Delta is exactly the
-rank-2-vs-rank-3 arrival gap we traced by hand (44 us at 16 MB, 163 us at 8 MB).
-Multiple waves (deeper pipelines, more iterations) are reported per wave and the
-worst is the headline.
+per (dst_stage, it) — e.g. {0->2, 1->3} feeding stage 1. Multiple waves (deeper
+pipelines, more iterations) are reported per wave and the worst is the headline.
 
-Measured on the fabric, never in the schedule: arrival = start + fct from
-fct.txt. The ASTRA schedule is not used (pre-posted RECVs sit at tick 0). Nothing
-is fitted; empty input yields empty output.
+Source: the ASTRA stats CSV (utils.astra.pp_arrivals), recv side -- sys_id is the
+receiving rank and end_tick its arrival, which equals the ns-3 fct arrival
+(start+fct) to the nanosecond but comes pre-classified by op/stage/iteration, so
+the wave index is `it` itself rather than a sort-by-start cumcount heuristic. The
+recv start_tick/duration are wait-dominated (pre-posted at the origin) and unused;
+only end_tick is read. Nothing is fitted; empty input yields empty output.
 """
 
 from __future__ import annotations
@@ -55,7 +48,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from .roles import Placement
+from . import astra
 
 NAN = float("nan")
 
@@ -73,53 +66,6 @@ class PPResult:
     n_waves: int = 0
     waves: object = field(default=None)     # per-wave DataFrame
     arrivals: object = field(default=None)  # per-flow DataFrame
-
-
-def _stage_of_rank(placement: Placement) -> dict[int, int]:
-    """rank -> prefill stage index (only prefill ranks appear)."""
-    m: dict[int, int] = {}
-    for stage_idx, ranks in enumerate(placement.prefill):
-        for r in ranks:
-            m[int(r)] = stage_idx
-    return m
-
-
-def pp_prefill_arrivals(flows: pd.DataFrame, placement: Placement) -> pd.DataFrame:
-    """One row per INTER-stage PP-prefill activation, fabric-timed.
-
-    `flows` is utils.flows.annotate output. We keep flow_class == 'pp_prefill'
-    (drops tp, kv, ctrl), then require src_stage != dst_stage so only true
-    inter-stage activations remain. A per-wave index is attached: the flows into
-    one (dst_stage) are ordered by start and numbered, so the k-th activation
-    into each destination rank of a stage forms wave k. On T1 (one activation
-    per stage) this makes exactly one wave; deeper pipelines get one per handoff.
-
-    Columns: src, dst (ranks), src_stage, dst_stage, wave, start, arrival (ns).
-    Empty frame with those columns when there is no inter-stage pp_prefill flow.
-    """
-    cols = ["src", "dst", "src_stage", "dst_stage", "wave", "start", "arrival"]
-    if flows is None or flows.empty or "flow_class" not in flows.columns:
-        return pd.DataFrame(columns=cols)
-    pp = flows[flows["flow_class"] == "pp_prefill"].copy()
-    if pp.empty:
-        return pd.DataFrame(columns=cols)
-
-    stage = _stage_of_rank(placement)
-    pp["src_stage"] = pp["src"].map(stage)
-    pp["dst_stage"] = pp["dst"].map(stage)
-    pp = pp.dropna(subset=["src_stage", "dst_stage"])
-    pp = pp[pp["src_stage"] != pp["dst_stage"]]        # inter-stage only
-    if pp.empty:
-        return pd.DataFrame(columns=cols)
-    pp["src_stage"] = pp["src_stage"].astype(int)
-    pp["dst_stage"] = pp["dst_stage"].astype(int)
-
-    # Wave index: within one destination stage, the k-th activation each of its
-    # ranks receives (ordered by send start) belongs to wave k. Ranks of a stage
-    # get the same number of activations, so this aligns them for the skew.
-    pp = pp.sort_values("start")
-    pp["wave"] = pp.groupby(["dst_stage", "dst"]).cumcount()
-    return pp[cols].reset_index(drop=True)
 
 
 def wave_skew(pp_arr: pd.DataFrame) -> pd.DataFrame:
@@ -143,20 +89,20 @@ def wave_skew(pp_arr: pd.DataFrame) -> pd.DataFrame:
              .reset_index(drop=True)
 
 
-def measure(flows: pd.DataFrame, placement: Placement) -> "PPResult":
-    """PP skew summary for one run, as a typed result.
+def measure(adf: pd.DataFrame) -> "PPResult":
+    """PP skew summary for one run, as a typed result, from the ASTRA stats CSV.
 
     The headline number is `skew_ns`: the worst wave's cross-rank PP arrival
     skew — the Delta that gates the receiving stage's all-reduce. Frames
     (`waves`, `arrivals`) ride along for plotting. `available` is False when no
-    inter-stage PP flow could be timed (PP=1, or a single prefill stage); the
-    caller warns and the PP figures are skipped.
+    inter-stage PP activation could be timed (PP=1, or a single prefill stage);
+    the caller warns and the PP figures are skipped.
 
     Returning a dataclass rather than a dict is deliberate: every field a Row
     stores is named here once, so a new field cannot leak onto Row through a
     blind setattr loop, and mypy/readers see the shape.
     """
-    pp_arr = pp_prefill_arrivals(flows, placement)
+    pp_arr = astra.pp_arrivals(adf)
     waves = wave_skew(pp_arr)
     if waves.empty:
         return PPResult(available=False, waves=waves, arrivals=pp_arr)

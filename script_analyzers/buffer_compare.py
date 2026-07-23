@@ -40,18 +40,25 @@ the raw ns WOULD carry compute scale (a 70B's TTFT and collectives dwarf a
 13B's), so these are made dimensionless -- self-normalised (divided by another
 quantity of the SAME run) or normalised to that model's OWN largest-buffer run:
 
-    ar_first_over_rest   rs_ar_first_ns / rs_ar_rest_mean_ns: the first
-                         (skew-gated) all-reduce measured in units of THIS
-                         model's own steady-state all-reduce. ~1 means the skew
-                         added nothing; >1 is the skew stall.
+    rs_ar_first_bw       the first (skew-gated) all-reduce's EFFECTIVE BANDWIDTH
+                         (comm_size / duration, GB/s), from the ASTRA CSV. The
+                         skew stall shows as the bandwidth collapsing -- the early
+                         rank waits idle at the barrier, so bytes-per-wall-time
+                         drops -- with the ungated wire rate as the ceiling. A
+                         rate, not a duration, so it is comparable across models
+                         without normalising. Preferred over the old
+                         ar_first_over_rest, whose "N x slower" framing was really
+                         the idle skew wait (the transfer itself runs at W).
     ttft_slowdown        ttft_ns / ttft_ns at THIS model's largest buffer: how
                          much the buffer moves TTFT, relative to the most-relaxed
                          (largest-buffer) configuration. Flat ~1 across the sweep
                          means the buffer -> skew -> all-reduce chain does NOT
                          reach TTFT for that model.
 
-Kept in summary.csv but no longer plotted: skew_over_ar_rest (redundant now that
-pp_skew_ms is shown raw -- it was the same skew in collective-units) and
+Kept in summary.csv but no longer plotted: ar_first_over_rest (rs_ar_first_ns /
+rs_ar_rest_mean_ns -- the same stall as a duration multiple, dominated by the
+idle skew wait rather than a slower transfer), skew_over_ar_rest (redundant now
+that pp_skew_ms is shown raw -- it was the same skew in collective-units) and
 kv_gate_over_ttft (decode-start timing, orthogonal to the buffer chain).
 
 Discovery
@@ -216,7 +223,8 @@ def main(argv: list[str] | None = None) -> int:
         combined = pd.concat(frames, ignore_index=True)
         front = ["workload", "tag", "bottleneck", "buffer_mb",
                  "pp_skew_ms", "qpeak_mb", "qmean_mb", "pause_rate", "pause_frames",
-                 "line_rate_pct", "ar_first_over_rest", "ttft_slowdown",
+                 "line_rate_pct", "rs_ar_first_bw", "rs_ar_rest_bw",
+                 "rs_ar_first_stage_bw", "ttft_slowdown", "ar_first_over_rest",
                  "pause_pct_of_window", "qpeak_pct", "skew_over_ar_rest",
                  "kv_gate_over_ttft"]
         combined = combined[[c for c in front if c in combined.columns]
@@ -270,10 +278,16 @@ def main(argv: list[str] | None = None) -> int:
             "line_rate_efficiency_by_workload.png")
 
         # === Block B: does the fabric effect propagate to the user? ==========
+        # First (skew-gated) all-reduce as EFFECTIVE BANDWIDTH (bytes/duration),
+        # like buffer_sweep fig 01: the stall shows as the bandwidth COLLAPSING
+        # (the early rank sits idle at the barrier, so bytes/wall-time drops),
+        # bounded above by the ungated wire rate. Honest about what happens --
+        # the transfer is not slower, it waits -- and comparable across models
+        # because it is a rate, not a compute-scaled duration.
         line_by_workload(
-            "ar_first_over_rest", "First all-reduce (×steady-state)",
-            "Skew-induced all-reduce stall",
-            "allreduce_first_over_rest_by_workload.png", hline=1.0)
+            "rs_ar_first_bw", "First all-reduce eff. bw (GB/s)",
+            "Skew stall on the first all-reduce (effective bandwidth collapses)",
+            "allreduce_first_bandwidth_by_workload.png")
 
         line_by_workload(
             "ttft_slowdown", "TTFT (×largest-buffer)",

@@ -405,15 +405,24 @@ def analyse(tag: str, p: incast.IncastPaths, placement: Placement) -> Row:
     row.bottleneck = str(bn)
     row.link0 = link_metrics(kv, bn, topo, pfc, qlen, row.buffer_bytes)
 
-    # KV arrival timing. barrier gives the decode-start gate and the per-rank
-    # ready times; the headline SKEW is intra-stage (computed separately, NOT
-    # barrier's global cross_rank_skew, which is dominated by the inter-stage gap).
-    b = barrier(kv, placement)
+    # KV arrival timing and PP skew read the ASTRA stats CSV (per-op end_tick =
+    # arrival, cleanly labelled) instead of reconstructing them from fct.txt --
+    # same nanosecond values, none of the flow-classification / incast fan-in /
+    # wave-grouping heuristics. Fabric metrics above (link, PFC, drops, queues)
+    # stay on ns-3.
+    adir = p.astra_run(tag)
+    adf = astra.read_run(adir) if adir.is_dir() else None
+    kv_arr = astra.kv_arrivals(adf)
+
+    # barrier gives the decode-start gate and the per-rank ready times; the
+    # headline SKEW is intra-stage (computed separately, NOT barrier's global
+    # cross_rank_skew, which is dominated by the inter-stage gap).
+    b = barrier(kv_arr, placement)
     row.kv_gate_ns = b["kv_gate_ns"]
     row.kv_ready_min_ns = b["kv_ready_min_ns"]
     row.kv_stream_duration_ns = b["kv_stream_duration_ns"]
     row.decode_ranks = b["decode_ranks"]
-    sk = kv_stage_skew(kv, placement)
+    sk = kv_stage_skew(kv_arr, placement)
     row.kv_skew_ns = sk["worst_ns"]
     row.kv_skew_mean_ns = sk["mean_ns"]
     row.kv_skew_global_ns = sk["global_ns"]
@@ -422,7 +431,7 @@ def analyse(tag: str, p: incast.IncastPaths, placement: Placement) -> Row:
         warn(f"{tag}: decode stage(s) {sk['short_stages']} declare >=2 ranks but "
              f"<2 received KV; their intra-stage skew is omitted.")
 
-    ppr = pp.measure(f, placement)
+    ppr = pp.measure(adf)
     row.pp_available = ppr.available
     row.pp_skew_ns = ppr.skew_ns
     row.pp_skew_mean_ns = ppr.skew_mean_ns
@@ -552,10 +561,20 @@ def recover_placement(p: incast.IncastPaths, tags: list[str]) -> Placement:
 # --------------------------------------------------------------------------- #
 # Figures
 # --------------------------------------------------------------------------- #
+# Per-level colour overrides: viridis maps the last level to its pale-yellow
+# endpoint, which is nearly invisible on a white background. Override those
+# levels with readable, mutually distinct hues (kept CVD-safe against the
+# viridis purple/teal of the other levels, and away from the reserved LOSS_RED).
+_LEVEL_COLOR_OVERRIDE = {
+    "T4": "#e8590c",          # dark orange -- readable, distinct from T2.1/T3
+}
+
+
 def _level_colors(levels: list[Level]) -> dict[str, tuple]:
     cmap = plt.get_cmap("viridis")
     n = max(len(levels) - 1, 1)
-    return {lv.level: cmap(i / n) for i, lv in enumerate(levels)}
+    return {lv.level: _LEVEL_COLOR_OVERRIDE.get(lv.level, cmap(i / n))
+            for i, lv in enumerate(levels)}
 
 
 def fig_kv_skew(levels: list[Level], s: pd.DataFrame, outdir: Path,
