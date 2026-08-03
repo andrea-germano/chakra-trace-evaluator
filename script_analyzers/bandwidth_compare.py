@@ -84,23 +84,11 @@ def load_workload(root: Path, workload: str, sweep: str, pattern: str) -> pd.Dat
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sweep", default="bandwidth_sweep",
-                    help="sweep sub-directory name to look for under every "
-                         "workload (default: bandwidth_sweep)")
-    ap.add_argument("--root", default=str(paths.ROOT), type=Path,
-                    help=f"project root (default: {paths.ROOT})")
-    ap.add_argument("--workloads", nargs="+", default=None,
-                    help="glob pattern(s) to keep (default: every workload that "
-                         "has the sweep), e.g. --workloads 'llama2_13b_*'")
-    ap.add_argument("--exclude", nargs="+", default=None,
-                    help="glob pattern(s) to drop")
+    paths.add_compare_arguments(ap, "bandwidth_compare",
+                                default_sweep="bandwidth_sweep")
     ap.add_argument("--pattern", default="*.csv",
-                    help="glob for the per-node CSVs inside each run dir")
-    ap.add_argument("-o", "--out", default=None, type=Path,
-                    help="output dir (default: results/sweep_analysis/"
-                         "bandwidth_compare/<sweep>)")
-    ap.add_argument("--list", action="store_true",
-                    help="print discovered workloads and exit, without analysing")
+                    help="glob for the per-rank CSVs inside each run dir "
+                         "(default: *.csv)")
     a = ap.parse_args(argv)
 
     root = Path(a.root)
@@ -127,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
              f"all of them out)")
 
         outdir = (Path(a.out) if a.out else
-                  root / "results" / "sweep_analysis" / "bandwidth_compare")
+                  root / "results" / "sweep_analysis" / "bandwidth_compare" / a.sweep)
 
         frames = []
         print(f"\nScanning {len(workloads)} workload(s):")

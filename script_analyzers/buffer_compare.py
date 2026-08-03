@@ -24,6 +24,14 @@ number to compare across models -- no normalisation:
     pp_skew_ms           pp_skew_ns / 1e6: cross-rank arrival misalignment on the
                          receiving stage. A delta (idle ms), not a workload size,
                          so directly comparable across models.
+    kv_tp_skew_mean_ms   mean per-(decode stage, layer) spread between the
+                         arrivals of the KV shards feeding the SAME TP group
+                         (buffer_sweep fig 08) -- the decode-side analog of
+                         pp_skew_ms. A congestion-caused delta, so raw ms.
+    dec_ar_first_skew_ms worst decode stage's entry skew into its FIRST TP
+                         all-reduce (buffer_sweep fig 10): how staggered the
+                         shards entered the one collective gated by that
+                         stage's own KV. Also a delta, so raw ms.
     qpeak_mb             link0_qpeak_bytes / 2^20: peak occupancy at the
                          bottleneck port, in MB. Absolute bytes -- deliberately
                          NOT qpeak_pct, whose denominator is the swept buffer
@@ -54,6 +62,12 @@ quantity of the SAME run) or normalised to that model's OWN largest-buffer run:
                          (largest-buffer) configuration. Flat ~1 across the sweep
                          means the buffer -> skew -> all-reduce chain does NOT
                          reach TTFT for that model.
+    dec_ar_first_over_rest
+                         worst decode stage's FIRST all-reduce duration in units
+                         of that same stage's steady-state mean (buffer_sweep
+                         fig 10): does the KV skew the decode pipeline inherits
+                         actually stretch its first collective? Self-normalised
+                         per stage, so dimensionless and comparable.
 
 Kept in summary.csv but no longer plotted: ar_first_over_rest (rs_ar_first_ns /
 rs_ar_rest_mean_ns -- the same stall as a duration multiple, dominated by the
@@ -68,6 +82,12 @@ Discovery
 Every sub-directory of output/ns3 that contains a `<sweep>` directory is a
 model; nothing is hard-coded. Run with --list to see what would be picked up
 without analysing anything.
+
+PP=1 models are first-class citizens: they have no PP wave, so pp_skew_ms (and
+the skew-gating story) is NaN and their line drops from that one figure only.
+The all-reduce bandwidths still report (buffer_sweep falls back to the single
+prefill stage -- ungated, so expected flat: the control), and every fabric-
+domain, KV and TTFT metric is measured exactly as for PP>1.
 
 Bottleneck consistency is checked WITHIN each model's sweep (as buffer_sweep
 does), never ACROSS models: different topologies number their switches
@@ -139,6 +159,13 @@ def load_workload(root: Path, workload: str, sweep: str,
     qm = s.get("link0_qmean_bytes")                  # -- NOT qpeak_pct: dividing by
     s["qpeak_mb"] = qb / 2**20 if qb is not None else NAN   # the swept buffer is
     s["qmean_mb"] = qm / 2**20 if qm is not None else NAN   # circular on a buffer
+    # decode-side skews (buffer_sweep figs 08/10): congestion-caused deltas like
+    # pp_skew_ms, so raw ms. The per-stage decN_* columns are stage-numbered per
+    # model (different PP splits); analyse_sweep already reduced them to the
+    # WORST stage (buffer_sweep.decode_worst_stage) -- only units change here.
+    s["kv_tp_skew_mean_ms"] = s["kv_tp_skew_mean_ns"] / 1e6
+    s["kv_tp_skew_p99_ms"] = s["kv_tp_skew_p99_ns"] / 1e6
+    s["dec_ar_first_skew_ms"] = s["dec_ar_first_skew_ns"] / 1e6
     # kept in the CSV for continuity, no longer plotted:                  # sweep.
     s["pause_pct_of_window"] = s.get("link0_pause_pct_of_window")
     s["qpeak_pct"] = s.get("link0_qpeak_pct")
@@ -161,25 +188,12 @@ def load_workload(root: Path, workload: str, sweep: str,
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sweep", default="buffer_sweep_T1",
-                    help="sweep sub-directory name to look for under every "
-                         "workload (default: buffer_sweep_T1)")
-    ap.add_argument("--root", default=str(paths.ROOT), type=Path,
-                    help=f"project root (default: {paths.ROOT})")
-    ap.add_argument("--workloads", nargs="+", default=None,
-                    help="glob pattern(s) to keep (default: every workload that "
-                         "has the sweep), e.g. --workloads 'llama2_13b_*'")
-    ap.add_argument("--exclude", nargs="+", default=None,
-                    help="glob pattern(s) to drop")
+    paths.add_compare_arguments(ap, "buffer_compare",
+                                default_sweep="buffer_sweep_T1")
     ap.add_argument("--top-links", type=int, default=6,
                     help="how many KV-crossed links analyse_sweep scores "
                          "(only link0 is compared here; default: 6)")
     roles.add_argument(ap)
-    ap.add_argument("-o", "--out", default=None, type=Path,
-                    help="output dir (default: results/sweep_analysis/"
-                         "buffer_compare/<sweep>)")
-    ap.add_argument("--list", action="store_true",
-                    help="print discovered workloads and exit, without analysing")
     a = ap.parse_args(argv)
 
     root = Path(a.root)
@@ -214,17 +228,21 @@ def main(argv: list[str] | None = None) -> int:
         for w in workloads:
             summ = load_workload(root, w, a.sweep, placement, a.top_links)
             frames.append(summ)
+            sk = summ.sort_values("buffer_mb")["pp_skew_ms"].iloc[0]
             print(f"  + {w:<55} buf={summ['buffer_mb'].min():g}.."
                   f"{summ['buffer_mb'].max():g}  "
                   f"bn={summ['bottleneck'].iloc[0]}  "
                   f"skew@min_buf="
-                  f"{summ.sort_values('buffer_mb')['pp_skew_ms'].iloc[0]:.2f}ms")
+                  f"{f'{sk:.2f}ms' if pd.notna(sk) else 'n/a (PP=1)'}")
 
         combined = pd.concat(frames, ignore_index=True)
         front = ["workload", "tag", "bottleneck", "buffer_mb",
-                 "pp_skew_ms", "qpeak_mb", "qmean_mb", "pause_rate", "pause_frames",
+                 "pp_skew_ms", "kv_tp_skew_mean_ms", "kv_tp_skew_p99_ms",
+                 "dec_ar_first_skew_ms",
+                 "qpeak_mb", "qmean_mb", "pause_rate", "pause_frames",
                  "line_rate_pct", "rs_ar_first_bw", "rs_ar_rest_bw",
-                 "rs_ar_first_stage_bw", "ttft_slowdown", "ar_first_over_rest",
+                 "rs_ar_first_stage_bw", "ttft_slowdown", "dec_ar_first_over_rest",
+                 "ar_first_over_rest",
                  "pause_pct_of_window", "qpeak_pct", "skew_over_ar_rest",
                  "kv_gate_over_ttft"]
         combined = combined[[c for c in front if c in combined.columns]
@@ -263,6 +281,16 @@ def main(argv: list[str] | None = None) -> int:
             "pp_skew_ms_by_workload.png")
 
         line_by_workload(
+            "kv_tp_skew_mean_ms", "KV TP-group skew, mean (ms)",
+            "KV shard arrival skew within decode TP groups",
+            "kv_tp_skew_by_workload.png")
+
+        line_by_workload(
+            "dec_ar_first_skew_ms", "Decode first all-reduce entry skew (ms)",
+            "KV skew inherited by the decode pipeline (worst stage)",
+            "decode_ar_first_skew_by_workload.png")
+
+        line_by_workload(
             "qpeak_mb", "Peak queue occupancy (MB)",
             "Bottleneck buffer occupancy",
             "qpeak_occupancy_mb_by_workload.png")
@@ -293,6 +321,11 @@ def main(argv: list[str] | None = None) -> int:
             "ttft_slowdown", "TTFT (×largest-buffer)",
             "TTFT sensitivity to buffer",
             "ttft_slowdown_by_workload.png", hline=1.0)
+
+        line_by_workload(
+            "dec_ar_first_over_rest", "Decode first all-reduce (×steady-state)",
+            "Does the inherited KV skew stretch the decode first all-reduce?",
+            "decode_ar_first_over_rest_by_workload.png", hline=1.0)
 
         print(f"\nWrote {outdir}:")
         print("  summary.csv")

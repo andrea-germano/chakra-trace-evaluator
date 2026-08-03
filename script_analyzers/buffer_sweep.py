@@ -22,7 +22,7 @@ Two suspected mechanisms, both traced back to PFC on the oversubscribed link:
        That skew changes how long the RECEIVING stage's TP all-reduce takes,
        which changes the prefill completion time -- TTFT.
 
-Seven figures, each answering one part of that:
+Ten figures, each answering one part of that:
 
     01  CAUSAL CHAIN TO TTFT       PP arrival skew, the receiving stage's FIRST
                                    (skew-gated) all-reduce, the steady-state mean
@@ -37,20 +37,47 @@ Seven figures, each answering one part of that:
     03  LINK BANDWIDTH/CONCURRENCY every link any KV flow crosses (not just the
                                    one deepest-queue bottleneck), ranked: does
                                    ONLY the measured link suffer, or several?
-    04  THROUGHPUT / BUFFER(t)    binned KV throughput(t) at the top-ranked link
-                                   (top row) over that switch's buffer occupancy
-                                   (bottom row, % of BUFFER_SIZE), one column per
-                                   buffer value, PFC PAUSE spans shaded on both --
-                                   throughput dips line up with a full buffer.
+    04  BUFFER OCCUPANCY(t)        the bottleneck switch's buffer occupancy as a
+                                   % of the swept BUFFER_SIZE, one column per
+                                   buffer value, PFC PAUSE spans shaded -- the
+                                   pauses line up with a full buffer. (The old
+                                   arrival-binned KV throughput row is gone: the
+                                   attribution was too coarse to be honest.)
     05  QUEUE(t) PER SWITCH        a grid (rows=switch, cols=buffer), with PFC
                                    PAUSE spans shaded.
     06  OCCUPANCY vs BUFFER        is the added buffer actually used, per switch.
-    07  TTFT-NORMALISED COST       decode-start and its "fabric tax" as
-                                   multiples of TTFT rather than absolute ms,
-                                   since TTFT itself now moves with the buffer
-                                   (via the skew chain) instead of being flat.
-    08  PFC COUNT vs BUFFER        the raw PAUSE-frame count at the bottleneck,
+    07  PFC COUNT vs BUFFER        the raw PAUSE-frame count at the bottleneck,
                                    one point per buffer -- just the "how many".
+    08  KV TP-GROUP SKEW           per (decode stage, layer): the spread between
+                                   the arrival of the KV shards that feed the
+                                   SAME TP group -- the wait the first decode
+                                   all-reduce of that layer inherits. min / mean
+                                   / p99 over the (stage, layer) population, vs
+                                   buffer.
+    09  KV TIME PER RANK           per decode rank: the total KV transfer time
+                                   (first->last arrival) and the signed gap
+                                   between the completion of that rank's FIRST
+                                   and LAST layer, vs buffer.
+    10  DECODE FIRST ALL-REDUCE    per decode PP stage: the entry skew (spread
+                                   of the shards' start ticks) of the stage's
+                                   FIRST TP all-reduce -- the one gated by its
+                                   own KV -- and, beside it, that all-reduce's
+                                   duration against the mean duration of the
+                                   rest, vs buffer. How much KV skew the decode
+                                   pipeline actually inherits.
+
+    11  DECODE KV STALL            how much the decode is stalled waiting for
+                                   its KV. Left: token-2 latency after token 1.
+                                   Middle: the first decode pass (decode start
+                                   -> token 2) against the steady inter-token
+                                   gap -- the excess IS the KV stall. Right:
+                                   the cause, per stage: KV readiness minus the
+                                   arrival of the stage's first input (FIRSTTOK
+                                   for stage 0, the it=0 PP activation after);
+                                   >0 means the stage outruns its KV and waits.
+
+    (The old 07, decode start as a multiple of TTFT, was dropped; the scalar
+    kv_gate_over_ttft is still computed and lands in summary.csv.)
 
 Everything is measured, nothing fitted (same discipline as utils.pp):
 fct.txt / pfc.txt / qlen.txt plus, for TTFT, this run's ASTRA-sim trace.
@@ -79,6 +106,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 from collections import defaultdict
@@ -185,11 +213,36 @@ class Row:
     kv_stream_duration_ns: float = NAN
     decode_ranks: str = ""
 
+    # -- 11 decode stalled by KV reception ------------------------------------ #
+    dec_start_ns: float = NAN             # first decode COMP start (stage 0 wakes
+                                          # on the FIRSTTOK ARRIVAL, not its send)
+    tok2_ns: float = NAN                  # second token: first DECFB send, max
+                                          # over shards (slowest shard's send)
+    tok2_latency_ns: float = NAN          # tok2 - dec_start: the first decode pass
+    tok2_after_tok1_ns: float = NAN       # tok2 - TTFT: the user-visible gap
+    itl_steady_ns: float = NAN            # mean inter-token gap of the remaining
+                                          # DECFB iterations (steady-state control)
+
+    # -- 08 KV skew within each TP group -------------------------------------- #
+    # Population: one skew per (decode stage, layer) = the spread between the
+    # arrivals of the KV shards feeding the same TP group. Groups with a single
+    # shard arrival have no skew and are excluded (kv_tp_skew_n counts the rest).
+    kv_tp_skew_min_ns: float = NAN
+    kv_tp_skew_mean_ns: float = NAN
+    kv_tp_skew_p99_ns: float = NAN
+    kv_tp_skew_n: int = 0
+
     # -- not flattened: per-figure raw data ----------------------------------- #
     links: list = field(default_factory=list)          # list[LinkStat]
     kv_rank_series: dict = field(default_factory=dict)  # rank -> (times_ns, cumbytes)
-    bn_throughput_series: object = None                 # (centres_ns, gbps)
-    bn_concurrency_series: object = None                # (times_ns, counts)
+    kv_rank_span: dict = field(default_factory=dict)     # rank -> last-first arrival (ns)
+    kv_rank_layer_delta: dict = field(default_factory=dict)  # rank -> signed ns:
+                                                        # completion(last layer) -
+                                                        # completion(first layer)
+    dec_ar: dict = field(default_factory=dict)           # decode stage -> first/steady
+                                                        # all-reduce skew + duration
+    dec_stall: dict = field(default_factory=dict)        # decode stage -> KV readiness
+                                                        # vs first-input arrival
     bn_pause_intervals: list = field(default_factory=list)
     qseries: dict = field(default_factory=dict)         # sw -> (ts_ns, bytes)
     qswitch_peak: dict = field(default_factory=dict)     # sw -> peak total bytes
@@ -198,10 +251,25 @@ class Row:
 
     def flat(self) -> dict:
         d = asdict(self)
-        for k in ("links", "kv_rank_series", "bn_throughput_series",
-                  "bn_concurrency_series", "bn_pause_intervals", "qseries",
+        for k in ("links", "kv_rank_series", "kv_rank_span", "kv_rank_layer_delta",
+                  "dec_ar", "dec_stall", "bn_pause_intervals", "qseries",
                   "qswitch_peak", "qswitch_mean", "pause_intervals"):
             d.pop(k, None)
+        for rank in sorted(self.kv_rank_span):
+            d[f"kv_rank{rank}_span_ns"] = self.kv_rank_span[rank]
+        for rank in sorted(self.kv_rank_layer_delta):
+            d[f"kv_rank{rank}_layer_delta_ns"] = self.kv_rank_layer_delta[rank]
+        for st in sorted(self.dec_ar):
+            m = self.dec_ar[st]
+            d[f"dec{st}_ar_first_skew_ns"] = m["first_skew_ns"]
+            d[f"dec{st}_ar_first_dur_ns"] = m["first_dur_ns"]
+            d[f"dec{st}_ar_rest_skew_mean_ns"] = m["rest_skew_mean_ns"]
+            d[f"dec{st}_ar_rest_dur_mean_ns"] = m["rest_dur_mean_ns"]
+        for st in sorted(self.dec_stall):
+            m = self.dec_stall[st]
+            d[f"dec{st}_input_arrival_ns"] = m["input_arrival_ns"]
+            d[f"dec{st}_kv_ready_ns"] = m["kv_ready_ns"]
+            d[f"dec{st}_kv_lateness_ns"] = m["kv_lateness_ns"]
         for i, ls in enumerate(self.links):
             d[f"link{i}_label"] = ls.label
             d[f"link{i}_window_ns"] = ls.window_ns      # KV window: normaliser for
@@ -341,11 +409,14 @@ def rs_allreduce_stats(adf: pd.DataFrame | None, placement: Placement, ppr) -> d
                               starts immediately and is never gated: the reference
                               the steady receiving-stage bw is compared against.
 
-    Stages are the ASTRA `ss` field. All NaN/0 with no ASTRA run, no wave (PP=1),
-    or no prefill TP (TP=1)."""
+    Stages are the ASTRA `ss` field. With PP=1 there is no wave and no receiving
+    stage, so the ONLY prefill stage reports instead: its first all-reduce is
+    ungated (nothing to inherit a skew from), but its bw-vs-buffer curve is still
+    the quantity the cross-model compare overlays -- expected flat, the control.
+    All NaN/0 with no ASTRA run, or no prefill TP (TP=1)."""
     out = {"rs_ar_first_ns": NAN, "rs_ar_rest_mean_ns": NAN, "rs_ar_n": 0,
            "rs_ar_first_bw": NAN, "rs_ar_rest_bw": NAN, "rs_ar_first_stage_bw": NAN}
-    if adf is None or not ppr.available or ppr.stage is None:
+    if adf is None:
         return out
     tp = adf[(adf["op_class"] == "TP") & (adf["phase"] == "prefill")]
     if not len(tp) or "ss" not in tp.columns:
@@ -363,7 +434,16 @@ def rs_allreduce_stats(adf: pd.DataFrame | None, placement: Placement, ppr) -> d
     g["bw"] = g["cs"] / g["dur"]                       # bytes/ns = GB/s
     g["ss"] = pd.to_numeric(g["ss"], errors="coerce")
 
-    recv = g[g["ss"] == ppr.stage].sort_values("start")
+    if ppr.available and ppr.stage is not None:
+        stage = ppr.stage
+    else:
+        # PP=1: no wave, no receiving stage. The only prefill stage reports;
+        # several stages with no measurable wave stays NaN (ambiguous).
+        stages = g["ss"].dropna().unique()
+        if len(stages) != 1:
+            return out
+        stage = stages[0]
+    recv = g[g["ss"] == stage].sort_values("start")
     if recv.empty:
         return out
     first = recv.iloc[0]
@@ -394,29 +474,168 @@ def kv_rank_series(kv: pd.DataFrame, placement: Placement) -> dict:
     return out
 
 
-def bn_time_series(kv_bn: pd.DataFrame, lo: int, hi: int,
-                   n_buckets: int = 80) -> tuple[tuple, tuple]:
-    """Binned aggregate KV throughput(t) (Gbit/s) and concurrent-flow count(t)
-    at one link, over [lo, hi].
+def kv_skew_stats(kv_arr: pd.DataFrame) -> tuple[dict, dict, dict]:
+    """The KV skew figures' raw material, all from the ASTRA KV recv rows
+    (utils.astra.kv_arrivals, which carries stage/shard/layer from the name).
 
-    Throughput is arrival-time attribution: each flow's bytes land in the
-    bucket where it ARRIVES (fct.txt gives start+fct, not an intra-flow rate
-    curve, so this is the finest honest resolution). A bucket with no arrivals
-    reads as a stall even if bytes were in flight -- which is exactly the
-    visual signature PFC pausing produces: transfers back up, then complete in
-    a burst once RESUME lets them drain. That is the point of the figure."""
-    if not len(kv_bn) or hi <= lo:
-        return (np.array([]), np.array([])), (np.array([]), np.array([]))
-    edges = np.linspace(lo, hi, n_buckets + 1)
-    widths = np.diff(edges)
-    bytes_per_bucket = np.zeros(n_buckets)
-    arr = kv_bn["arrival"].to_numpy(dtype=float)
-    idx = np.clip(np.searchsorted(edges, arr) - 1, 0, n_buckets - 1)
-    np.add.at(bytes_per_bucket, idx, kv_bn["size"].to_numpy(dtype=float))
-    gbps = bytes_per_bucket * 8.0 / widths        # bytes/ns * 8 = bit/ns = Gbit/s
-    centres = (edges[:-1] + edges[1:]) / 2
-    t_conc, conc = flowlib.concurrency_series(flowlib.flow_spans(kv_bn))
-    return (centres, gbps), (t_conc, conc)
+    Returns (scalars, rank_span, rank_layer_delta):
+
+        scalars           kv_tp_skew_{min,mean,p99}_ns and kv_tp_skew_n over the
+                          per-(stage, layer) TP-GROUP skew population: for each
+                          (decode stage, layer), max-min arrival across the KV
+                          shards feeding that TP group. That spread is exactly
+                          the wait the layer's first decode all-reduce inherits.
+                          Groups with fewer than 2 shard arrivals carry no skew
+                          and are excluded.
+        rank_span         rank -> last-first KV arrival at that rank (ns): the
+                          total transfer time each rank observes.
+        rank_layer_delta  rank -> completion(highest layer) - completion(lowest
+                          layer) at that rank (ns), SIGNED: layers arrive out of
+                          order, so this is not the span -- a negative value
+                          means the last layer's KV landed before the first's.
+                          A layer delivered in several chunks is complete at its
+                          last chunk.
+    """
+    scal = {"kv_tp_skew_min_ns": NAN, "kv_tp_skew_mean_ns": NAN,
+            "kv_tp_skew_p99_ns": NAN, "kv_tp_skew_n": 0}
+    rank_span: dict[int, float] = {}
+    rank_delta: dict[int, float] = {}
+    if kv_arr is None or kv_arr.empty:
+        return scal, rank_span, rank_delta
+
+    for d, g in kv_arr.groupby("dst"):
+        arr = g["arrival"].astype(float)
+        rank_span[int(d)] = float(arr.max() - arr.min())
+        gl = g.dropna(subset=["layer"])
+        if len(gl):
+            per_layer = gl.groupby("layer")["arrival"].max()
+            rank_delta[int(d)] = float(per_layer[per_layer.index.max()]
+                                       - per_layer[per_layer.index.min()])
+
+    grouped = kv_arr.dropna(subset=["stage", "layer"]) \
+                    .groupby(["stage", "layer"])["arrival"] \
+                    .agg(["min", "max", "count"])
+    sk = (grouped["max"] - grouped["min"])[grouped["count"] >= 2]
+    if len(sk):
+        scal.update(kv_tp_skew_min_ns=float(sk.min()),
+                    kv_tp_skew_mean_ns=float(sk.mean()),
+                    kv_tp_skew_p99_ns=float(sk.quantile(0.99)),
+                    kv_tp_skew_n=int(len(sk)))
+    return scal, rank_span, rank_delta
+
+
+def decode_ar_stats(adf: pd.DataFrame | None) -> dict[int, dict]:
+    """First vs steady-state TP all-reduce of each DECODE PP stage, from the
+    ASTRA stats CSV: decode stage -> {first_skew_ns, first_dur_ns,
+    rest_skew_mean_ns, rest_dur_mean_ns, n}.
+
+    Per collective (ss, L, it, op): ENTRY SKEW is the spread of the shards'
+    start ticks -- how staggered the TP ranks entered the collective -- and
+    duration is the slowest shard's. The FIRST collective of a stage (earliest
+    entry) is the one gated by that stage's own KV transfer, so its entry skew
+    is the KV skew the decode pipeline actually inherits; the rest of the
+    stage's collectives are the steady-state control. Empty dict with no ASTRA
+    run or no decode TP (TP=1)."""
+    out: dict[int, dict] = {}
+    if adf is None or adf.empty:
+        return out
+    tp = adf[(adf["op_class"] == "TP") & (adf["phase"] == "decode")]
+    if not len(tp) or "ss" not in tp.columns:
+        return out
+    keys = [c for c in ("ss", "L", "it", "op") if c in tp.columns]
+    g = (tp.groupby(keys, dropna=False)
+           .agg(start=("start_tick", "min"), start_max=("start_tick", "max"),
+                dur=("duration", "max")).reset_index())
+    g["skew"] = g["start_max"] - g["start"]
+    g["ss"] = pd.to_numeric(g["ss"], errors="coerce")
+    for st, gg in g.dropna(subset=["ss"]).groupby("ss"):
+        gg = gg.sort_values("start")
+        first, rest = gg.iloc[0], gg.iloc[1:]
+        out[int(st)] = {
+            "first_skew_ns": float(first["skew"]),
+            "first_dur_ns": float(first["dur"]),
+            "rest_skew_mean_ns": float(rest["skew"].mean()) if len(rest) else NAN,
+            "rest_dur_mean_ns": float(rest["dur"].mean()) if len(rest) else NAN,
+            "n": int(len(gg)),
+        }
+    return out
+
+
+def decode_stall_stats(adf: pd.DataFrame | None,
+                       kv_arr: pd.DataFrame) -> tuple[dict, dict[int, dict]]:
+    """How much the decode is stalled waiting for its KV, from the ASTRA CSV.
+
+    The decode does NOT gate on the KV barrier: stage 0 wakes when the FIRSTTOK
+    message ARRIVES (its send instant is the TTFT, but the message itself queues
+    behind the KV bulk), and each later stage wakes on the it=0 PP-decode
+    activation. A stage then consumes its KV layer by layer, so it stalls only
+    where it outruns the transfer. Two views of that stall:
+
+    scalars
+        dec_start_ns      first decode COMP start (= stage 0's wake)
+        tok2_ns           the second token: the first DECFB send, max over
+                          shards (the feedback is ready once the slowest shard
+                          sent -- same barrier logic as firsttok_send_instant)
+        tok2_latency_ns   tok2 - dec_start: wall-clock of the first decode pass
+        itl_steady_ns     mean gap between the remaining DECFB iterations, the
+                          steady-state inter-token control: the first pass's
+                          excess over it is the KV-induced stall
+    per stage
+        input_arrival_ns  when the stage COULD start (FIRSTTOK arrival for
+                          stage 0, it=0 PP-decode activation arrival after)
+        kv_ready_ns       last KV arrival for the stage
+        kv_lateness_ns    kv_ready - input_arrival: >0 = the stage outruns its
+                          KV and must stall inside the first pass; <=0 = the KV
+                          was already resident (the transfer is fully masked)
+    """
+    scal = {"dec_start_ns": NAN, "tok2_ns": NAN, "tok2_latency_ns": NAN,
+            "itl_steady_ns": NAN}
+    stages: dict[int, dict] = {}
+    if adf is None or adf.empty:
+        return scal, stages
+
+    comp = adf[(adf["op_class"] == "COMP") & (adf["phase"] == "decode")]
+    if len(comp):
+        scal["dec_start_ns"] = float(comp["start_tick"].min())
+
+    fb = adf[(adf["op_class"] == "DECFB") & (adf["comm_role"] == "send")]
+    if len(fb) and "it" in fb.columns:
+        inst = (fb.assign(it=pd.to_numeric(fb["it"], errors="coerce"))
+                  .dropna(subset=["it"])
+                  .groupby("it")["start_tick"].max().sort_index())
+        if len(inst):
+            scal["tok2_ns"] = float(inst.iloc[0])
+            if pd.notna(scal["dec_start_ns"]):
+                scal["tok2_latency_ns"] = scal["tok2_ns"] - scal["dec_start_ns"]
+            gaps = inst.diff().dropna()
+            if len(gaps):
+                scal["itl_steady_ns"] = float(gaps.mean())
+
+    kv_ready = {}
+    if kv_arr is not None and len(kv_arr) and kv_arr["stage"].notna().any():
+        kv_ready = kv_arr.dropna(subset=["stage"]).groupby("stage")["arrival"] \
+                         .max().to_dict()
+
+    inputs: dict[int, float] = {}
+    ft = adf[(adf["op_class"] == "FIRSTTOK") & (adf["comm_role"] == "recv")]
+    if len(ft):
+        inputs[0] = float(ft["end_tick"].max())
+    ppd = adf[(adf["op_class"] == "PP") & (adf["phase"] == "decode")
+              & (adf["comm_role"] == "recv")]
+    if len(ppd):
+        w0 = ppd.assign(it=pd.to_numeric(ppd["it"], errors="coerce"),
+                        ds=pd.to_numeric(ppd["ds"], errors="coerce")) \
+                .dropna(subset=["it", "ds"])
+        w0 = w0[w0["it"] == 0]
+        for ds, g in w0.groupby("ds"):
+            inputs[int(ds)] = float(g["end_tick"].max())
+
+    for st in sorted(set(kv_ready) | set(inputs)):
+        ready = float(kv_ready.get(st, NAN))
+        arr = float(inputs.get(st, NAN))
+        stages[int(st)] = {"input_arrival_ns": arr, "kv_ready_ns": ready,
+                           "kv_lateness_ns": ready - arr}
+    return scal, stages
 
 
 def link_metrics(kv: pd.DataFrame, bn: Bottleneck, topo: Topology,
@@ -529,8 +748,6 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
 
     kv_bn = kv[flowlib.crosses(kv, bn)]
     need(len(kv_bn), f"{tag}: no KV flow crosses the top-ranked link {bn}.")
-    lo, hi = int(kv_bn["start"].min()), int(kv_bn["arrival"].max())
-    row.bn_throughput_series, row.bn_concurrency_series = bn_time_series(kv_bn, lo, hi)
     row.bn_pause_intervals = victim_pause_intervals(pfc, bn, topo, clamp_to=run_end)
 
     # KV arrival, PP skew and all-reduce metrics all read the ASTRA stats CSV
@@ -547,6 +764,27 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
         setattr(row, k, v)
     row.kv_gate_over_ttft = (row.kv_gate_ns / row.ttft_ns
                              if pd.notna(row.ttft_ns) and row.ttft_ns > 0 else NAN)
+
+    skew_scal, row.kv_rank_span, row.kv_rank_layer_delta = kv_skew_stats(kv_arr)
+    for k, v in skew_scal.items():
+        setattr(row, k, v)
+    if row.kv_tp_skew_n == 0:
+        warn(f"{tag}: no (stage, layer) KV group has >=2 shard arrivals; the "
+             f"TP-group skew figure will be empty for this run. (TP=1, or the "
+             f"KV names carry no ds=/L= fields.)")
+    row.dec_ar = decode_ar_stats(adf)
+    if not row.dec_ar:
+        warn(f"{tag}: no decode TP all-reduce in the ASTRA stats; the decode "
+             f"first-all-reduce skew figure will be empty for this run.")
+
+    stall_scal, row.dec_stall = decode_stall_stats(adf, kv_arr)
+    for k, v in stall_scal.items():
+        setattr(row, k, v)
+    if pd.notna(row.tok2_ns) and pd.notna(row.ttft_ns):
+        row.tok2_after_tok1_ns = row.tok2_ns - row.ttft_ns
+    if pd.isna(row.tok2_ns):
+        warn(f"{tag}: no DECFB send in the ASTRA stats; the decode KV-stall "
+             f"figure will be empty for this run.")
 
     ppr = pp.measure(adf)
     if not ppr.available:
@@ -717,47 +955,34 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
         fig.suptitle("Congestion across every KV-crossed link", y=1.02)
         save_fig(fig, outdir, "03_link_bandwidth_and_concurrency.png", written)
 
-    # 04 KV THROUGHPUT(t) OVER BOTTLENECK BUFFER OCCUPANCY(t), PFC PAUSES ----- #
-    # Two stacked rows sharing each column's time axis: TOP = KV throughput at
-    # the bottleneck link, BOTTOM = how full that switch's buffer is (% of the
-    # swept BUFFER_SIZE). PFC PAUSE spans are shaded across both, so a throughput
-    # dip, the buffer that has backed up underneath it, and the pause that links
-    # them line up vertically -- the direct picture of "stalls in step with a
-    # full buffer / PAUSE". (The old thin twin-axis line was per-flow CONCURRENCY,
-    # not throughput; it answered "how many flows" and only muddied this figure.)
-    bn_runs = [r for r in runs if r.bn_throughput_series and len(r.bn_throughput_series[0])]
-    if bn_runs:
-        bn_sw = int(rows[0].bottleneck.split("->")[0])
-        ncols = len(bn_runs)
-        fig, axes = plt.subplots(2, ncols, squeeze=False, sharex="col", sharey="row",
-                                 figsize=(max(3.0 * ncols, 6), 5.4),
-                                 gridspec_kw={"height_ratios": [2, 1]})
-        for j, r in enumerate(bn_runs):
-            top, bot = axes[0][j], axes[1][j]
-            # top: KV throughput at the bottleneck link
-            t, gbps = r.bn_throughput_series
-            top.fill_between(np.asarray(t) * MS, gbps, color=BLUE, alpha=0.6, step="mid")
-            top.set_title(f"{r.buffer_mb:g} MiB", fontsize=9)
-            top.grid(True, alpha=0.3)
-            # bottom: bottleneck switch buffer occupancy, as % of the buffer size
-            q = r.qseries.get(bn_sw)
-            if q and r.buffer_bytes:
-                ts, ys = q
-                occ = np.asarray(ys) / r.buffer_bytes * 100.0
-                bot.fill_between(np.asarray(ts) * MS, occ, color=VIOLET, alpha=0.5, step="mid")
-                bot.plot(np.asarray(ts) * MS, occ, color=VIOLET, lw=0.6, alpha=0.8)
-            bot.set_ylim(0, 100)
-            bot.set_xlabel("Time (ms)", fontsize=8)
-            bot.grid(True, alpha=0.3)
-            # PFC PAUSE spans on both rows
+    # 04 BOTTLENECK BUFFER OCCUPANCY(t) AS % OF THE SWEPT BUFFER, PFC PAUSES -- #
+    # One column per buffer value: how full the bottleneck switch's buffer is,
+    # as a % of BUFFER_SIZE, with PFC PAUSE spans shaded on top -- the pauses
+    # line up with a full buffer. (The old top row, arrival-binned KV
+    # throughput, is gone: arrival-time attribution was too coarse to read as
+    # a bandwidth.)
+    bn_sw = int(rows[0].bottleneck.split("->")[0])
+    occ_runs = [r for r in runs if bn_sw in r.qseries and r.buffer_bytes]
+    if occ_runs:
+        ncols = len(occ_runs)
+        fig, axes = plt.subplots(1, ncols, squeeze=False, sharex=True, sharey=True,
+                                 figsize=(max(3.0 * ncols, 6), 3.6))
+        for j, r in enumerate(occ_runs):
+            a = axes[0][j]
+            ts, ys = r.qseries[bn_sw]
+            occ = np.asarray(ys) / r.buffer_bytes * 100.0
+            a.fill_between(np.asarray(ts) * MS, occ, color=VIOLET, alpha=0.5, step="mid")
+            a.plot(np.asarray(ts) * MS, occ, color=VIOLET, lw=0.6, alpha=0.8)
             for s0, e0 in r.bn_pause_intervals:
-                for a in (top, bot):
-                    a.axvspan(s0 * MS, e0 * MS, color=CORAL, alpha=0.25, lw=0)
-        axes[0][0].set_ylabel("KV throughput\n(Gb/s)", fontsize=9)
-        axes[1][0].set_ylabel(f"Buffer occupancy\nswitch {bn_sw} (% of buffer)", fontsize=9)
-        fig.suptitle(f"KV throughput over bottleneck buffer occupancy ({rows[0].bottleneck})"
-                     "  —  shaded = PFC PAUSE", y=1.01)
-        save_fig(fig, outdir, "04_kv_throughput_and_pauses.png", written)
+                a.axvspan(s0 * MS, e0 * MS, color=CORAL, alpha=0.25, lw=0)
+            a.set_ylim(0, 100)
+            a.set_title(f"{r.buffer_mb:g} MiB", fontsize=9)
+            a.set_xlabel("Time (ms)", fontsize=8)
+            a.grid(True, alpha=0.3)
+        axes[0][0].set_ylabel(f"Buffer occupancy\nswitch {bn_sw} (% of buffer)", fontsize=9)
+        fig.suptitle(f"Bottleneck buffer occupancy ({rows[0].bottleneck})"
+                     "  —  shaded = PFC PAUSE", y=1.02)
+        save_fig(fig, outdir, "04_buffer_occupancy_and_pauses.png", written)
 
     # 05 QUEUE OCCUPANCY(t) PER SWITCH, WITH PFC PAUSES ---------------------- #
     switches = sorted({sw for r in rows for sw in r.qseries})
@@ -826,22 +1051,7 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
         else:
             plt.close(fig)
 
-    # 07 TTFT-NORMALISED DECODE COST ----------------------------------------- #
-    if s["kv_gate_over_ttft"].notna().any():
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(x, s["kv_gate_over_ttft"], "o-", color=BLUE,
-               label="decode start / TTFT")
-        ax.axhline(1.0, color="k", linestyle=":", alpha=0.4)
-        ax2 = ax.twinx()
-        cost_frac = (s["kv_gate_ns"] - s["ttft_ns"]) / s["ttft_ns"]
-        ax2.plot(x, cost_frac, "s--", color=CORAL,
-                label="fabric tax")
-        ax2.set_ylabel("Fabric tax (×TTFT)")
-        _finish(fig, ax, s, outdir, "07_ttft_normalised_decode_cost.png",
-                "Decode start relative to TTFT",
-                "Decode start (×TTFT)", written, extra_axes=(ax2,))
-
-    # 08 PFC PAUSE-FRAME COUNT vs BUFFER ------------------------------------- #
+    # 07 PFC PAUSE-FRAME COUNT vs BUFFER ------------------------------------- #
     # Just the raw number of PAUSE frames the bottleneck's ingress received,
     # one point per buffer value. Plots 04/05 show WHEN pauses happen; this is
     # the single scalar "how many", so the buffer -> backpressure trend reads
@@ -850,35 +1060,217 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
         fig, ax = plt.subplots(figsize=(8, 5))
         ax.plot(x, s["link0_pause_frames"], "o-", color=CORAL,
                label="PFC PAUSE frames (bottleneck)")
-        _finish(fig, ax, s, outdir, "08_pfc_pause_frame_count.png",
+        _finish(fig, ax, s, outdir, "07_pfc_pause_frame_count.png",
                 "PFC PAUSE frames at the bottleneck",
                 "PAUSE frames (count)", written)
 
+    # 08 KV ARRIVAL SKEW WITHIN EACH TP GROUP -------------------------------- #
+    # One skew per (decode stage, layer): the spread between the arrivals of
+    # the KV shards feeding the same TP group -- exactly the wait that layer's
+    # first decode all-reduce inherits. min/mean/p99 of that population per
+    # buffer value.
+    if s["kv_tp_skew_mean_ns"].notna().any():
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for col, color, style, label in (
+                ("kv_tp_skew_min_ns", GREEN, "v--", "min"),
+                ("kv_tp_skew_mean_ns", BLUE, "o-", "mean"),
+                ("kv_tp_skew_p99_ns", CORAL, "s-.", "p99")):
+            if s[col].notna().any():
+                ax.plot(x, s[col] * MS, style, color=color, label=label)
+        n = int(s["kv_tp_skew_n"].max())
+        _finish(fig, ax, s, outdir, "08_kv_tp_group_skew.png",
+                f"KV arrival skew within each TP group "
+                f"({n} (stage, layer) groups)",
+                "Cross-shard arrival skew (ms)", written)
+
+    # 09 KV TRANSFER TIME AND FIRST/LAST-LAYER GAP, PER DECODE RANK ---------- #
+    # Left: each rank's total KV transfer time (first->last arrival). Right:
+    # the SIGNED gap between the completion of the rank's first and last layer
+    # -- layers arrive out of order, so this is not the span, and a negative
+    # value means the last layer landed before the first.
+    ranks_kv = sorted({d for r in runs for d in r.kv_rank_span})
+    if ranks_kv:
+        fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
+        cmap = plt.get_cmap("tab10")
+        for i, d in enumerate(ranks_kv):
+            c = cmap(i % 10)
+            xs = [r.buffer_mb for r in runs if d in r.kv_rank_span]
+            ys = [r.kv_rank_span[d] * MS for r in runs if d in r.kv_rank_span]
+            axL.plot(xs, ys, "o-", color=c, label=f"rank {d}")
+            xs = [r.buffer_mb for r in runs if d in r.kv_rank_layer_delta]
+            ys = [r.kv_rank_layer_delta[d] * MS for r in runs
+                  if d in r.kv_rank_layer_delta]
+            if xs:
+                axR.plot(xs, ys, "s--", color=c, label=f"rank {d}")
+        for a, ttl, yl in ((axL, "Total KV transfer time per rank",
+                            "Last − first KV arrival (ms)"),
+                           (axR, "Completion gap: last vs first layer",
+                            "compl(last layer) − compl(first layer) (ms)")):
+            logx_pow2(a, s, "buffer_mb", "Per-switch buffer (MiB)")
+            a.set_title(ttl)
+            a.set_ylabel(yl)
+            a.grid(True, alpha=0.3, which="both")
+            a.legend(fontsize=8)
+        fig.suptitle("KV delivery per decode rank", y=1.02)
+        save_fig(fig, outdir, "09_kv_transfer_time_per_rank.png", written)
+
+    # 10 SKEW INHERITED BY THE DECODE STAGES' FIRST ALL-REDUCE --------------- #
+    # Per decode PP stage: the FIRST TP all-reduce is gated by that stage's own
+    # KV transfer, so whatever KV skew survived the gate shows up twice. LEFT:
+    # its ENTRY SKEW -- the spread of the shards' start ticks -- one line per
+    # stage. RIGHT: its duration against the mean duration of the stage's
+    # remaining all-reduces (the steady-state control): the early shard sits
+    # inside the collective waiting for the late one, so inherited skew reads
+    # as first-AR duration above the steady mean. If both stay flat while
+    # figure 08 moves, the KV skew is being masked (e.g. the transfer outruns
+    # the deprioritised FIRSTTOK path).
+    dec_stages = sorted({st for r in runs for st in r.dec_ar})
+    if dec_stages:
+        fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
+        cmap = plt.get_cmap("tab10")
+        US = 1e-3                                       # ns -> µs
+        for i, st in enumerate(dec_stages):
+            c = cmap(i % 10)
+            have = [r for r in runs if st in r.dec_ar]
+            xs = [r.buffer_mb for r in have]
+            axL.plot(xs, [r.dec_ar[st]["first_skew_ns"] * US for r in have],
+                     "o-", color=c, label=f"stage {st}")
+            axR.plot(xs, [r.dec_ar[st]["first_dur_ns"] * US for r in have],
+                     "o-", color=c, label=f"stage {st} — first AR")
+            axR.plot(xs, [r.dec_ar[st]["rest_dur_mean_ns"] * US for r in have],
+                     "v--", color=c, alpha=0.5, label=f"stage {st} — mean of the rest")
+        for a, ttl, yl in ((axL, "Entry skew of the FIRST all-reduce",
+                            "Entry skew (µs)"),
+                           (axR, "Duration: first AR vs mean of the rest",
+                            "Duration (µs)")):
+            logx_pow2(a, s, "buffer_mb", "Per-switch buffer (MiB)")
+            a.set_title(ttl)
+            a.set_ylabel(yl)
+            a.grid(True, alpha=0.3, which="both")
+            a.legend(fontsize=8)
+        fig.suptitle("Skew inherited by each decode stage's first TP all-reduce",
+                     y=1.02)
+        save_fig(fig, outdir, "10_decode_first_allreduce_skew.png", written)
+
+    # 11 HOW MUCH THE DECODE IS STALLED BY ITS KV ---------------------------- #
+    # Left: the user-visible gap, token 2 after token 1 (includes the FIRSTTOK
+    # message's own transit, which queues behind the KV bulk). Middle: the
+    # first decode pass, decode start -> token 2, against the steady-state
+    # inter-token gap -- everything above the dashed control is time the
+    # pipeline spent waiting for KV. Right: the cause per stage: KV readiness
+    # minus the stage's first-input arrival; above 0 the stage outruns its KV
+    # and stalls, below 0 the transfer was already complete (fully masked).
+    if s["tok2_latency_ns"].notna().any():
+        fig, (axA, axB, axC) = plt.subplots(1, 3, figsize=(16, 4.8))
+        if s["tok2_after_tok1_ns"].notna().any():
+            axA.plot(x, s["tok2_after_tok1_ns"] * MS, "o-", color=BLUE)
+        axA.set_title("Token 2 after token 1")
+        axA.set_ylabel("t(token 2) − TTFT (ms)")
+
+        axB.plot(x, s["tok2_latency_ns"] * MS, "o-", color=CORAL,
+                 label="first decode pass")
+        if s["itl_steady_ns"].notna().any():
+            axB.plot(x, s["itl_steady_ns"] * MS, "v--", color=MUTED,
+                     label="steady inter-token gap")
+        axB.set_title("First decode pass vs steady state")
+        axB.set_ylabel("Decode start → token 2 (ms)")
+
+        dec_st = sorted({st for r in runs for st in r.dec_stall})
+        cmap = plt.get_cmap("tab10")
+        for i, st in enumerate(dec_st):
+            have = [r for r in runs if st in r.dec_stall]
+            axC.plot([r.buffer_mb for r in have],
+                     [r.dec_stall[st]["kv_lateness_ns"] * MS for r in have],
+                     "s-", color=cmap(i % 10), label=f"stage {st}")
+        axC.axhline(0.0, color="k", linestyle=":", alpha=0.5)
+        axC.set_title("KV lateness at each stage's first input")
+        axC.set_ylabel("KV ready − input arrival (ms)")
+
+        for a in (axA, axB, axC):
+            logx_pow2(a, s, "buffer_mb", "Per-switch buffer (MiB)")
+            a.grid(True, alpha=0.3, which="both")
+            if a.get_legend_handles_labels()[0]:
+                a.legend(fontsize=8)
+        fig.suptitle("How much the decode is stalled by its KV transfer", y=1.02)
+        save_fig(fig, outdir, "11_decode_kv_stall.png", written)
+
     return written
+
+
+def decode_worst_stage(s: pd.DataFrame) -> pd.DataFrame:
+    """Reduce the per-stage decN_* columns (figures 10 and 11) to the WORST
+    decode stage, plus the run-wide decode-stall scalars, so the
+    cross-model/cross-level tools have one stage-count-independent number per run:
+
+        dec_ar_first_skew_ns    max over stages of the entry skew into the
+                                stage's FIRST (KV-gated) TP all-reduce (fig 10).
+        dec_ar_first_over_rest  max over stages of first duration / that same
+                                stage's steady-state mean -- self-normalised per
+                                stage, so PP splits and model scale cancel (fig 10).
+        dec_kv_lateness_ns      max over stages of (KV ready - first-input
+                                arrival): how late the KV is at the stage that
+                                waits most for it (fig 11, right panel).
+        decode_kv_stall_ns      tok2_latency - itl_steady: the first decode
+                                pass's excess over the steady inter-token gap,
+                                i.e. the wall-clock the pipeline actually spent
+                                stalled on KV in the first pass (fig 11, middle).
+
+    Stage numbering differs between models (different PP), which is why the
+    reduction happens here, once, and not in each caller. NaN columns when the
+    sweep has no decode TP all-reduce (TP=1) or no DECFB (no second token)."""
+    stages = sorted(int(m.group(1)) for c in s.columns
+                    if (m := re.fullmatch(r"dec(\d+)_ar_first_skew_ns", c)))
+    fsk = [s[f"dec{st}_ar_first_skew_ns"] for st in stages]
+    s["dec_ar_first_skew_ns"] = (pd.concat(fsk, axis=1).max(axis=1)
+                                 if fsk else NAN)
+    ratios = [s[f"dec{st}_ar_first_dur_ns"] / s[f"dec{st}_ar_rest_dur_mean_ns"]
+              for st in stages]
+    s["dec_ar_first_over_rest"] = (pd.concat(ratios, axis=1).max(axis=1)
+                                   if ratios else NAN)
+
+    lat_stages = sorted(int(m.group(1)) for c in s.columns
+                        if (m := re.fullmatch(r"dec(\d+)_kv_lateness_ns", c)))
+    lat = [s[f"dec{st}_kv_lateness_ns"] for st in lat_stages]
+    s["dec_kv_lateness_ns"] = (pd.concat(lat, axis=1).max(axis=1)
+                               if lat else NAN)
+    if "tok2_latency_ns" in s.columns and "itl_steady_ns" in s.columns:
+        s["decode_kv_stall_ns"] = s["tok2_latency_ns"] - s["itl_steady_ns"]
+    else:
+        s["decode_kv_stall_ns"] = NAN
+    return s
 
 
 # --------------------------------------------------------------------------- #
 REPORT = ["buffer_mb", "ttft_ns", "kv_gate_ns", "kv_gate_over_ttft",
           "pp_skew_ns", "rs_ar_first_ns", "rs_ar_rest_mean_ns", "cross_rank_skew_ns",
+          "kv_tp_skew_mean_ns", "kv_tp_skew_p99_ns",
+          "tok2_latency_ns", "itl_steady_ns",
           "link0_label", "link0_eff_pct", "link0_conc_peak", "link0_pause_frames"]
 
 
 def analyse_sweep(p: paths.SweepPaths, placement: Placement,
                   top_links: int = 6, bn_force: str | None = None,
                   verbose: bool = True,
-                  want_series: bool = True) -> tuple[list[Row], pd.DataFrame, list[str]]:
+                  want_series: bool = True,
+                  tags: list[str] | None = None) -> tuple[list[Row], pd.DataFrame, list[str]]:
     """Score one workload's whole buffer sweep, exactly as buffer_sweep.main
     does -- factored out so buffer_compare gets identical numbers (one
     definition of the metrics, two tools). Returns (rows sorted by buffer, the flat
     summary DataFrame, chosen_labels). Raises Abort on any condition main would.
     Does no I/O beyond reading the sweep; writing figures/CSV stays in the
     caller. `verbose` gates the progress prints so a multi-workload caller stays
-    quiet."""
+    quiet.
+
+    `tags` restricts the analysis to a subset of the sweep's run dirs (default:
+    all of p.tags('ns3')). A 2D sweep (e.g. oversubscription x buffer) shares one
+    ns3 dir but moves two knobs, so oversub2d_sweep calls this once per
+    oversubscription level with that level's buffer tags -- keeping the
+    single-variant (one buffer axis) contract intact within each call."""
     need(not p.missing_roots(),
          "derived root(s) do not exist:\n    "
          + "\n    ".join(p.missing_roots())
          + f"\n  --sweep {p.sweep!r} is probably wrong.")
-    tags = p.tags("ns3")
+    tags = tags if tags is not None else p.tags("ns3")
     need(tags, f"no run sub-directory under {p.ns3_root}")
 
     if verbose:
@@ -947,6 +1339,7 @@ def analyse_sweep(p: paths.SweepPaths, placement: Placement,
     rows = sorted(rows, key=lambda r: r.buffer_mb)
     s = (pd.DataFrame([r.flat() for r in rows])
          .sort_values("buffer_mb").reset_index(drop=True))
+    s = decode_worst_stage(s)
     return rows, s, chosen_labels
 
 

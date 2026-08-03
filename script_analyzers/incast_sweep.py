@@ -872,14 +872,18 @@ REPORT = ["level", "incast_degree", "buffer_mb", "bottleneck", "kv_skew_ms",
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", default=str(incast.ROOT), type=Path,
-                    help=f"project root (default: {incast.ROOT})")
-    ap.add_argument("--out-workload", default=incast.OUT_WORKLOAD,
-                    help=f"output dir name under output/<domain> (default: "
-                         f"{incast.OUT_WORKLOAD})")
-    ap.add_argument("--config-sweep", default=incast.CONFIG_SWEEP,
+    # Same --sweep/--workload/--root vocabulary as the other analyzers, with the
+    # incast twist documented in utils.incast: the generator wrote the configs
+    # (--sweep) and the outputs (--workload) under DIFFERENT names, and the run
+    # tags sit directly under output/<domain>/<workload> with no <sweep> nesting.
+    ap.add_argument("--sweep", default=incast.CONFIG_SWEEP,
                     help=f"config sub-dir under configs/astra_sim/ns3 (default: "
                          f"{incast.CONFIG_SWEEP})")
+    ap.add_argument("--workload", default=incast.OUT_WORKLOAD,
+                    help=f"workload dir under output/<domain>; the run tags sit "
+                         f"directly under it (default: {incast.OUT_WORKLOAD})")
+    ap.add_argument("--root", default=str(incast.ROOT), type=Path,
+                    help=f"project root (default: {incast.ROOT})")
     ap.add_argument("--levels", nargs="+", default=None,
                     help="incast levels to analyse, e.g. --levels T3 T4 "
                          "(default: every level found)")
@@ -888,18 +892,18 @@ def main(argv: list[str] | None = None) -> int:
                          "the busy set is their union (default: 3)")
     ap.add_argument("-o", "--out", default=None, type=Path,
                     help="output dir (default: results/sweep_analysis/incast/"
-                         "<out-workload>)")
+                         "<workload>)")
     a = ap.parse_args(argv)
 
     root = Path(a.root)
     outdir = (Path(a.out) if a.out else
-              root / "results" / "sweep_analysis" / "incast" / a.out_workload)
+              root / "results" / "sweep_analysis" / "incast" / a.workload)
 
     try:
-        levels_found = incast.discover_levels(a.out_workload, root, "ns3")
+        levels_found = incast.discover_levels(a.workload, root, "ns3")
         need(levels_found,
-             f"no incast level under {root / 'output' / 'ns3' / a.out_workload}. "
-             f"Is --out-workload right?")
+             f"no incast level under {root / 'output' / 'ns3' / a.workload}. "
+             f"Is --workload right?")
         if a.levels:
             want = set(a.levels)
             missing = want - set(levels_found)
@@ -908,13 +912,13 @@ def main(argv: list[str] | None = None) -> int:
             levels_found = [l for l in levels_found if l in want]
 
         print(f"  root      {root}")
-        print(f"  workload  {a.out_workload}")
+        print(f"  workload  {a.workload}")
         print(f"  out       {outdir}")
         print(f"  levels    {levels_found}")
 
         levels = []
         for lv in levels_found:
-            L = analyse_level(lv, root, a.out_workload, a.config_sweep,
+            L = analyse_level(lv, root, a.workload, a.sweep,
                               a.top_switches)
             if L is not None:
                 levels.append(L)

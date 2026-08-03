@@ -302,7 +302,11 @@ def unique_transfers(df: pd.DataFrame, op_class: str) -> pd.DataFrame:
 def kv_arrivals(df: pd.DataFrame) -> pd.DataFrame:
     """One row per KV transfer AT ITS RECEIVING RANK, columns dst, arrival, size --
     the same shape the fct.txt-based KV frame used, so barrier() / kv_rank_series()
-    / kv_stage_skew() consume it unchanged, only sourced from ASTRA.
+    / kv_stage_skew() consume it unchanged, only sourced from ASTRA -- plus the
+    structure the KV name itself carries: stage (ds, the destination decode
+    stage), shard (dsh, the destination TP index) and layer (L). Those three are
+    what the per-TP-group / per-layer skew figures group by; they are NaN when a
+    name omits the field, never guessed.
 
     From the recv side (op_class KV, comm_role recv): sys_id is the receiver and
     end_tick the delivery instant. A recv row is pre-posted at the run origin, so
@@ -310,15 +314,19 @@ def kv_arrivals(df: pd.DataFrame) -> pd.DataFrame:
     and equals the ns-3 fct arrival (start+fct), verified to the nanosecond. This
     drops the placement-based flow classification, MTU heuristic and incast
     dst-rank matching the fct path needed. Empty frame if roles were not resolved."""
+    cols = ["dst", "arrival", "size", "stage", "shard", "layer"]
     if df is None or df.empty:
-        return pd.DataFrame(columns=["dst", "arrival", "size"])
+        return pd.DataFrame(columns=cols)
     kv = df[df["op_class"] == "KV"]
     if "comm_role" not in kv.columns or not (kv["comm_role"] == "recv").any():
-        return pd.DataFrame(columns=["dst", "arrival", "size"])
+        return pd.DataFrame(columns=cols)
     kv = kv[kv["comm_role"] == "recv"]
     return pd.DataFrame({"dst": kv["sys_id"].astype(int),
                          "arrival": kv["end_tick"].astype(float),
-                         "size": kv["comm_size"].astype(float)})
+                         "size": kv["comm_size"].astype(float),
+                         "stage": pd.to_numeric(kv["ds"], errors="coerce"),
+                         "shard": pd.to_numeric(kv["dsh"], errors="coerce"),
+                         "layer": pd.to_numeric(kv["L"], errors="coerce")})
 
 
 def pp_arrivals(df: pd.DataFrame) -> pd.DataFrame:

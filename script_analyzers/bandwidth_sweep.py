@@ -452,7 +452,8 @@ def main(argv: list[str] | None = None) -> int:
             act.help = "output dir (default: results/sweep_analysis/" \
                        f"{KIND}/<workload>/<sweep>)"
     ap.add_argument("--pattern", default="*.csv",
-                    help="glob for the per-node CSVs inside each run dir")
+                    help="glob for the per-rank CSVs inside each run dir "
+                         "(default: *.csv)")
     a = ap.parse_args(argv)
 
     try:

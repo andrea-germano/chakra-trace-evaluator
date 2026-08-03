@@ -103,6 +103,10 @@ class SweepAxis:
 
 BANDWIDTH_AXIS = SweepAxis("bx")
 BUFFER_AXIS = SweepAxis("buf")
+# Oversubscription sweep (T1): the swept knob is the down:up ratio, encoded as the
+# `os<N>` token in the run-dir name (e.g. T1_os8_dcqcn_buf32 -> 8). The uplink is held
+# at 200Gbps and the PCIe downlink is scaled to hit the ratio (2 x downlink / 200).
+OVERSUB_AXIS = SweepAxis("os")
 
 # The generation side writes bx straight into physical_topology.txt as Gbps
 # (e.g. bx400 -> "400Gbps" on the leaf links), but the ASTRA-sim CSVs report
@@ -141,3 +145,26 @@ def add_arguments(ap, kind: str) -> None:
     ap.add_argument("-o", "--out", default=None, type=Path,
                     help=f"output dir (default: results/sweep_analysis/{kind}/"
                          f"<sweep>/<workload>)")
+
+
+def add_compare_arguments(ap, kind: str, default_sweep: str) -> None:
+    """The path flags the two cross-model companions share. Same vocabulary as
+    add_arguments -- --sweep / --root / -o -- with the single --workload replaced
+    by --workloads / --exclude glob filters, because these tools DISCOVER every
+    workload that ran the sweep instead of being told one. `--sweep` has a
+    default here (not required): each companion is bound to one sweep family."""
+    ap.add_argument("--sweep", default=default_sweep,
+                    help="sweep sub-directory name to look for under every "
+                         f"workload (default: {default_sweep})")
+    ap.add_argument("--root", default=str(ROOT), type=Path,
+                    help=f"project root (default: {ROOT})")
+    ap.add_argument("--workloads", nargs="+", default=None,
+                    help="glob pattern(s) to keep (default: every workload that "
+                         "has the sweep), e.g. --workloads 'llama2_13b_*'")
+    ap.add_argument("--exclude", nargs="+", default=None,
+                    help="glob pattern(s) to drop")
+    ap.add_argument("-o", "--out", default=None, type=Path,
+                    help=f"output dir (default: results/sweep_analysis/{kind}/"
+                         f"<sweep>)")
+    ap.add_argument("--list", action="store_true",
+                    help="print discovered workloads and exit, without analysing")

@@ -21,8 +21,8 @@ one intentional difference is the control-traffic threshold, now split into an
 analysis value (aligned with utils.astra) and a lower visualisation value -- see
 CONTROL_MAX_BYTES / TIMELINE_CONTROL_MAX_BYTES below.
 
-    python3 astra_analyzer.py <model>/<tag>       # path under output/astra_logs
     python3 astra_analyzer.py --sweep buffer_sweep_T1 --tag T1_bx200_dcqcn_buf4
+    # input: output/astra_logs/<workload>/<sweep>/<tag>, like every analyzer
 
 Outputs (results/astra_analysis/... by default):
     01_latency_breakdown.png  02_communication_mix.png  03_effective_bandwidth.png
@@ -54,10 +54,7 @@ from utils.cli import Abort, need
 #  Configuration
 # --------------------------------------------------------------------------- #
 
-# Root from which model/topology sub-paths are resolved when a relative --input
-# is given, and the root under which per-run result folders are written.
-DATA_DIR = paths.ROOT / "output" / "astra_logs"
-RESULT_DIR = paths.ROOT / "results" / "astra_analysis"
+KIND = "astra"
 
 # Two thresholds, on purpose, for the two different jobs this file does.
 #
@@ -1243,40 +1240,29 @@ def analyse(run_dir: Path, out_dir: Path, title: str, pattern: str = "*.csv") ->
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("input", nargs="?", default=None,
-                    help="path to a run dir with stats_sys*.csv (absolute, or "
-                         "relative to output/astra_logs). Alternative to --sweep/--tag.")
-    ap.add_argument("--sweep", default=None,
-                    help="sweep dir name (package convention); with --tag resolves "
-                         "the run via utils.paths")
-    ap.add_argument("--tag", default=None, help="run tag under the sweep")
-    ap.add_argument("--workload", default=paths.WORKLOAD,
-                    help=f"workload dir under output/astra_logs (default: {paths.WORKLOAD})")
-    ap.add_argument("--root", default=str(paths.ROOT), type=Path,
-                    help=f"project root (default: {paths.ROOT})")
-    ap.add_argument("-o", "--out", default=None, type=Path,
-                    help="output dir (default: results/astra_analysis/<...>)")
+    paths.add_arguments(ap, KIND)
+    for act in ap._actions:
+        if act.dest == "out":
+            act.help = "output dir (default: results/astra_analysis/<workload>/<sweep>/<tag>)"
+    ap.add_argument("--tag", required=True,
+                    help="run sub-directory, e.g. 'T1_bx200_dcqcn_buf8'")
     ap.add_argument("--title", default=None, help="label shown in the timeline header")
     ap.add_argument("--pattern", default="*.csv",
-                    help="glob for the per-rank CSVs (default: *.csv)")
+                    help="glob for the per-rank CSVs inside the run dir (default: *.csv)")
     args = ap.parse_args(argv)
 
     try:
-        root = Path(args.root)
-        if args.input:
-            p = Path(args.input)
-            run_dir = p if (p.is_absolute() or p.exists()) else (root / "output" / "astra_logs" / args.input)
-            default_out = root / "results" / "astra_analysis" / args.input
-        elif args.sweep and args.tag:
-            sp = paths.SweepPaths(args.sweep, args.workload, root)
-            run_dir = sp.astra_run(args.tag)
-            default_out = root / "results" / "astra_analysis" / args.workload / args.sweep / args.tag
-        else:
-            need(False, "give an input run dir (positional), or both --sweep and --tag")
-
-        need(run_dir.is_dir(), f"run dir not found: {run_dir}")
-        out_dir = args.out or default_out
-        title = args.title or run_dir.name or "run"
+        p = paths.SweepPaths(sweep=args.sweep, workload=args.workload, root=Path(args.root))
+        need(p.astra_root.is_dir(),
+             f"derived ASTRA root does not exist:\n    {p.astra_root}\n"
+             f"  --sweep {args.sweep!r} or --workload {args.workload!r} is wrong.")
+        run_dir = p.astra_run(args.tag)
+        need(run_dir.is_dir(),
+             f"missing {run_dir}\n  --tag {args.tag!r} may be wrong; "
+             f"{p.astra_root} has: {sorted(x.name for x in p.astra_root.iterdir())[:8]}")
+        out_dir = args.out or (p.root / "results" / "astra_analysis"
+                               / args.workload / args.sweep / args.tag)
+        title = args.title or args.tag
         analyse(run_dir, out_dir, title, args.pattern)
         return 0
     except Abort as e:
