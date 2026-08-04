@@ -2,4 +2,4 @@ __pycache__/
 
 output/
 results/
-experiments/
+experiments/*.log

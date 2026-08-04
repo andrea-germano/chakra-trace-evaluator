@@ -1,0 +1,44 @@
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_256reqs_128prompt bandwidth_sweep/T2_bx25_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_256reqs_128prompt bandwidth_sweep/T2_bx50_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_256reqs_128prompt bandwidth_sweep/T2_bx100_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_256reqs_128prompt bandwidth_sweep/T2_bx200_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_256reqs_128prompt bandwidth_sweep/T2_bx400_dcqcn_buf32
+
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt bandwidth_sweep/T2_bx25_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt bandwidth_sweep/T2_bx50_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt bandwidth_sweep/T2_bx100_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt bandwidth_sweep/T2_bx200_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt bandwidth_sweep/T2_bx400_dcqcn_buf32
+
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_2048prompt bandwidth_sweep/T2_bx25_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_2048prompt bandwidth_sweep/T2_bx50_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_2048prompt bandwidth_sweep/T2_bx100_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_2048prompt bandwidth_sweep/T2_bx200_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_2048prompt bandwidth_sweep/T2_bx400_dcqcn_buf32
+
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_4reqs_8192prompt bandwidth_sweep/T2_bx25_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_4reqs_8192prompt bandwidth_sweep/T2_bx50_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_4reqs_8192prompt bandwidth_sweep/T2_bx100_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_4reqs_8192prompt bandwidth_sweep/T2_bx200_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_4reqs_8192prompt bandwidth_sweep/T2_bx400_dcqcn_buf32
+
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_1reqs_32768prompt bandwidth_sweep/T2_bx25_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_1reqs_32768prompt bandwidth_sweep/T2_bx50_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_1reqs_32768prompt bandwidth_sweep/T2_bx100_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_1reqs_32768prompt bandwidth_sweep/T2_bx200_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_1reqs_32768prompt bandwidth_sweep/T2_bx400_dcqcn_buf32
+
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt bandwidth_sweep/T2_bx25_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt bandwidth_sweep/T2_bx50_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt bandwidth_sweep/T2_bx100_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt bandwidth_sweep/T2_bx200_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt bandwidth_sweep/T2_bx400_dcqcn_buf32
+
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_4reqs_512prompt bandwidth_sweep/T2_bx25_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_4reqs_512prompt bandwidth_sweep/T2_bx50_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_4reqs_512prompt bandwidth_sweep/T2_bx100_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_4reqs_512prompt bandwidth_sweep/T2_bx200_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_4reqs_512prompt bandwidth_sweep/T2_bx400_dcqcn_buf32
+
+../generate_log_ns3.sh llama31_70b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt T2_bx100_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt T2_bx100_dcqcn_buf32
