@@ -3,15 +3,9 @@
 cc_sweep — the congestion-control comparison on the disaggregated-inference
 fabric: same topologies and KV-cache incast as incast_sweep (T3/T4 = prefill
 TP4/TP8 converging on TP2 decode pools), but the swept knob is the CC ALGORITHM
-(dcqcn / hpcc / timely / dctcp / none), with the per-switch buffer as a small
-secondary axis (8/16/32 MiB) that separates the PFC-storm regime from the
+(dcqcn / hpcc / hpcc-pint / timely / dctcp), with the per-switch buffer as a
+small secondary axis (8/16/32 MiB) that separates the PFC-storm regime from the
 comfortable one.
-
-`none` (CC_MODE 12) is the window-only ideal baseline: injection capped at the
-per-pair BDP, PFC as the only backpressure. Every other CC pays its control
-loop on top of that floor, so the summary reports each CC's makespan and TTFT
-RELATIVE to `none` at the same (topology, buffer) — the price (or gain) of the
-congestion control itself.
 
 Per-CC parameters are the HPCC SIGCOMM'19 artifact set at 100G (vwin variants);
 see configs/astra_sim/ns3/documentation/cc_parameter_provenance.md. The
@@ -22,9 +16,9 @@ as another algorithm.
 Reused verbatim from incast_sweep (one definition of a metric): the whole
 per-run measurement (`analyse` -> Row: TTFT, makespan, intra-stage KV skew,
 PFC census, drops, busiest switches), the placement recovery and the loss
-marking. New here: the CC axis, the KV-flow FCT distribution (mean/p50/p99 and
-p99 slowdown — the classic CC-comparison metric, read from the same fct.txt),
-and the vs-`none` normalisation.
+marking. New here: the CC axis and the KV-flow FCT distribution (mean/p50/p99
+and p99 slowdown — the classic CC-comparison metric, read from the same
+fct.txt).
 
 Output
 --------------------------------------------------------------------------------
@@ -33,7 +27,6 @@ Output
     <out>/03_kv_arrival_skew_vs_buffer.png worst intra-stage KV skew, line/CC
     <out>/04_makespan_vs_buffer.png        makespan (y fitted), panel/topo, line/CC
     <out>/05_ttft_vs_buffer.png            TTFT, panel/topo, line/CC
-    <out>/06_makespan_vs_none.png          makespan normalised to `none`, line/CC
     <out>/summary.csv                      one row per run
 Usage
 -----
@@ -80,11 +73,9 @@ OUT_WORKLOAD = "llama2_13b_16reqs_512prompt_cc_sweep"
 # bx and buf tokens (may contain '-', e.g. hpcc-pint, but never '_').
 _CC = re.compile(r"_bx[^_]+_(.+?)_buf\d", re.IGNORECASE)
 
-# Fixed CC identity: same colour in every figure. `none` is the ideal baseline
-# and is drawn dashed grey so it reads as a floor, not as a competitor.
-CC_ORDER = ["none", "dcqcn", "hpcc", "timely", "dctcp", "hpcc-pint"]
+# Fixed CC identity: same colour in every figure.
+CC_ORDER = ["dcqcn", "hpcc", "timely", "dctcp", "hpcc-pint"]
 CC_STYLE = {
-    "none":      dict(color="#9aa0a6", ls="--"),
     "dcqcn":     dict(color="#1f77b4", ls="-"),
     "hpcc":      dict(color="#2b8a3e", ls="-"),
     "timely":    dict(color="#6a4c93", ls="-"),
@@ -252,27 +243,12 @@ def analyse_level(level: str, root: Path, out_workload: str,
                  label=f"{level} (tp{degree})")
 
 
-def add_vs_none(s: pd.DataFrame) -> pd.DataFrame:
-    """makespan/TTFT normalised to the `none` run of the SAME (level, buffer):
-    the cost of the congestion control itself. NaN when `none` is not on disk
-    (e.g. smoke-testing on the dcqcn-only incast sweep)."""
-    base = (s[s["cc"] == "none"]
-            .set_index(["level", "buffer_mb"])[["total_exec_ms", "ttft_ms"]]
-            .rename(columns={"total_exec_ms": "_none_total",
-                             "ttft_ms": "_none_ttft"}))
-    s = s.join(base, on=["level", "buffer_mb"])
-    s["makespan_vs_none"] = s["total_exec_ms"] / s["_none_total"]
-    s["ttft_vs_none"] = s["ttft_ms"] / s["_none_ttft"]
-    return s.drop(columns=["_none_total", "_none_ttft"])
-
-
 # --------------------------------------------------------------------------- #
 # Figures: panel per topology, one line per CC, buffer on x
 # --------------------------------------------------------------------------- #
 def _cc_lines(levels: list[Level], s: pd.DataFrame, ycol: str, ylabel: str,
               title: str, fname: str, outdir: Path, written: list[Path],
-              yscale: str | None = None, zoom: bool = False,
-              hline1: bool = False) -> None:
+              yscale: str | None = None, zoom: bool = False) -> None:
     usable = [lv for lv in levels
               if not s[(s["level"] == lv.level)].dropna(subset=[ycol]).empty]
     if not usable:
@@ -293,8 +269,6 @@ def _cc_lines(levels: list[Level], s: pd.DataFrame, ycol: str, ylabel: str,
             a.plot(g["buffer_mb"], g[ycol], marker="o", label=cc, **_style(cc))
             _mark_lossy(a, g, "buffer_mb", ycol)
             ally.append(g[ycol])
-        if hline1:
-            a.axhline(1.0, color="#9aa0a6", lw=0.8, ls=":")
         logx_pow2(a, g0, "buffer_mb", "Per-switch buffer (MiB)")
         if yscale == "symlog":
             a.set_yscale("symlog", linthresh=10)
@@ -315,7 +289,7 @@ def _cc_lines(levels: list[Level], s: pd.DataFrame, ycol: str, ylabel: str,
 
 # --------------------------------------------------------------------------- #
 REPORT = ["level", "cc", "buffer_mb", "ttft_ms", "total_exec_ms",
-          "makespan_vs_none", "kv_fct_p50_ms", "kv_fct_p99_ms",
+          "kv_fct_p50_ms", "kv_fct_p99_ms",
           "kv_slowdown_p99", "kv_skew_ms", "total_pause_frames",
           "dropped_packets", "split_ok"]
 
@@ -366,7 +340,6 @@ def main(argv: list[str] | None = None) -> int:
         levels.sort(key=lambda L: L.degree)
 
         s = pd.DataFrame([r.flat() for L in levels for r in L.runs])
-        s = add_vs_none(s)
         s["cc"] = pd.Categorical(
             s["cc"],
             categories=sorted(s["cc"].unique(), key=_cc_sort_key), ordered=True)
@@ -397,12 +370,6 @@ def main(argv: list[str] | None = None) -> int:
         _cc_lines(levels, s, "ttft_ms", "TTFT (ms)",
                   "TTFT vs buffer, per CC (y fitted to data)",
                   "05_ttft_vs_buffer.png", outdir, written, zoom=True)
-        if s["makespan_vs_none"].notna().any():
-            _cc_lines(levels, s, "makespan_vs_none",
-                      "Makespan / makespan(none)",
-                      "Cost of the CC: makespan normalised to the window-only "
-                      "baseline", "06_makespan_vs_none.png", outdir, written,
-                      zoom=True, hline1=True)
 
         pd.set_option("display.width", 240)
         print("\n================ CC SWEEP ================")
