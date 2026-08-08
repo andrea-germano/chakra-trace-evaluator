@@ -16,6 +16,10 @@
 #     output/ns3/<OUTPUT_DIR_NAME>/... subtree);
 #   - two instances sharing the same OUTPUT_DIR_NAME still collide on ns-3
 #     outputs and must not run concurrently.
+#
+# All-or-nothing outputs: a run leaves both output trees complete, or neither.
+# Both are wiped before the run and after any failure, so a half-written run can
+# never reach the analysis scripts. KEEP_FAILED=1 keeps them for post-mortem.
 
 # 1. Ask for user input (supports command line args or interactive prompt)
 MODEL_FILE_NAME="$1"
@@ -45,6 +49,11 @@ if [ -z "$OUTPUT_DIR_NAME" ]; then
   echo "Output directory not specified, using: $OUTPUT_DIR_NAME"
 fi
 
+# It ends up inside rm -rf targets: keep it strictly under output/.
+case "$OUTPUT_DIR_NAME" in
+  /*|*..*) echo "ERROR: Output directory name must be relative and free of '..': $OUTPUT_DIR_NAME"; exit 1 ;;
+esac
+
 echo "---------------------------------------------------"
 
 # 2. Paths
@@ -71,6 +80,7 @@ WORKLOAD_PREFIX="$TRACES_DIR/$MODEL_FILE_NAME/et/$MODEL_FILE_NAME"
 COMM_GROUPS="$TRACES_DIR/$MODEL_FILE_NAME/comm_groups.json"
 NS3_OUT_DIR="$BASE_DIR/output/ns3/$OUTPUT_DIR_NAME"
 OUTPUT_DIR="$BASE_DIR/output/astra_logs/${OUTPUT_DIR_NAME}"
+NS3_DROPS="$NS3_OUT_DIR/drops.txt"
 
 # ESSENTIAL CHECK 2: Verify all required files and binaries exist
 if [ ! -x "$NS3_BIN" ]; then
@@ -101,15 +111,20 @@ if [ ! -f "$COMM_GROUPS" ]; then
   exit 1
 fi
 
+# One .et per rank: how many stats_sys*.csv a complete run must produce.
+EXPECTED_RANKS=$(find "$TRACES_DIR/$MODEL_FILE_NAME/et/" -maxdepth 1 -name "${MODEL_FILE_NAME}.*.et" | wc -l)
+
 # --- EXECUTION ---
 
 # Ensure we run from the root
 cd "$BASE_DIR" || exit
 
-if [ -d "$OUTPUT_DIR" ]; then
-  rm -rf "$OUTPUT_DIR"
-  echo "Existing output directory $OUTPUT_DIR removed."
-fi
+purge_outputs() {
+  rm -rf "$OUTPUT_DIR" "$NS3_OUT_DIR"
+  echo "==> outputs removed ($1)"
+}
+
+purge_outputs "pre-run cleanup"
 mkdir -p "$NS3_OUT_DIR"
 
 # Resolve the __RUN_DIR__ placeholder into a per-run temporary config so the
@@ -125,18 +140,53 @@ if ! grep -q "__RUN_DIR__" "$NET_CFG"; then
 fi
 
 RESOLVED_CFG="$(mktemp "${TMPDIR:-/tmp}/ns3_config.${OUTPUT_DIR_NAME//\//_}.XXXXXX.txt")"
-trap 'rm -f "$RESOLVED_CFG"' EXIT
+STDOUT_FIFO="$(mktemp -u "${TMPDIR:-/tmp}/ns3_stdout.${OUTPUT_DIR_NAME//\//_}.XXXXXX")"
 sed "s#__RUN_DIR__#${OUTPUT_DIR_NAME}#g" "$NET_CFG" > "$RESOLVED_CFG"
 
-echo "==> Starting ASTRA-sim (ns-3 backend)..."
+# RUN_OK flips to 1 only once the run is verified complete; every other exit
+# path takes the outputs down with it.
+RUN_OK=0
+PIDS=()
+
+cleanup() {
+  if [ ${#PIDS[@]} -gt 0 ]; then
+    kill -TERM "${PIDS[@]}" 2>/dev/null
+    for _ in $(seq 1 20); do
+      kill -0 "${PIDS[0]}" 2>/dev/null || break
+      sleep 0.05
+    done
+    kill -KILL "${PIDS[@]}" 2>/dev/null
+  fi
+  rm -f "$RESOLVED_CFG" "$STDOUT_FIFO"
+  if [ "$RUN_OK" -ne 1 ]; then
+    if [ "${KEEP_FAILED:-0}" = "1" ]; then
+      echo "==> KEEP_FAILED=1: partial outputs kept in $OUTPUT_DIR and $NS3_OUT_DIR"
+    else
+      purge_outputs "run did not complete"
+    fi
+  fi
+}
+trap cleanup EXIT
+trap 'echo "==> Interrupted — killing ns-3 and cleaning up."; exit 130' INT TERM HUP
+
+echo "==> Starting ASTRA-sim (ns-3 backend)... ($EXPECTED_RANKS ranks expected)"
 # Packet drops ("Headroom full" + a companion per-port state line) are printed by
 # ns-3 ONLY to stdout, and a lossy run prints thousands of them. Keep the console
-# clean: route the drop lines to drops.txt (created only if at least one drop
-# occurs), discard the companion state dump, and let all other (info) output
-# through to the screen. No full stdout log is kept: it is redundant with
-# astra_logs/.../log.log. Convention: drops.txt ABSENT == lossless.
-NS3_DROPS="$NS3_OUT_DIR/drops.txt"
-set -o pipefail
+# clean: route the drop lines to drops.txt, discard the companion state dump, and
+# let all other (info) output through to the screen. Convention: drops.txt ABSENT
+# == lossless
+mkfifo "$STDOUT_FIFO" || { echo "ERROR: cannot create FIFO $STDOUT_FIFO"; exit 1; }
+
+awk -v drops="$NS3_DROPS" '
+    /Headroom full/ { print > drops; expect=1; next }  # drop -> drops.txt (created here), off stdout
+    expect && /^\(/ { expect=0; next }                 # its (a,b)... companion line -> discarded
+    { expect=0; print }                                # info -> stdout (on screen)
+  ' < "$STDOUT_FIFO" &
+AWK_PID=$!
+
+# ns-3 goes to the background so bash can sit in `wait`: while it waits on a
+# FOREGROUND command it defers trap handlers, so a signal used to be queued for
+# the rest of the run and the cleanup never ran.
 "$NS3_BIN" \
   --workload-configuration="$WORKLOAD_PREFIX" \
   --system-configuration="$SYSTEM_CFG" \
@@ -144,14 +194,35 @@ set -o pipefail
   --remote-memory-configuration="$REMOTE_MEM_CFG" \
   --logical-topology-configuration="$LOGICAL_TOPO" \
   --comm-group-configuration="$COMM_GROUPS" \
-  --logging-folder="$OUTPUT_DIR" 2>&1 \
-  | awk -v drops="$NS3_DROPS" '
-      /Headroom full/ { print > drops; expect=1; next }  # drop -> drops.txt (created here), off stdout
-      expect && /^\(/ { expect=0; next }                 # its (a,b)... companion line -> discarded
-      { expect=0; print }'                               # info -> stdout (on screen)
+  --logging-folder="$OUTPUT_DIR" > "$STDOUT_FIFO" 2>&1 &
   # --logging-configuration="$LOGGING_CFG" \
-RC=${PIPESTATUS[0]}
-set +o pipefail
+NS3_PID=$!
+PIDS=("$NS3_PID" "$AWK_PID")
+
+wait "$NS3_PID"; RC=$?
+wait "$AWK_PID" 2>/dev/null   # let awk drain the FIFO and flush drops.txt
+PIDS=()
+
+FAILURE=""
+GOT_RANKS=$(find "$OUTPUT_DIR" -maxdepth 1 -name 'stats_sys*.csv' 2>/dev/null | wc -l)
+
+if [ $RC -ne 0 ]; then
+  FAILURE="ns-3 backend exited with code $RC"
+elif [ ! -f "$OUTPUT_DIR/log.log" ]; then
+  FAILURE="log.log was never written"
+elif ! grep -q "All ranks have finished" "$OUTPUT_DIR/log.log"; then
+  FAILURE="log.log has no 'All ranks have finished' marker (ended early)"
+elif [ "$GOT_RANKS" -ne "$EXPECTED_RANKS" ]; then
+  FAILURE="only $GOT_RANKS/$EXPECTED_RANKS stats_sys*.csv produced"
+elif [ -s "$OUTPUT_DIR/err.log" ]; then
+  FAILURE="err.log is not empty ($(wc -c < "$OUTPUT_DIR/err.log") bytes)"
+fi
+
+if [ -n "$FAILURE" ]; then
+  echo "==> ERROR: $FAILURE"
+  echo "    Set KEEP_FAILED=1 to keep the partial outputs for inspection."
+  exit 1
+fi
 
 if [ -f "$NS3_DROPS" ]; then
   echo "==> WARNING: $(wc -l < "$NS3_DROPS") dropped packet(s) ('Headroom full') — run is NOT lossless (see $NS3_DROPS)."
@@ -159,16 +230,7 @@ else
   echo "==> lossless: 0 dropped packets."
 fi
 
-if [ $RC -ne 0 ]; then
-  echo "==> ERROR: ASTRA-sim ns-3 backend exited with code $RC."
-  echo "    Check the terminal output above for the failing argument/file."
-  if [ -d "$OUTPUT_DIR" ]; then
-    rm -rf "$OUTPUT_DIR"
-    echo "==> NOTE: Removed the 'log' folder produced by ASTRA-sim due to the error."
-  fi
-  exit 1
-fi
-
-echo "==> SUCCESS: System-layer logs saved in $OUTPUT_DIR"
+RUN_OK=1
+echo "==> SUCCESS: System-layer logs saved in $OUTPUT_DIR ($EXPECTED_RANKS/$EXPECTED_RANKS ranks)"
 echo "==> ns-3 packet-level outputs: $NS3_OUT_DIR"
 echo "---------------------------------------------------"
