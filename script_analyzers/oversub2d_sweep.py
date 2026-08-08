@@ -23,16 +23,25 @@ What it produces
    KV stall), one full set per oversubscription level. Same layout you already
    read on the buffer sweep, so every per-run/time-series figure stays legible
    (4 buffers per panel, not 16).
-2. top level -- the 2D synthesis across all OS levels: line families (one line
-   per oversubscription level, x = buffer) and heatmaps (os x buffer) for the
-   signals that read as a CLEAN FIELD on this plane -- congestion severity
-   (paused fraction of the window, NOT the pause-frame count, which inverts as
-   os rises), the two accurate outcomes (delivered KV bandwidth and KV
-   completion time), TTFT, and the mechanism (concurrency, queue peak). This is
-   where the "knee moves right as os grows" story is read directly. The
-   tail-dominated skew/stall scalars are deliberately NOT synthesised here --
-   they oscillate non-monotonically with buffer and are read per os level in the
-   by_oversub sets instead.
+2. top level -- the 2D synthesis across all OS levels, one line per level,
+   x = buffer, in two families:
+
+   * the buffer-sweep STORY, re-drawn in buffer_sweep's own figure layouts so
+     the two analyses read side by side -- the causal chain to TTFT (01: PP
+     skew -> gated all-reduce bw -> steady bw -> TTFT, stacked panels), the KV
+     TP-group skew (08), the decode first all-reduce (09) and the decode KV
+     stall (10). These are the same questions the buffer sweep asks, now with
+     "and how does the answer move with the oversubscription ratio" on top.
+     Being tail-sensitive, several respond non-monotonically to the buffer: a
+     LINE shows that honestly (every point is visible), which is why they get
+     line families here and stay OUT of the heatmaps, where the interpolated
+     gradient would read as a trend.
+   * SEVERITY / OUTCOME / MECHANISM (02-07): congestion severity (paused
+     fraction of the window, NOT the pause-frame count, which inverts as os
+     rises), the accurate outcomes (delivered KV bandwidth, KV completion,
+     TTFT), and the mechanism (concurrency, queue peak). The three that read
+     as a clean field also get heatmaps (11-13) -- this is where the "knee
+     moves right as os grows" story is read directly.
 
 Reuse, not reinvention
 ----------------------
@@ -79,21 +88,23 @@ KIND = "oversub2d"
 # --------------------------------------------------------------------------- #
 # Line-family: one metric vs buffer, one line per oversubscription level.
 # --------------------------------------------------------------------------- #
+def _os_color(i: int, n: int):
+    return plt.get_cmap("viridis")(i / max(n - 1, 1))
+
+
 def line_family(s: pd.DataFrame, col: str, ylabel: str, title: str, name: str,
                 outdir: Path, written: list, scale: float = 1.0,
                 yscale: str | None = None) -> None:
     if col not in s.columns or not s[col].notna().any():
         return
     fig, ax = plt.subplots(figsize=(8, 5))
-    cmap = plt.get_cmap("viridis")
     levels = sorted(s["oversub"].unique())
-    denom = max(len(levels) - 1, 1)
     for i, os_ratio in enumerate(levels):
         sub = s[s["oversub"] == os_ratio].sort_values("buffer_mb")
         if not sub[col].notna().any():
             continue
         ax.plot(sub["buffer_mb"], sub[col] * scale, marker="o",
-                color=cmap(i / denom), label=f"{os_ratio:g}:1")
+                color=_os_color(i, len(levels)), label=f"{os_ratio:g}:1")
     logx_pow2(ax, s, "buffer_mb", "Per-switch buffer (MiB)")
     if yscale:
         ax.set_yscale(yscale)
@@ -101,6 +112,40 @@ def line_family(s: pd.DataFrame, col: str, ylabel: str, title: str, name: str,
     ax.set_title(title)
     ax.grid(True, alpha=0.3, which="both")
     ax.legend(title="oversubscription", fontsize=8)
+    save_fig(fig, outdir, name, written)
+
+
+def multi_panel(s: pd.DataFrame, panels: list, suptitle: str, name: str,
+                outdir: Path, written: list) -> None:
+    """Stacked panels sharing the buffer x-axis -- buffer_sweep's causal-chain
+    layout -- with one line per oversubscription level in every panel. A panel
+    whose column is absent or all-NaN is dropped; the whole figure is skipped
+    when nothing survives. `panels` = [(col, ylabel, scale, hline), ...]."""
+    panels = [p for p in panels if p[0] in s.columns and s[p[0]].notna().any()]
+    if not panels:
+        return
+    levels = sorted(s["oversub"].unique())
+    n = len(panels)
+    fig, axes = plt.subplots(n, 1, sharex=True, figsize=(8.5, 2.2 * n + 1.0))
+    axes = np.atleast_1d(axes)
+    for ax, (col, ylabel, scale, hline) in zip(axes, panels):
+        for i, os_ratio in enumerate(levels):
+            sub = s[s["oversub"] == os_ratio].dropna(subset=[col]) \
+                   .sort_values("buffer_mb")
+            if sub.empty:
+                continue
+            ax.plot(sub["buffer_mb"], sub[col] * scale, marker="o", ms=4,
+                    color=_os_color(i, len(levels)), label=f"{os_ratio:g}:1")
+        if hline is not None:
+            ax.axhline(hline, color="k", ls=":", lw=1.0, alpha=0.5)
+        logx_pow2(ax, s, "buffer_mb", "Per-switch buffer (MiB)")
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.grid(True, alpha=0.3, which="both")
+    for ax in axes[:-1]:
+        ax.set_xlabel("")
+    axes[0].legend(title="oversub", fontsize=7,
+                   ncol=min(len(levels), 4), loc="best")
+    fig.suptitle(suptitle, y=1.0)
     save_fig(fig, outdir, name, written)
 
 
@@ -139,25 +184,55 @@ def heatmap(s: pd.DataFrame, col: str, title: str, name: str, outdir: Path,
 
 
 # --------------------------------------------------------------------------- #
-# Top-level 2D synthesis: SEVERITY + OUTCOME + MECHANISM across os levels.
+# Top-level 2D synthesis: the buffer-sweep STORY (01, 08-10) + SEVERITY /
+# OUTCOME / MECHANISM (02-07) + heatmaps (11-13), across os levels.
 # --------------------------------------------------------------------------- #
-# On the os x buffer plane, only metrics that read as a clean field survive here.
-# The old set carried every buffer_sweep scalar, including the tail-dominated
-# ones (pp_skew, kv_tp_skew, dec_ar_first_*, decode_kv_stall, dec_kv_lateness):
-# on this plane those are set by a single straggler and oscillate non-monotonically
-# with buffer, so a heatmap of them paints a gradient that is deterministic
-# sensitivity, not a trend. They are all still drawn PER OS LEVEL in
-# by_oversub/os<N>/ (buffer_sweep figs 08/10/11) where each is read on its own
-# time series; they are just no longer synthesised on the 2D plane.
+# The story figures re-draw buffer_sweep's own layouts (its figs 01/08/10/11)
+# with the oversubscription level as the line family, so the buffer analysis
+# and this one read side by side. Several of these are tail-sensitive (set by a
+# single straggler) and respond non-monotonically to the buffer: a line shows
+# that honestly -- every point is visible -- which is why they are drawn as
+# line families here and deliberately kept OUT of the heatmaps, whose
+# interpolated gradient would read deterministic sensitivity as a trend.
+# The full time-series versions stay in by_oversub/os<N>/ (buffer_sweep figs).
 #
-# Worse, the old headline metric here -- link0_pause_frames -- INVERTS with
-# oversubscription: as os rises the bottleneck stays paused in longer continuous
-# stretches, so the pause/resume COUNT drops (132k -> 67k -> 51k at buf2) even
-# though congestion worsens. The severity that actually rises monotonically is
-# the paused FRACTION of the window (51% -> 75% -> 85%), so that is the severity
-# signal now, backed by the two accurate outcome metrics (delivered bw and KV
-# completion, from fct bytes -- not affected by the pfc qIndex caveat).
-#
+# The severity metric is the paused FRACTION of the window, not the pause-frame
+# count: the count INVERTS with oversubscription (as os rises the bottleneck
+# stays paused in longer continuous stretches, so pause/resume events DROP,
+# 132k -> 67k -> 51k at buf2, even though congestion worsens) while the paused
+# fraction rises monotonically (51% -> 75% -> 85%). The outcome metrics
+# (delivered bw, KV completion) come from fct bytes and are not affected by
+# the pfc qIndex caveat.
+
+# Buffer-story stacked figures: (filename, suptitle, [(col, ylabel, scale,
+# hline), ...]). Worst-stage reductions (dec_*) come from decode_worst_stage,
+# so they are stage-count independent; tok2_over_itl is derived in main().
+STORY_SPECS = [
+    ("01_causal_chain_to_ttft.png",
+     "Does PP skew propagate into TTFT?  (one line per os level)", [
+        ("pp_skew_ns", "PP arrival skew (µs)", 1e-3, None),
+        ("rs_ar_first_bw", "Gated all-reduce\neff. bw (GB/s)", 1.0, None),
+        ("rs_ar_rest_bw", "Steady all-reduce\neff. bw (GB/s)", 1.0, None),
+        ("ttft_ns", "TTFT (ms)", MS, None),
+     ]),
+    ("08_kv_tp_group_skew_vs_buffer.png",
+     "KV arrival skew within each TP group  (one line per os level)", [
+        ("kv_tp_skew_mean_ns", "Cross-shard skew,\nmean (ms)", MS, None),
+        ("kv_tp_skew_p99_ns", "Cross-shard skew,\np99 (ms)", MS, None),
+     ]),
+    ("09_decode_first_allreduce_vs_buffer.png",
+     "Skew inherited by the decode first TP all-reduce (worst stage)", [
+        ("dec_ar_first_skew_ns", "First AR entry\nskew (ms)", MS, None),
+        ("dec_ar_first_over_rest", "First AR duration\n(× steady-state)", 1.0, 1.0),
+     ]),
+    ("10_decode_kv_stall_vs_buffer.png",
+     "How much the decode is stalled by its KV transfer", [
+        ("decode_kv_stall_ns", "First-pass KV\nstall (ms)", MS, 0.0),
+        ("tok2_over_itl", "First decode pass\n(× steady ITL)", 1.0, 1.0),
+        ("dec_kv_lateness_ns", "KV ready − first\ninput (ms)", MS, 0.0),
+     ]),
+]
+
 # (col, ylabel, scale, yscale, title, filename) -- one line per os level.
 #   SEVERITY   pause_pct_of_window   how long the bottleneck is backpressured
 #   OUTCOME    eff_pct, kv_gate, ttft   what the KV/prefill actually cost
@@ -166,42 +241,46 @@ def heatmap(s: pd.DataFrame, col: str, title: str, name: str, outdir: Path,
 LINE_SPECS = [
     ("link0_pause_pct_of_window", "Bottleneck paused (% of window)", 1.0, None,
      "Congestion severity vs buffer  (per os level)",
-     "01_pause_pct_vs_buffer.png"),
+     "02_pause_pct_vs_buffer.png"),
     ("link0_eff_pct", "Delivered KV bw (% of 200G uplink)", 1.0, None,
      "Delivered KV bandwidth vs buffer  (outcome, per os level)",
-     "02_delivered_bw_vs_buffer.png"),
+     "03_delivered_bw_vs_buffer.png"),
     ("kv_gate_ns", "KV completion / decode gate (ms)", MS, None,
      "KV completion time vs buffer  (outcome, per os level)",
-     "03_kv_completion_vs_buffer.png"),
+     "04_kv_completion_vs_buffer.png"),
     ("ttft_ns", "TTFT (ms)", MS, None,
      "TTFT vs buffer  (outcome, per os level)",
-     "04_ttft_vs_buffer.png"),
+     "05_ttft_vs_buffer.png"),
     ("link0_conc_mean", "Mean concurrent KV flows", 1.0, None,
      "Bottleneck concurrency vs buffer  (mechanism, per os level)",
-     "05_concurrency_vs_buffer.png"),
+     "06_concurrency_vs_buffer.png"),
     ("link0_qpeak_bytes", "Peak queue occupancy (kB)", 1e-3, None,
      "Bottleneck queue peak vs buffer  (mechanism, per os level)",
-     "06_queue_peak_vs_buffer.png"),
+     "07_queue_peak_vs_buffer.png"),
 ]
 
 # The three that read as a clean os x buffer field: one severity, two outcomes.
 HEATMAP_SPECS = [
     ("link0_pause_pct_of_window", "Bottleneck paused (% of window)", "{:.0f}",
-     "magma", 1.0, "07_heatmap_pause_pct.png"),
+     "magma", 1.0, "11_heatmap_pause_pct.png"),
     ("kv_gate_ns", "KV completion (ms)", "{:.0f}", "magma", MS,
-     "08_heatmap_kv_completion_ms.png"),
+     "12_heatmap_kv_completion_ms.png"),
     ("link0_eff_pct", "Delivered KV bw (% of 200G uplink)", "{:.0f}", "viridis", 1.0,
-     "09_heatmap_delivered_bw.png"),
+     "13_heatmap_delivered_bw.png"),
 ]
 
 
 def make_2d_plots(s: pd.DataFrame, outdir: Path) -> list[Path]:
     outdir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
-    for col, ylabel, scale, yscale, title, name in LINE_SPECS:
+    name, title, panels = STORY_SPECS[0]                     # 01 causal chain
+    multi_panel(s, panels, title, name, outdir, written)
+    for col, ylabel, scale, yscale, title, name in LINE_SPECS:   # 02-07
         line_family(s, col, ylabel, title, name, outdir, written,
                     scale=scale, yscale=yscale)
-    for col, title, fmt, cmap, scale, name in HEATMAP_SPECS:
+    for name, title, panels in STORY_SPECS[1:]:              # 08-10
+        multi_panel(s, panels, title, name, outdir, written)
+    for col, title, fmt, cmap, scale, name in HEATMAP_SPECS:     # 11-13
         heatmap(s, col, f"{title} — oversubscription × buffer", name, outdir,
                 written, fmt=fmt, cmap=cmap, scale=scale)
     return written
@@ -275,13 +354,17 @@ def main(argv: list[str] | None = None) -> int:
                   f"{row0.get('link0_pause_pct_of_window', float('nan')):.0f}%")
 
         s = pd.concat(frames, ignore_index=True).sort_values(["oversub", "buffer_mb"])
+        # first decode pass in units of this level's own steady inter-token gap:
+        # the dimensionless twin of decode_kv_stall_ns (same as buffer_compare).
+        s["tok2_over_itl"] = s["tok2_latency_ns"] / s["itl_steady_ns"]
         s.to_csv(outdir / "summary_2d.csv", index=False)
         plots = make_2d_plots(s, outdir)
 
         pd.set_option("display.width", 200)
         report = [c for c in ["oversub", "buffer_mb",
                               "link0_pause_pct_of_window", "link0_conc_mean",
-                              "link0_eff_pct", "kv_gate_ns", "ttft_ns"]
+                              "link0_eff_pct", "kv_gate_ns", "ttft_ns",
+                              "pp_skew_ns", "decode_kv_stall_ns"]
                   if c in s.columns]
         print("\n================ OVERSUBSCRIPTION × BUFFER (2D) ================")
         print(s[report].to_string(index=False))

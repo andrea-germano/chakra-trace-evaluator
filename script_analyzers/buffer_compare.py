@@ -32,6 +32,19 @@ number to compare across models -- no normalisation:
                          all-reduce (buffer_sweep fig 10): how staggered the
                          shards entered the one collective gated by that
                          stage's own KV. Also a delta, so raw ms.
+    kv_tp_skew_p99_ms    the p99 of the same per-(stage, layer) shard-skew
+                         population whose mean is plotted above: the tail a
+                         layer's first all-reduce can actually inherit, which
+                         a mean smooths away. A delta, so raw ms.
+    decode_kv_stall_ms   buffer_sweep fig 11 (middle) as one number: the first
+                         decode pass's excess over the steady inter-token gap
+                         (tok2_latency - itl_steady) -- the wall-clock the
+                         pipeline actually spent stalled on KV. Waiting time,
+                         not compute, so raw ms.
+    dec_kv_lateness_ms   fig 11 (right) reduced to the worst stage: KV ready
+                         minus that stage's first-input arrival. >0 = the
+                         stage outruns its KV and stalls; <=0 = the transfer
+                         is fully masked. A signed fabric delta, so raw ms.
     qpeak_mb             link0_qpeak_bytes / 2^20: peak occupancy at the
                          bottleneck port, in MB. Absolute bytes -- deliberately
                          NOT qpeak_pct, whose denominator is the swept buffer
@@ -68,6 +81,12 @@ quantity of the SAME run) or normalised to that model's OWN largest-buffer run:
                          fig 10): does the KV skew the decode pipeline inherits
                          actually stretch its first collective? Self-normalised
                          per stage, so dimensionless and comparable.
+    tok2_over_itl        the first decode pass in units of THIS model's steady
+                         inter-token gap (tok2_latency / itl_steady): does the
+                         KV stall reach the user-visible second token? Flat ~1
+                         means the transfer is fully hidden; the excess over 1
+                         is decode_kv_stall_ms made dimensionless, so models of
+                         different compute scale share the axis.
 
 Kept in summary.csv but no longer plotted: ar_first_over_rest (rs_ar_first_ns /
 rs_ar_rest_mean_ns -- the same stall as a duration multiple, dominated by the
@@ -162,6 +181,10 @@ def load_workload(root: Path, workload: str, sweep: str,
     s["kv_tp_skew_mean_ms"] = s["kv_tp_skew_mean_ns"] / 1e6
     s["kv_tp_skew_p99_ms"] = s["kv_tp_skew_p99_ns"] / 1e6
     s["dec_ar_first_skew_ms"] = s["dec_ar_first_skew_ns"] / 1e6
+    # decode-stall family (buffer_sweep fig 11, reduced by decode_worst_stage):
+    # waiting-time deltas, so raw ms like the skews above.
+    s["decode_kv_stall_ms"] = s["decode_kv_stall_ns"] / 1e6
+    s["dec_kv_lateness_ms"] = s["dec_kv_lateness_ns"] / 1e6
     # kept in the CSV for continuity, no longer plotted:                  # sweep.
     s["pause_pct_of_window"] = s.get("link0_pause_pct_of_window")
     s["qpeak_pct"] = s.get("link0_qpeak_pct")
@@ -172,6 +195,9 @@ def load_workload(root: Path, workload: str, sweep: str,
     # this model's largest-buffer run. These answer the payoff question, not the
     # fabric magnitude one, so they stay dimensionless.
     s["ar_first_over_rest"] = s["rs_ar_first_ns"] / s["rs_ar_rest_mean_ns"]
+    # first decode pass in units of this model's own steady inter-token gap:
+    # the dimensionless twin of decode_kv_stall_ms (see module docstring).
+    s["tok2_over_itl"] = s["tok2_latency_ns"] / s["itl_steady_ns"]
     # normalised to THIS model's largest-buffer (most relaxed) run.
     tt = s.dropna(subset=["ttft_ns"]).sort_values("buffer_mb")
     ref = float(tt["ttft_ns"].iloc[-1]) if len(tt) else NAN
@@ -234,11 +260,12 @@ def main(argv: list[str] | None = None) -> int:
         combined = pd.concat(frames, ignore_index=True)
         front = ["workload", "tag", "bottleneck", "buffer_mb",
                  "pp_skew_ms", "kv_tp_skew_mean_ms", "kv_tp_skew_p99_ms",
-                 "dec_ar_first_skew_ms",
+                 "dec_ar_first_skew_ms", "decode_kv_stall_ms",
+                 "dec_kv_lateness_ms",
                  "qpeak_mb", "qmean_mb", "pause_rate", "pause_frames",
                  "line_rate_pct", "rs_ar_first_bw", "rs_ar_rest_bw",
                  "rs_ar_first_stage_bw", "ttft_slowdown", "dec_ar_first_over_rest",
-                 "ar_first_over_rest",
+                 "tok2_over_itl", "ar_first_over_rest",
                  "pause_pct_of_window", "qpeak_pct", "skew_over_ar_rest",
                  "kv_gate_over_ttft"]
         combined = combined[[c for c in front if c in combined.columns]
@@ -270,6 +297,21 @@ def main(argv: list[str] | None = None) -> int:
             "dec_ar_first_skew_ms", "Decode first all-reduce entry skew (ms)",
             "KV skew inherited by the decode pipeline (worst stage)",
             "decode_ar_first_skew_by_workload.png")
+
+        line_by_workload(
+            "kv_tp_skew_p99_ms", "KV TP-group skew, p99 (ms)",
+            "KV shard arrival skew within decode TP groups — the tail",
+            "kv_tp_skew_p99_by_workload.png")
+
+        line_by_workload(
+            "decode_kv_stall_ms", "First-pass KV stall (ms)",
+            "Decode first pass: excess over the steady inter-token gap",
+            "decode_kv_stall_by_workload.png", hline=0.0)
+
+        line_by_workload(
+            "dec_kv_lateness_ms", "KV ready − first input (ms)",
+            "KV lateness at the decode stages' first input (worst stage)",
+            "dec_kv_lateness_by_workload.png", hline=0.0)
 
         line_by_workload(
             "qpeak_mb", "Peak queue occupancy (MB)",
@@ -307,6 +349,11 @@ def main(argv: list[str] | None = None) -> int:
             "dec_ar_first_over_rest", "Decode first all-reduce (×steady-state)",
             "Does the inherited KV skew stretch the decode first all-reduce?",
             "decode_ar_first_over_rest_by_workload.png", hline=1.0)
+
+        line_by_workload(
+            "tok2_over_itl", "First decode pass (×steady ITL)",
+            "Does the KV stall reach the second token?",
+            "tok2_over_itl_by_workload.png", hline=1.0)
 
         print(f"\nWrote {outdir}:")
         print("  summary.csv")
