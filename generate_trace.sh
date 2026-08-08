@@ -29,7 +29,7 @@ echo "---------------------------------------------------"
 # Paths
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-MLSYNTH_SCRIPT="$BASE_DIR/../mlsynth/synthesise_inference.py"
+MLSYNTH_SCRIPT="$BASE_DIR/../mlsynth/synthesise_workload.py"
 MLSYNTH_CFG_PATH="$BASE_DIR/configs/mlsynth/${MODEL_FILE_NAME}.yaml"
 TRACES_DIR="$BASE_DIR/output/mlsynth"
 

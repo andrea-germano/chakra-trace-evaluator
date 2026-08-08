@@ -24,7 +24,7 @@ echo "---------------------------------------------------"
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Absolute paths for the executables
-MLSYNTH_SCRIPT="$BASE_DIR/../mlsynth/synthesise_inference.py"
+MLSYNTH_SCRIPT="$BASE_DIR/../mlsynth/synthesise_workload.py"
 ASTRA_BIN="$BASE_DIR/../astra-sim/build/astra_analytical/build/bin/AstraSim_Analytical_Congestion_Unaware"
 
 # 3. Define paths for base configurations
