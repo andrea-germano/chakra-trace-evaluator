@@ -134,24 +134,36 @@ class IncastPaths:
         return sorted(p.name for p in root.iterdir()
                       if p.is_dir() and level_of(p.name) == self.level)
 
+    def missing_configs(self) -> list[str]:
+        """Config INPUTS absent for tags that have ns-3 output, one line each.
+        Configs are what the analysis reasons FROM (topology, buffer, payload):
+        with one missing, no number about that run means anything, so the caller
+        must Abort on a non-empty return -- unlike a missing OUTPUT, which only
+        means the run has not finished and can be skipped (usable_tags)."""
+        out = []
+        for t in self.tags("ns3"):
+            for name, f in (("config.txt", self.config(t)),
+                            ("physical_topology.txt", self.topology(t))):
+                if not f.is_file():
+                    out.append(f"{t}: missing {f}")
+        return out
+
     def usable_tags(self) -> tuple[list[str], list[str]]:
-        """(analysable, skipped). A run is analysable only when EVERY input it
-        needs is on disk: its config + topology, its ns-3 fct/pfc/qlen, and its
-        ASTRA run dir. The generator writes these in separate passes and rewrites
-        the config buffer set between runs, so at any instant an ns-3 output can
-        lack a matching config (or vice versa); analysing the intersection, and
-        naming what was dropped, is the only thing that does not either crash or
-        silently invent a buffer value. `skipped` carries a one-line reason each,
-        for the caller to warn with."""
+        """(analysable, skipped) by OUTPUT presence alone. A run is analysable
+        when every simulation output it needs is on disk: its ns-3 fct/pfc/qlen
+        and at least one ASTRA stats_sys*.csv. The generator writes these in
+        separate passes, so a half-written run is normal life, not an error:
+        it is skipped with a one-line reason for the caller to warn with.
+        Config inputs are NOT checked here -- a missing config is a reason to
+        Abort, and missing_configs() reports those separately."""
         analysable, skipped = [], []
         for t in self.tags("ns3"):
             missing = [name for name, ok in (
-                ("config.txt", self.config(t).is_file()),
-                ("physical_topology.txt", self.topology(t).is_file()),
                 ("fct.txt", (self.ns3_run(t) / "fct.txt").is_file()),
                 ("pfc.txt", (self.ns3_run(t) / "pfc.txt").is_file()),
                 ("qlen.txt", (self.ns3_run(t) / "qlen.txt").is_file()),
-                ("astra run", self.astra_run(t).is_dir())) if not ok]
+                ("stats_sys*.csv",
+                 any(self.astra_run(t).glob("stats_sys*.csv")))) if not ok]
             if missing:
                 skipped.append(f"{t}: missing {', '.join(missing)}")
             else:

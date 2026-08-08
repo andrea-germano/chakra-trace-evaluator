@@ -153,6 +153,20 @@ def find_bottleneck(topo: Topology, port_max: dict[tuple[int, int], int],
     return Bottleneck(sw, port, peer, topo.ports[sw][port].rate, ingress)
 
 
+def forced_bottleneck(topo: Topology, sw: int, peer: int,
+                      congesting: pd.DataFrame) -> Bottleneck:
+    """The user-declared 'sw->peer' link as a Bottleneck, its ingress ports
+    derived from the paths of `congesting` exactly as find_bottleneck derives
+    them -- the only difference is that the egress link is TOLD, not measured.
+    Raises ValueError when the topology has no such link."""
+    egress = topo.port_facing(sw, peer)
+    if egress is None:
+        raise ValueError(f"no link {sw}->{peer} in the topology; switch {sw} "
+                         f"has ports {[topo.port_label(sw, i) for i in topo.ports.get(sw, {})]}")
+    ingress = _ingress_ports(topo, sw, peer, congesting)
+    return Bottleneck(sw, egress, peer, topo.ports[sw][egress].rate, ingress)
+
+
 def candidate_links(topo: Topology, port_max: dict[tuple[int, int], int],
                     congesting: pd.DataFrame) -> list[Bottleneck]:
     """Every directed (switch, egress_port) at least one row of `congesting`

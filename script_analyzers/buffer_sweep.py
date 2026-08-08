@@ -107,7 +107,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import shutil
 import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -120,61 +119,26 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from utils import astra, intervals
+from utils import astra
 from utils import flows as flowlib
 from utils import ns3, paths, pp, roles
-from utils.cli import Abort, need
-from utils.fabric import Bottleneck, Topology, parse_ns3_config, parse_topology
-from utils.plots import downsample_max, logx_pow2, save_fig
+from utils.cli import Abort, drain_warnings, need, warn
+from utils.fabric import parse_ns3_config, parse_topology
+from utils.measures import (LinkStat, barrier, decode_ar_stats,
+                            decode_stall_stats, kv_rank_series, kv_skew_stats,
+                            link_metrics, ttft_from, victim_pause_intervals)
+from utils.plots import (BLUE, CORAL, GREEN, MS, MUTED, VIOLET,
+                         downsample_max, logx_pow2, save_fig, zoom_y)
 from utils.roles import Placement
-from utils.paths import BUFFER_AXIS
+from utils.paths import BUFFER_AXIS, fresh_dir
 
 NAN = float("nan")
 KIND = "buffer"
-MS = 1e-6                     # ns -> ms
-
-BLUE, CORAL, GREEN, VIOLET, MUTED = \
-    "#1f77b4", "#d1495b", "#2b8a3e", "#6a4c93", "#9aa0a6"
 
 
 # --------------------------------------------------------------------------- #
-WARNINGS: list[str] = []
-
-
-def warn(msg: str) -> None:
-    WARNINGS.append(msg)
-    print(f"  ! {msg}", file=sys.stderr)
-
-
+# One row per run. (LinkStat, the per-link score, lives in utils.measures.)
 # --------------------------------------------------------------------------- #
-# One row per link, one row per run.
-# --------------------------------------------------------------------------- #
-@dataclass
-class LinkStat:
-    """One candidate KV-crossed link's stats for one run -- scored the way a
-    single bottleneck is (window/floor/efficiency, queue occupancy, PFC pauses),
-    plus concurrency, which a single-link analysis never needed with only one
-    link to look at."""
-    label: str = ""
-    switch: int = -1
-    egress_port: int = -1
-    peer: int = -1
-    rate_gbps: float = NAN
-    f_ports: int = 0
-    kv_bytes: float = NAN
-    window_ns: float = NAN
-    floor_ns: float = NAN
-    delivered_gbps: float = NAN
-    eff_pct: float = NAN                  # floor/window, %: delivered vs the hard floor
-    qpeak_bytes: float = NAN
-    qmean_bytes: float = NAN
-    qpeak_pct: float = NAN                # qpeak_bytes / this run's buffer_bytes, %
-    conc_peak: float = NAN                # most concurrent KV flows at once
-    conc_mean: float = NAN                # mean concurrency each flow actually saw
-    pause_frames: float = NAN
-    pause_pct_of_window: float = NAN
-
-
 @dataclass
 class Row:
     tag: str = ""
@@ -289,108 +253,11 @@ class Row:
 
 
 # --------------------------------------------------------------------------- #
-# Measurement helpers
+# Measurement helpers. The ones shared with incast_sweep/cc_sweep (barrier,
+# kv_rank_series, kv_skew_stats, decode_ar_stats, decode_stall_stats, ttft_from,
+# link_metrics, victim_pause_intervals) live in utils.measures; what stays here
+# is this sweep's own question.
 # --------------------------------------------------------------------------- #
-def union_len(spans: list[tuple[int, int]], lo: int, hi: int) -> int:
-    """Covered length of the union of `spans` clipped to [lo, hi]. The union
-    algebra is utils.intervals; only the clip window is this function's own."""
-    clipped = [(max(s, lo), min(e, hi)) for s, e in spans if min(e, hi) > max(s, lo)]
-    return int(intervals.union_len(clipped))
-
-
-def pause_stats(pfc: ns3.PfcLog, bn: Bottleneck, topo: Topology,
-                lo: int, hi: int) -> dict:
-    """Backpressure on the ingress side of `bn`, over [lo, hi]. Kept
-    link-generic so it works for every candidate link, not only one."""
-    span = max(hi - lo, 1)
-    victims = set(bn.pause_victims(topo))
-
-    frames_bn = frames_total = 0
-    devices_paused: set[tuple[int, int]] = set()
-    for (node, _nt, ifidx, _q), events in pfc.events.items():
-        n_in_win = sum(1 for t, typ in events if typ == 1 and lo <= t <= hi)
-        frames_total += n_in_win
-        if (node, ifidx) in victims:
-            frames_bn += n_in_win
-            if n_in_win:
-                devices_paused.add((node, ifidx))
-
-    iv = pfc.pause_intervals(clamp_to=hi)
-    per_dev: dict[tuple[int, int], list] = {}
-    for (node, _nt, ifidx, _q), spans in iv.items():
-        if (node, ifidx) in victims:
-            per_dev.setdefault((node, ifidx), []).extend(spans)
-    pct = 0.0
-    if per_dev:
-        best = max(per_dev, key=lambda k: union_len(per_dev[k], lo, hi))
-        pct = 100.0 * union_len(per_dev[best], lo, hi) / span
-
-    return {"pause_frames_bn": float(frames_bn),
-            "pause_frames_total": float(frames_total),
-            "paused_devices": float(len(devices_paused)),
-            "pause_pct_of_window": pct}
-
-
-def victim_pause_intervals(pfc: ns3.PfcLog, bn: Bottleneck, topo: Topology,
-                           clamp_to: int) -> list[tuple[int, int]]:
-    """Raw PAUSE intervals (not unioned) on `bn`'s ingress victims, for
-    shading a timeline. pause_stats reduces the same population to one %
-    number; this keeps the intervals themselves."""
-    victims = set(bn.pause_victims(topo))
-    out: list[tuple[int, int]] = []
-    for (node, _nt, ifidx, _q), spans in pfc.pause_intervals(clamp_to=clamp_to).items():
-        if (node, ifidx) in victims:
-            out.extend(spans)
-    return out
-
-
-def barrier(kv: pd.DataFrame, placement: Placement) -> dict:
-    """The first decode step cannot start until every KV flow feeding a decode
-    rank has arrived."""
-    out = {"decode_ranks": ",".join(map(str, placement.decode_ranks))}
-    ready, dur = {}, {}
-    for d in placement.decode_ranks:
-        arr = kv.loc[kv["dst"] == d, "arrival"]
-        if len(arr):
-            ready[d] = float(arr.max())
-            dur[d] = float(arr.max() - arr.min())
-    need(ready, f"no KV flow arrives at any declared decode rank "
-                f"{placement.decode_ranks}: --placement is wrong.")
-    if len(ready) < len(placement.decode_ranks):
-        warn(f"only {len(ready)}/{len(placement.decode_ranks)} decode ranks "
-             f"receive KV; the barrier is over {sorted(ready)}.")
-    out["kv_gate_ns"] = max(ready.values())
-    out["kv_ready_min_ns"] = min(ready.values())
-    out["cross_rank_skew_ns"] = max(ready.values()) - min(ready.values())
-    out["kv_stream_duration_ns"] = max(dur.values())
-    return out
-
-
-def ttft_end_of_prefill(tag: str, p: paths.SweepPaths) -> dict:
-    """TTFT = the first token, produced at the END OF PREFILL (FIRSTTOK send,
-    NOT DECFB -- DECFB is the second token, one decode pipeline late)."""
-    adir = p.astra_run(tag)
-    if not adir.is_dir():
-        warn(f"{tag}: no ASTRA run at {adir}; TTFT (end of prefill) unavailable.")
-        return {}
-    df = astra.read_run(adir)
-    if df is None:
-        warn(f"{tag}: no readable stats_sys*.csv under {adir}; TTFT unavailable.")
-        return {}
-    inst = astra.firsttok_send_instant(df)
-    if inst is not None:
-        return {"ttft_ns": inst}
-    pre = df.loc[(df["op_class"] == "COMP") & (df["phase"] == "prefill"),
-                 "end_tick"]
-    if len(pre):
-        warn(f"{tag}: no FIRSTTOK in the ASTRA trace; using the last prefill "
-             f"compute end as end-of-prefill TTFT.")
-        return {"ttft_ns": float(pre.max())}
-    warn(f"{tag}: no FIRSTTOK and no prefill COMP in the ASTRA trace; TTFT "
-         f"unavailable.")
-    return {}
-
-
 def rs_allreduce_stats(adf: pd.DataFrame | None, placement: Placement, ppr) -> dict:
     """The prefill TP all-reduce, read from the ASTRA stats CSV (the authoritative
     per-collective duration and bytes -- the ns-3 fct.txt only sees the on-wire
@@ -460,237 +327,34 @@ def rs_allreduce_stats(adf: pd.DataFrame | None, placement: Placement, ppr) -> d
     return out
 
 
-def kv_rank_series(kv: pd.DataFrame, placement: Placement) -> dict:
-    """rank -> (arrival_times_ns, cumulative_bytes), sorted by arrival. The
-    raw material for figure 02: skew is the horizontal spread between ranks'
-    curves, smoothness is whether each curve ramps or stair-steps with flats."""
-    out = {}
-    for d in placement.decode_ranks:
-        sub = kv.loc[kv["dst"] == d].sort_values("arrival")
-        if not len(sub):
-            continue
-        out[int(d)] = (sub["arrival"].to_numpy(dtype=float),
-                       np.cumsum(sub["size"].to_numpy(dtype=float)))
-    return out
-
-
-def kv_skew_stats(kv_arr: pd.DataFrame) -> tuple[dict, dict, dict]:
-    """The KV skew figures' raw material, all from the ASTRA KV recv rows
-    (utils.astra.kv_arrivals, which carries stage/shard/layer from the name).
-
-    Returns (scalars, rank_span, rank_layer_delta):
-
-        scalars           kv_tp_skew_{min,mean,p99}_ns and kv_tp_skew_n over the
-                          per-(stage, layer) TP-GROUP skew population: for each
-                          (decode stage, layer), max-min arrival across the KV
-                          shards feeding that TP group. That spread is exactly
-                          the wait the layer's first decode all-reduce inherits.
-                          Groups with fewer than 2 shard arrivals carry no skew
-                          and are excluded.
-        rank_span         rank -> last-first KV arrival at that rank (ns): the
-                          total transfer time each rank observes.
-        rank_layer_delta  rank -> completion(highest layer) - completion(lowest
-                          layer) at that rank (ns), SIGNED: layers arrive out of
-                          order, so this is not the span -- a negative value
-                          means the last layer's KV landed before the first's.
-                          A layer delivered in several chunks is complete at its
-                          last chunk.
-    """
-    scal = {"kv_tp_skew_min_ns": NAN, "kv_tp_skew_mean_ns": NAN,
-            "kv_tp_skew_p99_ns": NAN, "kv_tp_skew_n": 0}
-    rank_span: dict[int, float] = {}
-    rank_delta: dict[int, float] = {}
-    if kv_arr is None or kv_arr.empty:
-        return scal, rank_span, rank_delta
-
-    for d, g in kv_arr.groupby("dst"):
-        arr = g["arrival"].astype(float)
-        rank_span[int(d)] = float(arr.max() - arr.min())
-        gl = g.dropna(subset=["layer"])
-        if len(gl):
-            per_layer = gl.groupby("layer")["arrival"].max()
-            rank_delta[int(d)] = float(per_layer[per_layer.index.max()]
-                                       - per_layer[per_layer.index.min()])
-
-    grouped = kv_arr.dropna(subset=["stage", "layer"]) \
-                    .groupby(["stage", "layer"])["arrival"] \
-                    .agg(["min", "max", "count"])
-    sk = (grouped["max"] - grouped["min"])[grouped["count"] >= 2]
-    if len(sk):
-        scal.update(kv_tp_skew_min_ns=float(sk.min()),
-                    kv_tp_skew_mean_ns=float(sk.mean()),
-                    kv_tp_skew_p99_ns=float(sk.quantile(0.99)),
-                    kv_tp_skew_n=int(len(sk)))
-    return scal, rank_span, rank_delta
-
-
-def decode_ar_stats(adf: pd.DataFrame | None) -> dict[int, dict]:
-    """First vs steady-state TP all-reduce of each DECODE PP stage, from the
-    ASTRA stats CSV: decode stage -> {first_skew_ns, first_dur_ns,
-    rest_skew_mean_ns, rest_dur_mean_ns, n}.
-
-    Per collective (ss, L, it, op): ENTRY SKEW is the spread of the shards'
-    start ticks -- how staggered the TP ranks entered the collective -- and
-    duration is the slowest shard's. The FIRST collective of a stage (earliest
-    entry) is the one gated by that stage's own KV transfer, so its entry skew
-    is the KV skew the decode pipeline actually inherits; the rest of the
-    stage's collectives are the steady-state control. Empty dict with no ASTRA
-    run or no decode TP (TP=1)."""
-    out: dict[int, dict] = {}
-    if adf is None or adf.empty:
-        return out
-    tp = adf[(adf["op_class"] == "TP") & (adf["phase"] == "decode")]
-    if not len(tp) or "ss" not in tp.columns:
-        return out
-    keys = [c for c in ("ss", "L", "it", "op") if c in tp.columns]
-    g = (tp.groupby(keys, dropna=False)
-           .agg(start=("start_tick", "min"), start_max=("start_tick", "max"),
-                dur=("duration", "max")).reset_index())
-    g["skew"] = g["start_max"] - g["start"]
-    g["ss"] = pd.to_numeric(g["ss"], errors="coerce")
-    for st, gg in g.dropna(subset=["ss"]).groupby("ss"):
-        gg = gg.sort_values("start")
-        first, rest = gg.iloc[0], gg.iloc[1:]
-        out[int(st)] = {
-            "first_skew_ns": float(first["skew"]),
-            "first_dur_ns": float(first["dur"]),
-            "rest_skew_mean_ns": float(rest["skew"].mean()) if len(rest) else NAN,
-            "rest_dur_mean_ns": float(rest["dur"].mean()) if len(rest) else NAN,
-            "n": int(len(gg)),
-        }
-    return out
-
-
-def decode_stall_stats(adf: pd.DataFrame | None,
-                       kv_arr: pd.DataFrame) -> tuple[dict, dict[int, dict]]:
-    """How much the decode is stalled waiting for its KV, from the ASTRA CSV.
-
-    The decode does NOT gate on the KV barrier: stage 0 wakes when the FIRSTTOK
-    message ARRIVES (its send instant is the TTFT, but the message itself queues
-    behind the KV bulk), and each later stage wakes on the it=0 PP-decode
-    activation. A stage then consumes its KV layer by layer, so it stalls only
-    where it outruns the transfer. Two views of that stall:
-
-    scalars
-        dec_start_ns      first decode COMP start (= stage 0's wake)
-        tok2_ns           the second token: the first DECFB send, max over
-                          shards (the feedback is ready once the slowest shard
-                          sent -- same barrier logic as firsttok_send_instant)
-        tok2_latency_ns   tok2 - dec_start: wall-clock of the first decode pass
-        itl_steady_ns     mean gap between the remaining DECFB iterations, the
-                          steady-state inter-token control: the first pass's
-                          excess over it is the KV-induced stall
-    per stage
-        input_arrival_ns  when the stage COULD start (FIRSTTOK arrival for
-                          stage 0, it=0 PP-decode activation arrival after)
-        kv_ready_ns       last KV arrival for the stage
-        kv_lateness_ns    kv_ready - input_arrival: >0 = the stage outruns its
-                          KV and must stall inside the first pass; <=0 = the KV
-                          was already resident (the transfer is fully masked)
-    """
-    scal = {"dec_start_ns": NAN, "tok2_ns": NAN, "tok2_latency_ns": NAN,
-            "itl_steady_ns": NAN}
-    stages: dict[int, dict] = {}
-    if adf is None or adf.empty:
-        return scal, stages
-
-    comp = adf[(adf["op_class"] == "COMP") & (adf["phase"] == "decode")]
-    if len(comp):
-        scal["dec_start_ns"] = float(comp["start_tick"].min())
-
-    fb = adf[(adf["op_class"] == "DECFB") & (adf["comm_role"] == "send")]
-    if len(fb) and "it" in fb.columns:
-        inst = (fb.assign(it=pd.to_numeric(fb["it"], errors="coerce"))
-                  .dropna(subset=["it"])
-                  .groupby("it")["start_tick"].max().sort_index())
-        if len(inst):
-            scal["tok2_ns"] = float(inst.iloc[0])
-            if pd.notna(scal["dec_start_ns"]):
-                scal["tok2_latency_ns"] = scal["tok2_ns"] - scal["dec_start_ns"]
-            gaps = inst.diff().dropna()
-            if len(gaps):
-                scal["itl_steady_ns"] = float(gaps.mean())
-
-    kv_ready = {}
-    if kv_arr is not None and len(kv_arr) and kv_arr["stage"].notna().any():
-        kv_ready = kv_arr.dropna(subset=["stage"]).groupby("stage")["arrival"] \
-                         .max().to_dict()
-
-    inputs: dict[int, float] = {}
-    ft = adf[(adf["op_class"] == "FIRSTTOK") & (adf["comm_role"] == "recv")]
-    if len(ft):
-        inputs[0] = float(ft["end_tick"].max())
-    ppd = adf[(adf["op_class"] == "PP") & (adf["phase"] == "decode")
-              & (adf["comm_role"] == "recv")]
-    if len(ppd):
-        w0 = ppd.assign(it=pd.to_numeric(ppd["it"], errors="coerce"),
-                        ds=pd.to_numeric(ppd["ds"], errors="coerce")) \
-                .dropna(subset=["it", "ds"])
-        w0 = w0[w0["it"] == 0]
-        for ds, g in w0.groupby("ds"):
-            inputs[int(ds)] = float(g["end_tick"].max())
-
-    for st in sorted(set(kv_ready) | set(inputs)):
-        ready = float(kv_ready.get(st, NAN))
-        arr = float(inputs.get(st, NAN))
-        stages[int(st)] = {"input_arrival_ns": arr, "kv_ready_ns": ready,
-                           "kv_lateness_ns": ready - arr}
-    return scal, stages
-
-
-def link_metrics(kv: pd.DataFrame, bn: Bottleneck, topo: Topology,
-                 pfc: ns3.PfcLog, qlen: ns3.QlenLog, buffer_bytes: float) -> LinkStat:
-    ls = LinkStat(label=str(bn), switch=bn.switch, egress_port=bn.egress_port,
-                 peer=bn.peer, rate_gbps=bn.rate / 1e9, f_ports=bn.f_ports)
-    kv_bn = kv[flowlib.crosses(kv, bn)]
-    if not len(kv_bn):
-        return ls
-    lo, hi = int(kv_bn["start"].min()), int(kv_bn["arrival"].max())
-    ls.window_ns = hi - lo
-    ls.kv_bytes = float(kv_bn["size"].sum())
-    ls.floor_ns = ls.kv_bytes * 8e9 / bn.rate
-    if ls.window_ns > 0:
-        ls.delivered_gbps = ls.kv_bytes * 8.0 / ls.window_ns
-        ls.eff_pct = 100 * ls.floor_ns / ls.window_ns
-    ls.qpeak_bytes = float(qlen.port_max.get((bn.switch, bn.egress_port), NAN))
-    ls.qmean_bytes = float(qlen.port_mean.get((bn.switch, bn.egress_port), NAN))
-    if buffer_bytes and pd.notna(ls.qpeak_bytes):
-        ls.qpeak_pct = 100 * ls.qpeak_bytes / buffer_bytes
-    ls.conc_peak, ls.conc_mean = flowlib.concurrency_stats(flowlib.flow_spans(kv_bn))
-    pstats = pause_stats(pfc, bn, topo, lo, hi)
-    ls.pause_frames = pstats["pause_frames_bn"]
-    ls.pause_pct_of_window = pstats["pause_pct_of_window"]
-    return ls
-
-
 # --------------------------------------------------------------------------- #
 # Per-run analysis
 # --------------------------------------------------------------------------- #
 def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
            chosen_labels: list[str], want_series: bool = True) -> Row:
+    """One run. analyse_sweep has already guaranteed the config inputs exist
+    (Abort otherwise) and every output file is on disk (runs missing one are
+    skipped before this is called), so nothing here re-checks file presence."""
     buf = BUFFER_AXIS.value(tag)
-    need(buf is not None, f"{tag}: no 'buf<num>' token in the directory name; "
-                          f"the swept axis is unreadable.")
-    tpath, cpath = p.topology(tag), p.config(tag)
     ns3_dir = p.ns3_run(tag)
-    for fpath in (tpath, cpath, ns3_dir / "fct.txt", ns3_dir / "pfc.txt",
-                 ns3_dir / "qlen.txt"):
-        need(fpath.exists(), f"{tag}: missing {fpath}")
-
-    topo = parse_topology(tpath)
-    cfg = parse_ns3_config(cpath)
+    topo = parse_topology(p.topology(tag))
+    cfg = parse_ns3_config(p.config(tag))
     for w in cfg.warnings():
         warn(f"{tag}: {w}")
     need(cfg.buffer_mb is not None,
-         f"{tag}: no BUFFER_SIZE in {cpath}.")
+         f"{tag}: no BUFFER_SIZE in {p.config(tag)}.")
     need(abs(cfg.buffer_mb - buf) < 1e-6,
          f"{tag}: BUFFER_SIZE={cfg.buffer_mb} MiB in config.txt but 'buf{buf:g}' "
          f"in the directory name. One of the two is lying.")
 
     row = Row(tag=tag, buffer_mb=float(buf), buffer_bytes=float(buf) * 1024 * 1024)
 
-    for k, v in ttft_end_of_prefill(tag, p).items():
-        setattr(row, k, v)
+    # The one read of this run's ASTRA trace: TTFT, KV arrivals, PP skew,
+    # all-reduce and decode-stall metrics all share this frame.
+    adir = p.astra_run(tag)
+    adf = astra.read_run(adir)
+    need(adf is not None, f"{tag}: no readable stats_sys*.csv under {adir}.")
+    row.ttft_ns = ttft_from(adf, tag)
 
     raw = ns3.read_fct(ns3_dir / "fct.txt")
     need(raw is not None and len(raw), f"{tag}: fct.txt has no parsable rows.")
@@ -737,7 +401,9 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
         # queue; the upstream neighbour feeding it is (see PfcLog docstring).
         per_switch[bn_i.switch].extend(
             victim_pause_intervals(pfc, bn_i, topo, clamp_to=run_end))
-    row.pause_intervals = dict(per_switch)
+    # two candidate links on one switch can share PAUSE victims; dedupe so the
+    # figure-05 shading does not stack the same interval twice.
+    row.pause_intervals = {sw: sorted(set(iv)) for sw, iv in per_switch.items()}
     need(row.links, f"{tag}: no candidate link to report.")
 
     bn = links_here.get(chosen_labels[0])
@@ -755,9 +421,7 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
     # than reconstructing them from fct.txt flows -- identical nanosecond values,
     # none of the flow classification / send-recv dedup / wave-grouping heuristics.
     # (Queue occupancy, PFC and per-physical-link stats above stay on ns-3: ASTRA
-    # has no equivalent.)
-    adir = p.astra_run(tag)
-    adf = astra.read_run(adir) if adir.is_dir() else None
+    # has no equivalent.) `adf` was read once at the top of this function.
     kv_arr = astra.kv_arrivals(adf)
 
     for k, v in barrier(kv_arr, placement).items():
@@ -813,20 +477,6 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
         row.qswitch_mean[sw] = float(np.mean(ys))
 
     return row
-
-
-def _zoom_y(ax, series, pad: float = 0.15) -> None:
-    """Autoscale one panel's y-axis to its own data, with a small margin."""
-    v = series.dropna()
-    if v.empty:
-        return
-    lo, hi = float(v.min()), float(v.max())
-    span = hi - lo
-    if span <= 0:
-        band = max(abs(hi) * 0.02, 0.5)
-        ax.set_ylim(hi - band, hi + band)
-    else:
-        ax.set_ylim(lo - pad * span, hi + pad * span)
 
 
 # --------------------------------------------------------------------------- #
@@ -891,7 +541,7 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
             a = axes[i]
             for series, color, style, label in curves:
                 a.plot(x, series, style, color=color, label=label)
-            _zoom_y(a, pd.concat([c[0] for c in curves]))
+            zoom_y(a, pd.concat([c[0] for c in curves]))
             a.set_ylabel(ylabel, fontsize=9)
             a.grid(True, alpha=0.3, which="both")
             logx_pow2(a, s, "buffer_mb", "Per-switch buffer (MiB)")
@@ -1273,14 +923,39 @@ def analyse_sweep(p: paths.SweepPaths, placement: Placement,
     tags = tags if tags is not None else p.tags("ns3")
     need(tags, f"no run sub-directory under {p.ns3_root}")
 
+    # Config INPUTS and the swept-axis token are what the analysis reasons FROM:
+    # any of them missing on any run is an Abort, before touching a single file.
+    miss_cfg = [f"{t}: missing {f}" for t in tags
+                for f in (p.topology(t), p.config(t)) if not f.is_file()]
+    need(not miss_cfg, "config input(s) missing -- fix the configs (or prune "
+                       "the stale ns-3 output):\n    " + "\n    ".join(miss_cfg))
+    for t in tags:
+        need(BUFFER_AXIS.value(t) is not None,
+             f"{t}: no 'buf<num>' token in the directory name; the swept axis "
+             f"is unreadable.")
+
+    # OUTPUTS are what the simulations write: a run still missing one has just
+    # not finished (or died) -- skip it with a name, and analyse the rest.
+    usable = []
+    for t in tags:
+        nd = p.ns3_run(t)
+        missing = [n for n, ok in (
+            ("fct.txt", (nd / "fct.txt").is_file()),
+            ("pfc.txt", (nd / "pfc.txt").is_file()),
+            ("qlen.txt", (nd / "qlen.txt").is_file()),
+            ("stats_sys*.csv", any(p.astra_run(t).glob("stats_sys*.csv")))) if not ok]
+        if missing:
+            warn(f"{t}: output(s) missing ({', '.join(missing)}) -- run skipped.")
+        else:
+            usable.append(t)
+    need(usable, "no run has all its outputs on disk yet.")
+    tags = usable
+
     if verbose:
         print(p.describe())
         print(f"  placement\n{placement.describe()}\n")
-    if (ad := p.astra_run(tags[0])).is_dir():
-        if msg := roles.cross_check(placement, ad):
-            warn(msg)
-    else:
-        warn(f"no ASTRA run at {ad}: --placement is taken on trust.")
+    if msg := roles.cross_check(placement, p.astra_run(tags[0])):
+        warn(msg)
 
     variants = {BUFFER_AXIS.variant(t) for t in tags}
     need(len(variants) == 1,
@@ -1370,9 +1045,7 @@ def main(argv: list[str] | None = None) -> int:
         rows, s, chosen_labels = analyse_sweep(
             p, placement, top_links=a.top_links, bn_force=a.bottleneck, verbose=True)
 
-        if outdir.exists():
-            shutil.rmtree(outdir)
-        outdir.mkdir(parents=True, exist_ok=True)
+        fresh_dir(outdir)
         s.to_csv(outdir / "summary.csv", index=False)
         plots = make_plots(rows, s, outdir, chosen_labels)
 
@@ -1382,13 +1055,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nWrote {outdir}:")
         for fpath in ["summary.csv", *[q.name for q in plots]]:
             print(f"  {fpath}")
-        if WARNINGS:
-            print(f"\n{len(WARNINGS)} WARNING(S) — the numbers above are "
-                  f"conditional on them:")
-            for w in WARNINGS:
-                print(f"  ! {w}")
-            return 1
-        return 0
+        return drain_warnings(" — the numbers above are conditional on them")
     except Abort as e:
         print(f"\nABORT: {e}", file=sys.stderr)
         return 2

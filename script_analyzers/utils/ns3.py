@@ -212,6 +212,32 @@ class PfcLog:
             out[key] = iv
         return out
 
+    def switch_pause_census(self) -> tuple[dict[int, int], float]:
+        """(PAUSE frames per switch node, total PAUSE frames over every device).
+        A switch appears in pfc.txt as the VICTIM whose egress was held (see the
+        class docstring), so this counts how hard each switch was backpressured.
+        Hosts (node_type 0) are excluded from the per-switch dict -- the question
+        is about switch buffers -- but still count toward the total."""
+        per_sw: dict[int, int] = defaultdict(int)
+        total = 0
+        for (node, ntype, _ifidx, _q), events in self.events.items():
+            n_pause = sum(1 for _t, typ in events if typ == 1)
+            total += n_pause
+            if ntype == 1:
+                per_sw[node] += n_pause
+        return dict(per_sw), float(total)
+
+    def switch_pause_intervals(self, clamp_to: int) -> dict[int, list]:
+        """PAUSE [start, end] spans per switch node, for shading a switch's queue
+        timeline: the per-device intervals collapsed onto the switch id (hosts
+        dropped). Same state machine as pause_intervals."""
+        out: dict[int, list] = defaultdict(list)
+        for (node, ntype, _ifidx, _q), spans in \
+                self.pause_intervals(clamp_to=clamp_to).items():
+            if ntype == 1:
+                out[node].extend(spans)
+        return dict(out)
+
     def pause_per_device(self, clamp_to: int) -> dict[tuple[int, int, int], int]:
         """Collapsed to (node, node_type, ifindex). Queues of one device overlap
         in time, so this is a sum over queues and can exceed the device's own

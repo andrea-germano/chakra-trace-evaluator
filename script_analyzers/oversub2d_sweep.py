@@ -53,7 +53,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import shutil
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -66,12 +65,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import buffer_sweep
-from buffer_sweep import MS, analyse_sweep
+from buffer_sweep import analyse_sweep
 
 from utils import paths, roles
-from utils.cli import Abort, need
-from utils.paths import OVERSUB_AXIS
-from utils.plots import logx_pow2, save_fig
+from utils.cli import Abort, drain_warnings, need
+from utils.paths import OVERSUB_AXIS, fresh_dir
+from utils.plots import MS, logx_pow2, save_fig
 from utils.roles import Placement
 
 KIND = "oversub2d"
@@ -255,9 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  bottleneck (forced): {a.bottleneck}   per-os sets: {not a.no_per_os}")
         print(f"\n{len(by_os)} oversubscription levels:")
 
-        if outdir.exists():
-            shutil.rmtree(outdir)
-        outdir.mkdir(parents=True, exist_ok=True)
+        fresh_dir(outdir)
 
         frames, per_os_plots = [], 0
         for os_ratio in sorted(by_os):
@@ -294,13 +291,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {q.name}")
         if want_series:
             print(f"  by_oversub/os*/ — {per_os_plots} per-level buffer_sweep figures")
-        if buffer_sweep.WARNINGS:
-            print(f"\n{len(buffer_sweep.WARNINGS)} WARNING(S) from the per-level "
-                  f"buffer analysis — the numbers are conditional on them:")
-            for w in buffer_sweep.WARNINGS:
-                print(f"  ! {w}")
-            return 1
-        return 0
+        return drain_warnings(" from the per-level buffer analysis — the "
+                              "numbers are conditional on them")
     except Abort as e:
         print(f"\nABORT: {e}", file=sys.stderr)
         return 2

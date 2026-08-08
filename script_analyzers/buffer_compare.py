@@ -112,12 +112,8 @@ from pathlib import Path
 
 import pandas as pd
 
-import matplotlib
-matplotlib.use("Agg")          # headless: no display needed
-import matplotlib.pyplot as plt
-
 from utils import paths, roles
-from utils.plots import logx_pow2, save_fig
+from utils.plots import lines_by_group
 from utils.roles import Placement
 from buffer_sweep import analyse_sweep
 from utils.cli import Abort, need
@@ -254,25 +250,10 @@ def main(argv: list[str] | None = None) -> int:
 
         def line_by_workload(ycol: str, ylabel: str, title: str, fname: str,
                              hline: float | None = None) -> None:
-            """One line per model, x = buffer (log2). Skipped when the column is
-            absent or entirely NaN, so a metric a model's runs never produced
-            (e.g. PP=1 -> no all-reduce ratio) just drops out."""
-            if ycol not in combined.columns or not combined[ycol].notna().any():
-                return
-            fig, ax = plt.subplots(figsize=(9, 5.5))
-            for w, grp in combined.groupby("workload"):
-                grp = grp.dropna(subset=[ycol]).sort_values("buffer_mb")
-                if grp.empty:
-                    continue
-                ax.plot(grp["buffer_mb"], grp[ycol], marker="o", label=w)
-            if hline is not None:
-                ax.axhline(hline, color="k", linestyle=":", alpha=0.4)
-            logx_pow2(ax, combined, "buffer_mb", "Per-switch buffer (MiB)")
-            ax.set_ylabel(ylabel)
-            ax.set_title(title)
-            ax.grid(True, alpha=0.3, which="both")
-            ax.legend(fontsize=8)
-            save_fig(fig, outdir, fname, written)
+            # one line per model, x = buffer, log-2 axis (utils.plots.lines_by_group)
+            lines_by_group(combined, "workload", "buffer_mb", ycol,
+                           "Per-switch buffer (MiB)", ylabel, title, fname,
+                           outdir, written, hline=hline, logx2=True)
 
         # === Block A: fabric-domain magnitudes, absolute & comparable ========
         line_by_workload(

@@ -3,7 +3,8 @@ utils — shared machinery for the MLSynth sweep analyzers.
 
     paths    every path, derived from one --sweep name; the swept-axis parsing;
              and the cross-model workload discovery the companions share.
-    cli      the Abort/need convention every analyzer raises through.
+    cli      the Abort/need convention every analyzer raises through, and the
+             single warn/drain_warnings stream they all speak into.
     roles    the declared rank -> role map, and flow classification from it.
     fabric   what the ns-3 switch does: topology, config, the PFC/ECN physics.
              Reads no simulation output; predicts from design parameters alone.
@@ -15,8 +16,14 @@ utils — shared machinery for the MLSynth sweep analyzers.
              de-dup, and the shared derived instants (first-token send, roles).
     intervals  interval-set algebra (union / overlap / subtract / concurrency),
              pure geometry over (start, end) pairs; used by astra and the analyzers.
+    measures the per-run measures more than one analyzer reports: TTFT, the KV
+             barrier and skews, the decode-side stall/all-reduce stats, and the
+             per-link score (LinkStat / link_metrics / pause_stats). Measurement
+             only; what a number MEANS stays in the analyzers.
     plots    the plotting mechanics (not the plots): series, log-2 axes, save,
-             and the max-per-bucket queue-series downsampler both sweeps share.
+             the max-per-bucket queue-series downsampler, the shared palette,
+             zoom_y, the lossy-run overlay and the one-line-per-group figure
+             both cross-model companions draw.
 
 The analyzers on top answer different questions and stay separate:
 

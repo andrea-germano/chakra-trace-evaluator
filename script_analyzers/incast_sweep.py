@@ -19,8 +19,14 @@ decode rank) and the thing that matters is downstream of that chain:
     as kv_skew_global_ms);
   * TTFT vs buffer, all topologies on ONE axis (TTFT is fixed by prefill, so this
     is the cross-topology comparison); and the makespan (total execution) on its
-    OWN axis per topology, shown both as the absolute time and as makespan-minus-
-    TTFT, the post-first-token tail the incast actually stretches;
+    OWN axis per topology (the makespan-minus-TTFT decomposition, the post-first-
+    token tail the incast actually stretches, survives in summary.csv);
+  * WHAT the decode inherits from that skew -- buffer_sweep's decode-side figures,
+    re-rendered per topology: the per-(stage, layer) TP-group shard skew, the
+    entry skew and duration of each decode stage's FIRST (KV-gated) TP
+    all-reduce, the KV stall of the first decode pass (token-2 latency vs the
+    steady inter-token gap), and the per-rank cumulative KV arrival timelines
+    where a PFC stall is visible as a flat stretch;
   * and, kept from buffer_sweep but pared down, how the switch buffers fill and
     how many PFC PAUSE frames they draw -- but only for the BUSIEST switches
     (top by PFC and/or by buffer occupancy), because these topologies have far
@@ -43,19 +49,32 @@ wider-TP topology is visible rather than assumed.
 
 Reused verbatim (one definition of a metric): the ns-3 / ASTRA readers, the flow
 classification and bottleneck search (utils.flows/fabric), the PP-skew measure
-(utils.pp), and buffer_sweep's own KV barrier, per-link stats and PFC-interval
-helpers. Only the incast-specific orchestration and the figures are new.
+(utils.pp), and the shared per-run measures of utils.measures -- TTFT
+(ttft_from), the KV barrier, per-link stats and the decode-side measures
+(kv_rank_series, kv_skew_stats, decode_ar_stats, decode_stall_stats -- figures
+02/03/04/09 are their incast rendering). Only the
+incast-specific orchestration and the figures are new. buffer_sweep's causal
+chain to TTFT (its figure 01) is deliberately NOT imported: it runs through the
+PP arrival skew, which is ~0 by construction for these placements.
 
 Output
 --------------------------------------------------------------------------------
     <out>/01_kv_arrival_skew_vs_buffer.png      intra-stage KV skew vs buffer (panel/topo,
                                                 one line per decode stage)
-    <out>/02_ttft_vs_buffer.png                 TTFT, all topologies on one axis
-    <out>/03_makespan_vs_buffer.png             makespan & makespan-minus-TTFT, panel/topo
-    <out>/04_dropped_packets_vs_buffer.png      packet loss vs buffer, all topologies
-    <out>/05_pfc_frames_vs_buffer.png           PFC PAUSE frames vs buffer, all topologies
-    <out>/<level>_queue_fill_busy_switches.png     queue(t), busiest switches only
-    <out>/<level>_occupancy_and_pfc_vs_buffer.png  occupancy & PFC frames, busiest
+    <out>/02_kv_tp_group_skew_vs_buffer.png     per-(stage, layer) KV shard skew,
+                                                min/mean/p99, panel/topo
+    <out>/03_decode_first_allreduce_skew.png    entry skew + duration of each decode
+                                                stage's FIRST (KV-gated) TP all-reduce,
+                                                one row of panels per topology
+    <out>/04_decode_kv_stall_vs_buffer.png      token 2 after token 1, first decode pass
+                                                vs steady ITL, per-stage KV lateness
+    <out>/05_ttft_vs_buffer.png                 TTFT, all topologies on one axis
+    <out>/06_makespan_vs_buffer.png             makespan, panel/topo (y fitted to data)
+    <out>/07_dropped_packets_vs_buffer.png      packet loss vs buffer, all topologies
+    <out>/08_pfc_frames_vs_buffer.png           PFC PAUSE frames vs buffer, all topologies
+    <out>/09_<level>_kv_cumulative_arrival.png     cumulative KV per decode rank, panel/buffer
+    <out>/10_<level>_queue_fill_busy_switches.png  queue(t), busiest switches only
+    <out>/11_<level>_occupancy_and_pfc_vs_buffer.png  occupancy & PFC frames, busiest
     <out>/summary.csv     one row per run (incl. pp_skew_us, total_over_ttft)
 
 Usage
@@ -69,7 +88,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import shutil
 import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -81,60 +99,21 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 
 from utils import astra, incast, ns3, pp, roles
 from utils import flows as flowlib
-from utils.cli import Abort, need
+from utils.cli import Abort, drain_warnings, need, warn
 from utils.fabric import parse_ns3_config, parse_topology
-from utils.paths import BUFFER_AXIS
-from utils.plots import downsample_max, logx_pow2, save_fig
+from utils.measures import (LinkStat, barrier, decode_ar_stats,
+                            decode_stall_stats, kv_rank_series, kv_skew_stats,
+                            link_metrics, ttft_from)
+from utils.paths import BUFFER_AXIS, fresh_dir
+from utils.plots import (BLUE, CORAL, GREEN, LOSS_RED, MS, MUTED,
+                         downsample_max, logx_pow2, loss_proxies,
+                         mark_lossy, save_fig, zoom_y)
 from utils.roles import Placement
 
-# buffer_sweep owns the per-run KV/link/PFC measurement; reuse it so a metric has
-# one definition. warn()/WARNINGS is its single warning stream -- share it, and
-# drain it once at the end.
-from buffer_sweep import (WARNINGS, MS, LinkStat, barrier, link_metrics,
-                          ttft_end_of_prefill, victim_pause_intervals, warn,
-                          _zoom_y)
-
 NAN = float("nan")
-BLUE, CORAL, GREEN, VIOLET, MUTED = \
-    "#1f77b4", "#d1495b", "#2b8a3e", "#6a4c93", "#9aa0a6"
-LOSS_RED = "#e8000b"          # rings/marks runs that DROPPED packets (not lossless);
-                              # a vivid red kept distinct from CORAL's data series
-
-
-def _mark_lossy(ax, g: pd.DataFrame, xcol: str, ycol: str) -> tuple[bool, bool]:
-    """Overlay, on top of a plotted series, the runs that were NOT lossless: a red
-    ring on runs that dropped packets, a grey ring on runs whose loss is UNKNOWN
-    (no drops.txt captured). Returns (marked_lossy, marked_unknown) so the caller
-    can add matching legend proxies."""
-    ml = mu = False
-    if "lossy" in g.columns:
-        gl = g[g["lossy"] == True].dropna(subset=[xcol, ycol])
-        if not gl.empty:
-            ax.scatter(gl[xcol], gl[ycol], s=170, facecolors="none",
-                       edgecolors=LOSS_RED, linewidths=2.6, zorder=6)
-            ml = True
-    if "loss_captured" in g.columns:
-        gu = g[g["loss_captured"] == False].dropna(subset=[xcol, ycol])
-        if not gu.empty:
-            ax.scatter(gu[xcol], gu[ycol], s=140, facecolors="none",
-                       edgecolors=MUTED, linewidths=1.8, zorder=5)
-            mu = True
-    return ml, mu
-
-
-def _loss_proxies(marked_lossy: bool, marked_unknown: bool) -> list[Line2D]:
-    h: list[Line2D] = []
-    if marked_lossy:
-        h.append(Line2D([], [], marker="o", ls="none", mfc="none", mec=LOSS_RED,
-                        mew=2.6, ms=12, label="dropped packets (not lossless)"))
-    if marked_unknown:
-        h.append(Line2D([], [], marker="o", ls="none", mfc="none", mec=MUTED,
-                        mew=1.8, ms=11, label="loss unknown (no drops.txt)"))
-    return h
 
 
 # --------------------------------------------------------------------------- #
@@ -168,6 +147,22 @@ class Row:
     kv_stream_duration_ns: float = NAN
     decode_ranks: str = ""
 
+    # -- 02: KV skew within each TP group (buffer_sweep.kv_skew_stats) ------ #
+    # One skew per (decode stage, layer): the spread between the arrivals of
+    # the KV shards feeding the same TP group -- the wait that layer's first
+    # decode all-reduce inherits. Finer grain than kv_skew_ns (per stage only).
+    kv_tp_skew_min_ns: float = NAN
+    kv_tp_skew_mean_ns: float = NAN
+    kv_tp_skew_p99_ns: float = NAN
+    kv_tp_skew_n: int = 0
+
+    # -- 04: decode stalled by KV reception (buffer_sweep.decode_stall_stats) - #
+    dec_start_ns: float = NAN             # first decode COMP start
+    tok2_ns: float = NAN                  # second token: first DECFB send
+    tok2_latency_ns: float = NAN          # tok2 - dec_start: first decode pass
+    tok2_after_tok1_ns: float = NAN       # tok2 - TTFT: user-visible gap
+    itl_steady_ns: float = NAN            # steady inter-token gap (control)
+
     # -- PP skew (expected ~0 here, plotted to check) ----------------------- #
     pp_skew_ns: float = NAN
     pp_skew_mean_ns: float = NAN
@@ -188,12 +183,28 @@ class Row:
     packets_delivered: int = 0            # sum ceil(size/payload) over flows
     dropped_per_switch: dict = field(default_factory=dict)  # switch id -> drops
 
+    # -- KV FCT raw material (per-flow, for cc_sweep's distribution/CDF) ------ #
+    # kv_fct_ns are the durations of the ASTRA CSV KV send rows -- bit-identical
+    # to the ns-3 fct of the same flows (verified to the nanosecond), but already
+    # classified by name, so no downstream re-read of fct.txt is ever needed.
+    # kv_slowdown alone stays ns-3-sourced: its denominator standalone_fct
+    # (base_rtt + bytes/pairBw) exists only in fct.txt.
+    kv_fct_ns: object = None              # np.ndarray | None
+    kv_slowdown: object = None            # np.ndarray | None
+    kv_bytes: float = NAN                 # total bulk-KV payload bytes
+    kv_goodput_gbps: float = NAN          # kv_bytes*8 / (last arrival - first send)
+
     # -- per-switch, not flattened ------------------------------------------ #
     qseries: dict = field(default_factory=dict)          # sw -> (ts_ns, bytes) downsampled
     qswitch_peak: dict = field(default_factory=dict)     # sw -> peak total bytes
     qswitch_mean: dict = field(default_factory=dict)     # sw -> mean total bytes
     pfc_per_switch: dict = field(default_factory=dict)   # sw -> PAUSE frame count
     pause_intervals: dict = field(default_factory=dict)  # sw -> [(start,end)]
+
+    # -- decode-side raw data (buffer_sweep's measures), not flattened as-is - #
+    kv_rank_series: dict = field(default_factory=dict)   # rank -> (times_ns, cumbytes)
+    dec_ar: dict = field(default_factory=dict)           # stage -> first/steady AR
+    dec_stall: dict = field(default_factory=dict)        # stage -> KV lateness
 
     # -- derived ------------------------------------------------------------ #
     @property
@@ -217,7 +228,9 @@ class Row:
         d = {k: v for k, v in asdict(self).items()
              if k not in ("qseries", "qswitch_peak", "qswitch_mean",
                           "pfc_per_switch", "pause_intervals", "link0",
-                          "dropped_per_switch", "kv_skew_stage_ns")}
+                          "dropped_per_switch", "kv_skew_stage_ns",
+                          "kv_rank_series", "dec_ar", "dec_stall",
+                          "kv_fct_ns", "kv_slowdown")}
         d["total_over_ttft"] = self.total_over_ttft
         d["lossy"] = self.lossy
         d["drop_rate_pct"] = self.drop_rate * 100 if pd.notna(self.drop_rate) else NAN
@@ -230,6 +243,24 @@ class Row:
         d["ttft_ms"] = self.ttft_ns * MS
         d["total_exec_ms"] = self.total_exec_ns * MS
         d["total_minus_ttft_ms"] = (self.total_exec_ns - self.ttft_ns) * MS
+        d["kv_tp_skew_mean_ms"] = self.kv_tp_skew_mean_ns * MS  # fig 02, ms twins
+        d["kv_tp_skew_p99_ms"] = self.kv_tp_skew_p99_ns * MS
+        d["tok2_latency_ms"] = self.tok2_latency_ns * MS        # fig 04, ms twins
+        d["tok2_after_tok1_ms"] = self.tok2_after_tok1_ns * MS
+        d["itl_steady_ms"] = self.itl_steady_ns * MS
+        # per-stage decode columns, same names buffer_sweep flattens to, so the
+        # cross-tool readers see one schema
+        for st in sorted(self.dec_ar):
+            m = self.dec_ar[st]
+            d[f"dec{st}_ar_first_skew_ns"] = m["first_skew_ns"]
+            d[f"dec{st}_ar_first_dur_ns"] = m["first_dur_ns"]
+            d[f"dec{st}_ar_rest_skew_mean_ns"] = m["rest_skew_mean_ns"]
+            d[f"dec{st}_ar_rest_dur_mean_ns"] = m["rest_dur_mean_ns"]
+        for st in sorted(self.dec_stall):
+            m = self.dec_stall[st]
+            d[f"dec{st}_input_arrival_ns"] = m["input_arrival_ns"]
+            d[f"dec{st}_kv_ready_ns"] = m["kv_ready_ns"]
+            d[f"dec{st}_kv_lateness_ns"] = m["kv_lateness_ns"]
         ls: LinkStat | None = self.link0
         if ls is not None:
             d["bn_eff_pct"] = ls.eff_pct
@@ -240,63 +271,9 @@ class Row:
 
 
 # --------------------------------------------------------------------------- #
-# Measurement helpers that are incast's own (buffer_sweep has no total-exec, no
-# per-switch PFC census)
+# Measurement helpers that are incast's own. (The shared per-run measures come
+# from utils.measures; the per-switch PFC census is a PfcLog method.)
 # --------------------------------------------------------------------------- #
-def astra_times(tag: str, p: incast.IncastPaths) -> dict:
-    """TTFT (end of prefill) AND total execution time from one read of this run's
-    ASTRA trace. TTFT is the FIRSTTOK send (buffer_sweep's definition, reused via
-    firsttok_send_instant); total is the last op end over the whole run -- the
-    workload wall clock the incast delay ultimately shows up in."""
-    adir = p.astra_run(tag)
-    if not adir.is_dir():
-        warn(f"{tag}: no ASTRA run at {adir}; TTFT/total unavailable.")
-        return {}
-    df = astra.read_run(adir)
-    if df is None:
-        warn(f"{tag}: no readable stats_sys*.csv under {adir}; TTFT/total unavailable.")
-        return {}
-    out = {"total_exec_ns": float(df["end_tick"].max())}
-    inst = astra.firsttok_send_instant(df)
-    if inst is not None:
-        out["ttft_ns"] = inst
-    else:
-        pre = df.loc[(df["op_class"] == "COMP") & (df["phase"] == "prefill"),
-                     "end_tick"]
-        if len(pre):
-            warn(f"{tag}: no FIRSTTOK; using last prefill compute end as TTFT.")
-            out["ttft_ns"] = float(pre.max())
-        else:
-            warn(f"{tag}: no FIRSTTOK and no prefill COMP; TTFT unavailable.")
-    return out
-
-
-def pfc_pause_census(pfc: ns3.PfcLog) -> tuple[dict[int, int], float]:
-    """(PAUSE frames per switch node, total PAUSE frames). A switch appears in
-    pfc.txt as the VICTIM whose egress was held (see ns3.PfcLog), so this counts
-    how hard each switch was backpressured -- the 'produces the most PFC packets'
-    axis of the busy-switch ranking. Hosts (node_type 0) are excluded: the
-    question is about switch buffers."""
-    per_sw: dict[int, int] = defaultdict(int)
-    total = 0
-    for (node, ntype, _ifidx, _q), events in pfc.events.items():
-        n_pause = sum(1 for _t, typ in events if typ == 1)
-        total += n_pause
-        if ntype == 1:
-            per_sw[node] += n_pause
-    return dict(per_sw), float(total)
-
-
-def switch_pause_intervals(pfc: ns3.PfcLog, clamp_to: int) -> dict[int, list]:
-    """PAUSE [start,end] spans per switch node, for shading a switch's queue
-    timeline. The per-device intervals of pfc, collapsed onto the switch id."""
-    out: dict[int, list] = defaultdict(list)
-    for (node, ntype, _ifidx, _q), spans in pfc.pause_intervals(clamp_to=clamp_to).items():
-        if ntype == 1:
-            out[node].extend(spans)
-    return dict(out)
-
-
 def kv_stage_skew(kv: pd.DataFrame, placement: Placement) -> dict:
     """KV-cache arrival skew computed WITHIN each decode stage (a TP group),
     not across the whole decode pool.
@@ -340,26 +317,30 @@ def kv_stage_skew(kv: pd.DataFrame, placement: Placement) -> dict:
 
 
 def analyse(tag: str, p: incast.IncastPaths, placement: Placement) -> Row:
+    """One run. analyse_level has already aborted on missing config inputs and
+    skipped runs with missing outputs (usable_tags), so nothing here re-checks
+    file presence."""
     buf = BUFFER_AXIS.value(tag)
     need(buf is not None, f"{tag}: no 'buf<num>' token in the name.")
-    tpath, cpath, ns3_dir = p.topology(tag), p.config(tag), p.ns3_run(tag)
-    for fpath in (tpath, cpath, ns3_dir / "fct.txt", ns3_dir / "pfc.txt",
-                  ns3_dir / "qlen.txt"):
-        need(fpath.exists(), f"{tag}: missing {fpath}")
-
-    topo = parse_topology(tpath)
-    cfg = parse_ns3_config(cpath)
+    ns3_dir = p.ns3_run(tag)
+    topo = parse_topology(p.topology(tag))
+    cfg = parse_ns3_config(p.config(tag))
     for w in cfg.warnings():
         warn(f"{tag}: {w}")
-    if cfg.buffer_mb is not None and abs(cfg.buffer_mb - buf) > 1e-6:
-        warn(f"{tag}: BUFFER_SIZE={cfg.buffer_mb} MiB in config.txt but "
-             f"'buf{buf:g}' in the name; trusting the name.")
+    need(cfg.buffer_mb is None or abs(cfg.buffer_mb - buf) < 1e-6,
+         f"{tag}: BUFFER_SIZE={cfg.buffer_mb} MiB in config.txt but "
+         f"'buf{buf:g}' in the name. One of the two is lying.")
 
     row = Row(tag=tag, level=p.level, incast_degree=incast.prefill_tp(placement),
               buffer_mb=float(buf), buffer_bytes=float(buf) * 1024 * 1024)
 
-    for k, v in astra_times(tag, p).items():
-        setattr(row, k, v)
+    # The one read of this run's ASTRA trace: TTFT/total, KV arrivals & FCTs,
+    # PP skew and the decode-side measures all share this frame.
+    adir = p.astra_run(tag)
+    adf = astra.read_run(adir)
+    need(adf is not None, f"{tag}: no readable stats_sys*.csv under {adir}.")
+    row.total_exec_ns = float(adf["end_tick"].max())
+    row.ttft_ns = ttft_from(adf, tag)
 
     raw = ns3.read_fct(ns3_dir / "fct.txt")
     need(raw is not None and len(raw), f"{tag}: fct.txt has no parsable rows.")
@@ -391,6 +372,24 @@ def analyse(tag: str, p: incast.IncastPaths, placement: Placement) -> Row:
     need(len(kv), f"{tag}: no KV flow after classification -- the prefill/decode "
                   f"split does not match this topology's traffic.")
 
+    # KV FCT raw material (see the Row fields): per-flow durations from the CSV
+    # KV send rows, filtered to bulk (> one packet) to mirror the 'kv' class
+    # exactly; the slowdown array is the only fct.txt-sourced piece.
+    kv_send = astra.sends(adf, adf["op_class"] == "KV")
+    kv_send = kv_send[kv_send["comm_size"] > cfg.payload]
+    if len(kv_send) != len(kv):
+        warn(f"{tag}: {len(kv_send)} CSV KV sends vs {len(kv)} classified fct "
+             f"kv flows; the FCT stats use the CSV rows.")
+    row.kv_fct_ns = kv_send["duration"].to_numpy(dtype=float)
+    row.kv_slowdown = kv["slowdown"].dropna().to_numpy(dtype=float)
+    row.kv_bytes = float(kv_send["comm_size"].sum()) if len(kv_send) else NAN
+    span = (float(kv_send["end_tick"].max() - kv_send["start_tick"].min())
+            if len(kv_send) else 0.0)
+    # Aggregate KV goodput over the KV phase: total KV bytes over first-send ->
+    # last-arrival wall time. Not a link utilisation (the shards cross different
+    # links) -- "how fast the whole KV handover completed".
+    row.kv_goodput_gbps = row.kv_bytes * 8.0 / span if span > 0 else NAN
+
     qlen = ns3.read_qlen(ns3_dir / "qlen.txt", series=True)
     need(qlen is not None and qlen.port_max, f"{tag}: qlen.txt has no samples.")
     pfc = ns3.read_pfc(ns3_dir / "pfc.txt")
@@ -409,9 +408,7 @@ def analyse(tag: str, p: incast.IncastPaths, placement: Placement) -> Row:
     # arrival, cleanly labelled) instead of reconstructing them from fct.txt --
     # same nanosecond values, none of the flow-classification / incast fan-in /
     # wave-grouping heuristics. Fabric metrics above (link, PFC, drops, queues)
-    # stay on ns-3.
-    adir = p.astra_run(tag)
-    adf = astra.read_run(adir) if adir.is_dir() else None
+    # stay on ns-3. `adf` was read once at the top of this function.
     kv_arr = astra.kv_arrivals(adf)
 
     # barrier gives the decode-start gate and the per-rank ready times; the
@@ -431,6 +428,31 @@ def analyse(tag: str, p: incast.IncastPaths, placement: Placement) -> Row:
         warn(f"{tag}: decode stage(s) {sk['short_stages']} declare >=2 ranks but "
              f"<2 received KV; their intra-stage skew is omitted.")
 
+    # decode-side measures, from utils.measures (one definition each):
+    # per-(stage, layer) TP-group shard skew (fig 02), per-rank cumulative KV
+    # arrival (fig 09), decode first-all-reduce inheritance (fig 03) and the
+    # first-pass KV stall (fig 04). The rank span / layer delta that
+    # kv_skew_stats also returns feed buffer_sweep's figure 09 only; unused here.
+    skew_scal, _, _ = kv_skew_stats(kv_arr)
+    for k, v in skew_scal.items():
+        setattr(row, k, v)
+    if row.kv_tp_skew_n == 0:
+        warn(f"{tag}: no (stage, layer) KV group has >=2 shard arrivals; the "
+             f"TP-group skew figure (02) will be empty for this run.")
+    row.kv_rank_series = kv_rank_series(kv_arr, placement)
+    row.dec_ar = decode_ar_stats(adf)
+    if not row.dec_ar:
+        warn(f"{tag}: no decode TP all-reduce in the ASTRA stats; the decode "
+             f"first-all-reduce figure (03) will be empty for this run.")
+    stall_scal, row.dec_stall = decode_stall_stats(adf, kv_arr)
+    for k, v in stall_scal.items():
+        setattr(row, k, v)
+    if pd.notna(row.tok2_ns) and pd.notna(row.ttft_ns):
+        row.tok2_after_tok1_ns = row.tok2_ns - row.ttft_ns
+    if pd.isna(row.tok2_ns):
+        warn(f"{tag}: no DECFB send in the ASTRA stats; the decode KV-stall "
+             f"figure (04) will be empty for this run.")
+
     ppr = pp.measure(adf)
     row.pp_available = ppr.available
     row.pp_skew_ns = ppr.skew_ns
@@ -440,8 +462,8 @@ def analyse(tag: str, p: incast.IncastPaths, placement: Placement) -> Row:
              f"placements); PP skew recorded as NaN/0.")
 
     # per-switch fabric census
-    row.pfc_per_switch, row.total_pause_frames = pfc_pause_census(pfc)
-    row.pause_intervals = switch_pause_intervals(pfc, run_end)
+    row.pfc_per_switch, row.total_pause_frames = pfc.switch_pause_census()
+    row.pause_intervals = pfc.switch_pause_intervals(run_end)
     for sw, (ts, ys) in qlen.switch_series.items():
         if len(ts) == 0:
             continue
@@ -497,15 +519,25 @@ def analyse_level(level: str, root: Path, out_workload: str, config_sweep: str,
                   k_switches: int) -> Level | None:
     p = incast.IncastPaths(level=level, out_workload=out_workload,
                            config_sweep=config_sweep, root=root)
-    if p.missing_roots():
-        warn(f"{level}: skipped, derived root(s) missing:\n    "
-             + "\n    ".join(p.missing_roots()))
+    missing_roots = p.missing_roots()
+    # the config root is an INPUT: without it nothing can be analysed -- Abort.
+    # Output roots merely mean the level has not produced anything yet -- skip.
+    need(not any(m.startswith("config_root") for m in missing_roots),
+         f"{level}: " + "; ".join(m for m in missing_roots
+                                  if m.startswith("config_root")))
+    if missing_roots:
+        warn(f"{level}: skipped, output root(s) missing:\n    "
+             + "\n    ".join(missing_roots))
         return None
+    miss_cfg = p.missing_configs()
+    need(not miss_cfg,
+         f"{level}: config input(s) missing -- fix the configs (or prune the "
+         f"stale ns-3 output):\n    " + "\n    ".join(miss_cfg))
     tags, skipped = p.usable_tags()
     for s in skipped:
-        warn(f"{level}: {s} (config/output still being generated?) -- skipped.")
+        warn(f"{level}: {s} (run not finished yet?) -- skipped.")
     if not tags:
-        warn(f"{level}: no run has all inputs on disk yet; skipped.")
+        warn(f"{level}: no run has all its outputs on disk yet; skipped.")
         return None
 
     placement = recover_placement(p, tags)
@@ -609,13 +641,13 @@ def fig_kv_skew(levels: list[Level], s: pd.DataFrame, outdir: Path,
             si = col[len("kv_skew_d"):-len("_ms")]
             a.plot(gg["buffer_mb"], gg[col], "o-", color=cmap(k),
                    label=f"decode stage d{si}")
-            _mark_lossy(a, gg, "buffer_mb", col)
+            mark_lossy(a, gg, "buffer_mb", col)
         logx_pow2(a, g, "buffer_mb", "Per-switch buffer (MiB)")
         a.set_title(lv.label, fontsize=10)
         a.grid(True, alpha=0.3, which="both")
         a.set_ylim(bottom=0)
         h, _ = a.get_legend_handles_labels()
-        proxies = _loss_proxies(anyl, anyu) if j == 0 else []
+        proxies = loss_proxies(anyl, anyu) if j == 0 else []
         a.legend(handles=h + proxies, fontsize=8)
         if j == 0:
             a.set_ylabel("Intra-stage KV arrival skew (ms)")
@@ -624,9 +656,210 @@ def fig_kv_skew(levels: list[Level], s: pd.DataFrame, outdir: Path,
     save_fig(fig, outdir, "01_kv_arrival_skew_vs_buffer.png", written)
 
 
+def fig_kv_tp_skew(levels: list[Level], s: pd.DataFrame, outdir: Path,
+                   written: list[Path]) -> None:
+    """02 -- figure 01 at layer grain (buffer_sweep's 08): one skew per (decode
+    stage, layer) = the spread between the arrivals of the KV shards feeding the
+    same TP group, exactly the wait that layer's first decode all-reduce
+    inherits. min/mean/p99 of that population vs buffer, one panel per topology
+    (own y-scale, as in figure 01)."""
+    if "kv_tp_skew_mean_ns" not in s.columns:
+        return
+    usable = [lv for lv in levels
+              if s.loc[s["level"] == lv.level, "kv_tp_skew_mean_ns"].notna().any()]
+    if not usable:
+        return
+    n = len(usable)
+    anyl = anyu = False
+    fig, axes = plt.subplots(1, n, figsize=(max(4.8 * n, 5), 4.6), squeeze=False)
+    for j, lv in enumerate(usable):
+        a = axes[0][j]
+        g = s[s["level"] == lv.level].sort_values("buffer_mb")
+        for col, color, style, label in (
+                ("kv_tp_skew_min_ns", GREEN, "v--", "min"),
+                ("kv_tp_skew_mean_ns", BLUE, "o-", "mean"),
+                ("kv_tp_skew_p99_ns", CORAL, "s-.", "p99")):
+            gg = g.dropna(subset=[col])
+            if not gg.empty:
+                a.plot(gg["buffer_mb"], gg[col] * MS, style, color=color,
+                       label=label)
+        ml, mu = mark_lossy(a, g.dropna(subset=["kv_tp_skew_mean_ms"]),
+                             "buffer_mb", "kv_tp_skew_mean_ms")
+        anyl |= ml
+        anyu |= mu
+        ngroups = int(g["kv_tp_skew_n"].max())
+        logx_pow2(a, g, "buffer_mb", "Per-switch buffer (MiB)")
+        a.set_title(f"{lv.label}  ({ngroups} (stage, layer) groups)", fontsize=10)
+        a.grid(True, alpha=0.3, which="both")
+        a.set_ylim(bottom=0)
+        h, _ = a.get_legend_handles_labels()
+        proxies = loss_proxies(anyl, anyu) if j == 0 else []
+        a.legend(handles=h + proxies, fontsize=8)
+        if j == 0:
+            a.set_ylabel("Cross-shard arrival skew (ms)")
+    fig.suptitle("KV arrival skew within each TP group, per (stage, layer)",
+                 y=1.02)
+    save_fig(fig, outdir, "02_kv_tp_group_skew_vs_buffer.png", written)
+
+
+def fig_decode_allreduce(levels: list[Level], outdir: Path,
+                         written: list[Path]) -> None:
+    """03 -- the skew the decode pipeline actually inherits (buffer_sweep's 10),
+    one row of panels per topology. LEFT: the ENTRY SKEW of each decode stage's
+    FIRST TP all-reduce -- the one gated by that stage's own KV transfer -- i.e.
+    how staggered the TP ranks entered it. RIGHT: that all-reduce's duration
+    against the mean of the stage's remaining (steady-state) all-reduces: the
+    early shard sits inside the collective waiting for the late one, so
+    inherited skew reads as first-AR duration above the steady mean. If these
+    stay flat while figure 02 moves, the incast skew is being masked upstream
+    of the collective."""
+    usable = [lv for lv in levels if any(r.dec_ar for r in lv.rows)]
+    if not usable:
+        return
+    n = len(usable)
+    cmap = plt.get_cmap("tab10")
+    fig, axes = plt.subplots(n, 2, squeeze=False, figsize=(13, 4.2 * n))
+    for i, lv in enumerate(usable):
+        axL, axR = axes[i]
+        runs = lv.rows
+        stages = sorted({st for r in runs for st in r.dec_ar})
+        for k, st in enumerate(stages):
+            have = [r for r in runs if st in r.dec_ar]
+            xs = [r.buffer_mb for r in have]
+            c = cmap(k % 10)
+            axL.plot(xs, [r.dec_ar[st]["first_skew_ns"] * MS for r in have],
+                     "o-", color=c, label=f"stage d{st}")
+            axR.plot(xs, [r.dec_ar[st]["first_dur_ns"] * MS for r in have],
+                     "o-", color=c, label=f"d{st} — first AR")
+            axR.plot(xs, [r.dec_ar[st]["rest_dur_mean_ns"] * MS for r in have],
+                     "v--", color=c, alpha=0.5, label=f"d{st} — mean of the rest")
+        # not-lossless runs flagged as vlines (the fig_occ_pfc convention)
+        for ax in (axL, axR):
+            for r in runs:
+                if r.lossy:
+                    ax.axvline(r.buffer_mb, color=LOSS_RED, ls=":", lw=1.6,
+                               alpha=0.75, zorder=0)
+                elif not r.loss_captured:
+                    ax.axvline(r.buffer_mb, color=MUTED, ls=":", lw=1.0,
+                               alpha=0.5, zorder=0)
+        gx = pd.DataFrame({"buffer_mb": [r.buffer_mb for r in runs]})
+        for ax, ttl, yl in ((axL, "entry skew of the FIRST all-reduce",
+                             "Entry skew (ms)"),
+                            (axR, "duration: first AR vs mean of the rest",
+                             "Duration (ms)")):
+            logx_pow2(ax, gx, "buffer_mb", "Per-switch buffer (MiB)")
+            ax.set_title(f"{lv.label}: {ttl}", fontsize=10)
+            ax.set_ylabel(yl)
+            ax.grid(True, alpha=0.3, which="both")
+            ax.legend(fontsize=8)
+    fig.suptitle("Skew inherited by each decode stage's first TP all-reduce "
+                 "(red dotted = run dropped packets)", y=1.0)
+    save_fig(fig, outdir, "03_decode_first_allreduce_skew.png", written)
+
+
+def fig_decode_stall(levels: list[Level], s: pd.DataFrame, outdir: Path,
+                     written: list[Path]) -> None:
+    """04 -- how much the decode is stalled waiting for its KV (buffer_sweep's
+    11), all topologies overlaid. LEFT: the user-visible gap, token 2 after
+    token 1 (the FIRSTTOK message queues behind the KV bulk). MIDDLE: the first
+    decode pass (decode start -> token 2, solid) against the steady inter-token
+    gap (dashed, the control): the excess IS the KV stall. RIGHT: the cause per
+    (topology, stage): KV readiness minus the stage's first-input arrival --
+    above 0 the stage outruns its KV and stalls, below 0 the transfer was
+    already complete (fully masked)."""
+    if "tok2_latency_ms" not in s.columns or not s["tok2_latency_ms"].notna().any():
+        return
+    colors = _level_colors(levels)
+    fig, (axA, axB, axC) = plt.subplots(1, 3, figsize=(16, 4.8))
+    anyl = anyu = False
+    lat_cols = sorted((c for c in s.columns
+                       if re.fullmatch(r"dec\d+_kv_lateness_ns", c)),
+                      key=lambda c: int(c[len("dec"):-len("_kv_lateness_ns")]))
+    for lv in levels:
+        g = s[s["level"] == lv.level].sort_values("buffer_mb")
+        c = colors[lv.level]
+        ga = g.dropna(subset=["tok2_after_tok1_ms"])
+        if not ga.empty:
+            axA.plot(ga["buffer_mb"], ga["tok2_after_tok1_ms"], "o-", color=c,
+                     label=lv.label)
+            ml, mu = mark_lossy(axA, ga, "buffer_mb", "tok2_after_tok1_ms")
+            anyl |= ml
+            anyu |= mu
+        gb = g.dropna(subset=["tok2_latency_ms"])
+        if not gb.empty:
+            axB.plot(gb["buffer_mb"], gb["tok2_latency_ms"], "o-", color=c,
+                     label=f"{lv.label} — first pass")
+            mark_lossy(axB, gb, "buffer_mb", "tok2_latency_ms")
+        gi = g.dropna(subset=["itl_steady_ms"])
+        if not gi.empty:
+            axB.plot(gi["buffer_mb"], gi["itl_steady_ms"], "v--", color=c,
+                     alpha=0.5, label=f"{lv.label} — steady ITL")
+        for k, col in enumerate(lat_cols):
+            gc = g.dropna(subset=[col])
+            if gc.empty:
+                continue
+            st = col[len("dec"):-len("_kv_lateness_ns")]
+            axC.plot(gc["buffer_mb"], gc[col] * MS, marker="s",
+                     ls=["-", "--", ":", "-."][k % 4], color=c,
+                     label=f"{lv.label} d{st}")
+    axC.axhline(0.0, color="k", linestyle=":", alpha=0.5)
+    for a, ttl, yl in ((axA, "Token 2 after token 1", "t(token 2) − TTFT (ms)"),
+                       (axB, "First decode pass vs steady state",
+                        "Decode start → token 2 (ms)"),
+                       (axC, "KV lateness at each stage's first input",
+                        "KV ready − input arrival (ms)")):
+        logx_pow2(a, s, "buffer_mb", "Per-switch buffer (MiB)")
+        a.set_title(ttl)
+        a.set_ylabel(yl)
+        a.grid(True, alpha=0.3, which="both")
+        h, _ = a.get_legend_handles_labels()
+        if h:
+            a.legend(handles=h + (loss_proxies(anyl, anyu) if a is axA else []),
+                     fontsize=7)
+    fig.suptitle("How much the decode is stalled by its KV transfer", y=1.02)
+    save_fig(fig, outdir, "04_decode_kv_stall_vs_buffer.png", written)
+
+
+def fig_kv_cumulative(lv: Level, outdir: Path, written: list[Path]) -> None:
+    """09 -- (per topology) cumulative KV bytes arrived per decode rank over
+    time, one panel per buffer (buffer_sweep's 02). The horizontal spread
+    between the ranks' curves IS the skew of figure 01; a staircase with flat
+    stretches IS a PFC stall. Dotted vline = the KV gate (last arrival, decode
+    barrier)."""
+    runs = [r for r in lv.rows if r.kv_rank_series]
+    if not runs:
+        return
+    ranks = sorted({d for r in runs for d in r.kv_rank_series})
+    cmap = plt.get_cmap("tab10")
+    ncols = len(runs)
+    fig, axes = plt.subplots(1, ncols, figsize=(max(3.0 * ncols, 6), 4.6),
+                             sharey=True, squeeze=False)
+    for j, r in enumerate(runs):
+        a = axes[0][j]
+        for i, d in enumerate(ranks):
+            if d not in r.kv_rank_series:
+                continue
+            t, cum = r.kv_rank_series[d]
+            total = cum[-1] if len(cum) else 1.0
+            a.step(t * MS, 100 * cum / total, where="post",
+                   color=cmap(i % 10), label=f"rank {d}")
+        if pd.notna(r.kv_gate_ns):
+            a.axvline(r.kv_gate_ns * MS, color="k", linestyle=":", alpha=0.5)
+        tc = (LOSS_RED if r.lossy
+              else MUTED if not r.loss_captured else "black")
+        a.set_title(f"{r.buffer_mb:g} MiB", fontsize=9, color=tc)
+        a.set_xlabel("Time (ms)", fontsize=8)
+        a.grid(True, alpha=0.3)
+    axes[0][0].set_ylabel("KV arrived (% of total)")
+    axes[0][0].legend(fontsize=7, loc="lower right")
+    fig.suptitle(f"{lv.label}: cumulative KV arrival per decode rank "
+                 f"(red title = dropped packets)", y=1.02)
+    save_fig(fig, outdir, f"09_{lv.level}_kv_cumulative_arrival.png", written)
+
+
 def fig_ttft(levels: list[Level], s: pd.DataFrame, outdir: Path,
              written: list[Path]) -> None:
-    """02 -- TTFT vs buffer, ALL topologies on one axis (one line each). TTFT is
+    """05 -- TTFT vs buffer, ALL topologies on one axis (one line each). TTFT is
     end of prefill, upstream of the KV/fabric congestion, so it is flat across
     the buffer; the figure's job is the cross-topology comparison -- TTFT falls
     as the prefill TP width grows (more compute parallelism on prefill)."""
@@ -639,7 +872,7 @@ def fig_ttft(levels: list[Level], s: pd.DataFrame, outdir: Path,
             continue
         ax.plot(g["buffer_mb"], g["ttft_ms"], "o-", color=colors[lv.level],
                 label=lv.label)
-        ml, mu = _mark_lossy(ax, g, "buffer_mb", "ttft_ms")
+        ml, mu = mark_lossy(ax, g, "buffer_mb", "ttft_ms")
         anyl |= ml
         anyu |= mu
         drew = True
@@ -652,13 +885,13 @@ def fig_ttft(levels: list[Level], s: pd.DataFrame, outdir: Path,
     ax.set_title("TTFT vs buffer (all topologies)")
     ax.grid(True, alpha=0.3, which="both")
     h, _ = ax.get_legend_handles_labels()
-    ax.legend(handles=h + _loss_proxies(anyl, anyu), fontsize=8, title="topology")
-    save_fig(fig, outdir, "02_ttft_vs_buffer.png", written)
+    ax.legend(handles=h + loss_proxies(anyl, anyu), fontsize=8, title="topology")
+    save_fig(fig, outdir, "05_ttft_vs_buffer.png", written)
 
 
 def fig_makespan(levels: list[Level], s: pd.DataFrame, outdir: Path,
                  written: list[Path]) -> None:
-    """03 -- total execution time (makespan) vs buffer, one panel per topology.
+    """06 -- total execution time (makespan) vs buffer, one panel per topology.
     Just the makespan, and each panel's y-axis is FITTED to its own data (not
     pinned to zero), so the small buffer-driven variation is actually readable
     instead of a flat line at the top of the frame. The makespan-minus-TTFT
@@ -678,22 +911,22 @@ def fig_makespan(levels: list[Level], s: pd.DataFrame, outdir: Path,
              .dropna(subset=["total_exec_ms"]).sort_values("buffer_mb"))
         a.plot(g["buffer_mb"], g["total_exec_ms"], "s-", color=CORAL,
                label="makespan")
-        _mark_lossy(a, g, "buffer_mb", "total_exec_ms")
+        mark_lossy(a, g, "buffer_mb", "total_exec_ms")
         logx_pow2(a, g, "buffer_mb", "Per-switch buffer (MiB)")
-        _zoom_y(a, g["total_exec_ms"])          # fit y to the data, not to zero
+        zoom_y(a, g["total_exec_ms"])          # fit y to the data, not to zero
         a.set_title(lv.label, fontsize=10)
         a.grid(True, alpha=0.3, which="both")
         if j == 0:
             a.set_ylabel("Makespan (ms)")
             h, _ = a.get_legend_handles_labels()
-            a.legend(handles=h + _loss_proxies(anyl, anyu), fontsize=8)
+            a.legend(handles=h + loss_proxies(anyl, anyu), fontsize=8)
     fig.suptitle("Makespan vs buffer per topology (y fitted to data)", y=1.02)
-    save_fig(fig, outdir, "03_makespan_vs_buffer.png", written)
+    save_fig(fig, outdir, "06_makespan_vs_buffer.png", written)
 
 
 def fig_pfc_frames(levels: list[Level], s: pd.DataFrame, outdir: Path,
                    written: list[Path]) -> None:
-    """05 -- PFC PAUSE frames vs buffer, all topologies on one axis. The direct
+    """08 -- PFC PAUSE frames vs buffer, all topologies on one axis. The direct
     picture of the point that the fabric DOES respond to the buffer even where
     the end-to-end times do not: PFC backpressure explodes at small buffers and
     higher incast degree and collapses to zero as the buffer grows.
@@ -714,7 +947,7 @@ def fig_pfc_frames(levels: list[Level], s: pd.DataFrame, outdir: Path,
             continue
         ax.plot(g["buffer_mb"], g["total_pause_frames"], "o-",
                 color=colors[lv.level], label=lv.label)
-        ml, mu = _mark_lossy(ax, g, "buffer_mb", "total_pause_frames")
+        ml, mu = mark_lossy(ax, g, "buffer_mb", "total_pause_frames")
         anyl |= ml
         anyu |= mu
         drew = True
@@ -727,13 +960,13 @@ def fig_pfc_frames(levels: list[Level], s: pd.DataFrame, outdir: Path,
     ax.set_title("PFC backpressure vs buffer (all topologies)")
     ax.grid(True, alpha=0.3, which="both")
     h, _ = ax.get_legend_handles_labels()
-    ax.legend(handles=h + _loss_proxies(anyl, anyu), fontsize=8, title="topology")
-    save_fig(fig, outdir, "05_pfc_frames_vs_buffer.png", written)
+    ax.legend(handles=h + loss_proxies(anyl, anyu), fontsize=8, title="topology")
+    save_fig(fig, outdir, "08_pfc_frames_vs_buffer.png", written)
 
 
 def fig_drops(levels: list[Level], s: pd.DataFrame, outdir: Path,
               written: list[Path]) -> None:
-    """04 -- dedicated packet-loss panel: dropped packets ('Headroom full') vs the
+    """07 -- dedicated packet-loss panel: dropped packets ('Headroom full') vs the
     per-switch buffer, one line per topology. Lossless runs sit at 0; a run that
     violated the lossless fabric spikes up, is ringed in red, and is labelled with
     its drop count. Only runs with a captured drops.txt are plotted (loss-unknown
@@ -751,7 +984,7 @@ def fig_drops(levels: list[Level], s: pd.DataFrame, outdir: Path,
             continue
         ax.plot(g["buffer_mb"], g["dropped_packets"], "o-", color=colors[lv.level],
                 label=lv.label)
-        ml, _ = _mark_lossy(ax, g, "buffer_mb", "dropped_packets")
+        ml, _ = mark_lossy(ax, g, "buffer_mb", "dropped_packets")
         anyl |= ml
         for _, rr in g[g["dropped_packets"] > 0].iterrows():
             ax.annotate(f"{int(rr['dropped_packets'])}",
@@ -768,13 +1001,13 @@ def fig_drops(levels: list[Level], s: pd.DataFrame, outdir: Path,
     ax.set_ylim(bottom=0)
     ax.grid(True, alpha=0.3, which="both")
     handles, _ = ax.get_legend_handles_labels()
-    ax.legend(handles=handles + _loss_proxies(anyl, False), fontsize=8,
+    ax.legend(handles=handles + loss_proxies(anyl, False), fontsize=8,
               title="topology")
-    save_fig(fig, outdir, "04_dropped_packets_vs_buffer.png", written)
+    save_fig(fig, outdir, "07_dropped_packets_vs_buffer.png", written)
 
 
 def fig_queue_fill(lv: Level, outdir: Path, written: list[Path]) -> None:
-    """(per topology) -- how the BUSIEST switches' buffers fill over time,
+    """10 -- (per topology) how the BUSIEST switches' buffers fill over time,
     rows = busy switch, cols = buffer, with PFC PAUSE spans shaded as a top
     ribbon. The pared-down descendant of buffer_sweep's per-switch grid: same
     picture, but only the switches that actually matter here."""
@@ -818,13 +1051,14 @@ def fig_queue_fill(lv: Level, outdir: Path, written: list[Path]) -> None:
     note = f"  [red title = dropped packets: {', '.join(lossy)} MiB]" if lossy else ""
     fig.suptitle(f"{lv.label}: busiest switches' buffer fill over time "
                  f"(PFC PAUSE shaded){note}", y=1.01)
-    save_fig(fig, outdir, f"{lv.level}_queue_fill_busy_switches.png", written)
+    save_fig(fig, outdir, f"10_{lv.level}_queue_fill_busy_switches.png", written)
 
 
 def fig_occ_pfc(lv: Level, outdir: Path, written: list[Path]) -> None:
-    """(per topology) -- the busiest switches summarised vs buffer: peak
+    """11 -- (per topology) the busiest switches summarised vs buffer: peak
     occupancy (MB, left) and PFC PAUSE frames drawn (right), one line per busy
-    switch. The scalar companion to figure 05."""
+    switch. The scalar, per-switch companion to figures 08 (fabric-total PFC)
+    and 10 (the same switches' timelines)."""
     if not lv.busy:
         return
     runs = lv.rows
@@ -859,12 +1093,13 @@ def fig_occ_pfc(lv: Level, outdir: Path, written: list[Path]) -> None:
     note = " (red dotted = run dropped packets)" if lossy_bufs else ""
     fig.suptitle(f"{lv.label}: busiest switches — occupancy and PFC vs buffer{note}",
                  y=1.02)
-    save_fig(fig, outdir, f"{lv.level}_occupancy_and_pfc_vs_buffer.png", written)
+    save_fig(fig, outdir, f"11_{lv.level}_occupancy_and_pfc_vs_buffer.png", written)
 
 
 # --------------------------------------------------------------------------- #
 REPORT = ["level", "incast_degree", "buffer_mb", "bottleneck", "kv_skew_ms",
-          "kv_skew_global_ms", "ttft_ms", "total_exec_ms", "total_over_ttft",
+          "kv_skew_global_ms", "kv_tp_skew_mean_ms", "ttft_ms",
+          "tok2_latency_ms", "itl_steady_ms", "total_exec_ms", "total_over_ttft",
           "pp_skew_us", "total_pause_frames", "dropped_packets", "drop_rate_pct",
           "loss_captured", "kv_flows", "other_flows", "split_ok"]
 
@@ -928,21 +1163,26 @@ def main(argv: list[str] | None = None) -> int:
         s = pd.DataFrame([r.flat() for L in levels for r in L.rows])
         s = s.sort_values(["incast_degree", "buffer_mb"]).reset_index(drop=True)
 
-        if outdir.exists():
-            shutil.rmtree(outdir)
-        outdir.mkdir(parents=True, exist_ok=True)
+        fresh_dir(outdir)
         front = [c for c in REPORT if c in s.columns]
         s[front + [c for c in s.columns if c not in front]].to_csv(
             outdir / "summary.csv", index=False)
 
+        # numeric order == write order, so the "Wrote" listing reads 01..11
         written: list[Path] = []
-        fig_kv_skew(levels, s, outdir, written)
-        fig_ttft(levels, s, outdir, written)
-        fig_makespan(levels, s, outdir, written)
-        fig_drops(levels, s, outdir, written)
-        fig_pfc_frames(levels, s, outdir, written)
-        for L in levels:
+        fig_kv_skew(levels, s, outdir, written)             # 01
+        fig_kv_tp_skew(levels, s, outdir, written)          # 02
+        fig_decode_allreduce(levels, outdir, written)       # 03
+        fig_decode_stall(levels, s, outdir, written)        # 04
+        fig_ttft(levels, s, outdir, written)                # 05
+        fig_makespan(levels, s, outdir, written)            # 06
+        fig_drops(levels, s, outdir, written)               # 07
+        fig_pfc_frames(levels, s, outdir, written)          # 08
+        for L in levels:                                    # 09 per topology
+            fig_kv_cumulative(L, outdir, written)
+        for L in levels:                                    # 10 per topology
             fig_queue_fill(L, outdir, written)
+        for L in levels:                                    # 11 per topology
             fig_occ_pfc(L, outdir, written)
 
         pd.set_option("display.width", 240)
@@ -980,12 +1220,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nWrote {outdir}:")
         for fpath in ["summary.csv", *[q.name for q in written]]:
             print(f"  {fpath}")
-        if WARNINGS:
-            print(f"\n{len(WARNINGS)} WARNING(S):")
-            for w in WARNINGS:
-                print(f"  ! {w}")
-            return 1
-        return 0
+        return drain_warnings()
     except Abort as e:
         print(f"\nABORT: {e}", file=sys.stderr)
         return 2

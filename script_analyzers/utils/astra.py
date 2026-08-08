@@ -329,6 +329,23 @@ def kv_arrivals(df: pd.DataFrame) -> pd.DataFrame:
                          "layer": pd.to_numeric(kv["L"], errors="coerce")})
 
 
+def end_of_prefill(df: pd.DataFrame) -> tuple[float | None, str]:
+    """The TTFT instant with its fallback chain, decided in ONE place:
+    (instant_ns, source) where source is 'firsttok' (the FIRSTTOK send,
+    firsttok_send_instant), 'prefill_comp' (no FIRSTTOK in the trace: the last
+    prefill compute end) or '' (neither exists; instant is None). buffer_sweep
+    and incast_sweep both report TTFT through this, so the two sweeps cannot
+    drift apart on what "end of prefill" means."""
+    inst = firsttok_send_instant(df)
+    if inst is not None:
+        return float(inst), "firsttok"
+    pre = df.loc[(df["op_class"] == "COMP") & (df["phase"] == "prefill"),
+                 "end_tick"]
+    if len(pre):
+        return float(pre.max()), "prefill_comp"
+    return None, ""
+
+
 def pp_arrivals(df: pd.DataFrame) -> pd.DataFrame:
     """One row per inter-stage PP-prefill activation AT ITS RECEIVING RANK, columns
     dst_stage, wave, dst, arrival -- the shape utils.pp.wave_skew consumes.

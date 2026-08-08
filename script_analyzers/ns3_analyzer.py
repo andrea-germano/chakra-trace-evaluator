@@ -69,7 +69,7 @@ import matplotlib.pyplot as plt
 from utils import flows as flowlib
 from utils import ns3, paths, roles
 from utils.cli import Abort, need
-from utils.fabric import Bottleneck, FabricModel, parse_ns3_config, parse_topology
+from utils.fabric import FabricModel, parse_ns3_config, parse_topology
 from utils.plots import downsample_max, save_fig
 from utils.roles import Placement
 
@@ -739,12 +739,10 @@ def main(argv: list[str] | None = None) -> int:
         congesting = f[f["flow_class"] == "kv"] if has_class else fabric_flows
         if a.bottleneck:
             sw, peer = (int(x) for x in a.bottleneck.split("->"))
-            eg = topo.port_facing(sw, peer)
-            need(eg is not None, f"--bottleneck {a.bottleneck}: no such link.")
-            ing = {q for path in congesting["path"] for i, (x, y) in enumerate(path or [])
-                   if (x, y) == (sw, peer) and i > 0
-                   and (q := topo.port_facing(sw, path[i - 1][0])) is not None}
-            bn = Bottleneck(sw, eg, peer, topo.ports[sw][eg].rate, tuple(sorted(ing)))
+            try:
+                bn = flowlib.forced_bottleneck(topo, sw, peer, congesting)
+            except ValueError as e:
+                raise Abort(f"--bottleneck {a.bottleneck}: {e}") from None
         else:
             bn = flowlib.find_bottleneck(topo, qlen.port_max, congesting)
         model = FabricModel(topo, cfg)

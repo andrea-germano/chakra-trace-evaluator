@@ -24,8 +24,19 @@ search this replaces.
 from __future__ import annotations
 
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def fresh_dir(path: Path) -> Path:
+    """Delete-and-recreate an output directory, so a re-run never leaves stale
+    figures from a previous layout next to the new ones. Every sweep main()
+    does this to its outdir before writing."""
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 ROOT = Path("/home/andre/tesi/trace_evaluator")
 WORKLOAD = "llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt"

@@ -42,13 +42,9 @@ from pathlib import Path
 
 import pandas as pd
 
-import matplotlib
-matplotlib.use("Agg")          # headless: no display needed
-import matplotlib.pyplot as plt
-
 from utils import paths
 from utils.paths import BANDWIDTH_AXIS, BANDWIDTH_GBPS_TO_BYTES_PER_NS
-from utils.plots import save_fig
+from utils.plots import lines_by_group
 from bandwidth_sweep import load_run, summarise_run
 from utils.cli import Abort, need
 
@@ -155,25 +151,10 @@ def main(argv: list[str] | None = None) -> int:
 
         def line_by_workload(ycol: str, ylabel: str, title: str, fname: str,
                              hline: float | None = None) -> None:
-            """One line per workload, x = bandwidth. Skipped when the column is
-            absent or entirely NaN, so a metric a workload's runs never produced
-            (e.g. no KV transfer at all) just drops out instead of an empty line."""
-            if ycol not in combined.columns or not combined[ycol].notna().any():
-                return
-            fig, ax = plt.subplots(figsize=(9, 5.5))
-            for w, grp in combined.groupby("workload"):
-                grp = grp.dropna(subset=[ycol]).sort_values("bandwidth")
-                if grp.empty:
-                    continue
-                ax.plot(grp["bandwidth"], grp[ycol], marker="o", label=w)
-            if hline is not None:
-                ax.axhline(hline, color="k", linestyle=":", alpha=0.4)
-            ax.set_xlabel("Link bandwidth (bx)")
-            ax.set_ylabel(ylabel)
-            ax.set_title(title)
-            ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=8)
-            save_fig(fig, outdir, fname, written)
+            # one line per workload, x = bandwidth (utils.plots.lines_by_group)
+            lines_by_group(combined, "workload", "bandwidth", ycol,
+                           "Link bandwidth (bx)", ylabel, title, fname,
+                           outdir, written, hline=hline)
 
         line_by_workload(
             "speedup", "Speedup (×lowest-bw)",
