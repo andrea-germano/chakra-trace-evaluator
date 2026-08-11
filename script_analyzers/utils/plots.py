@@ -63,6 +63,20 @@ def downsample_max(ts, ys, n: int = 4000) -> tuple[np.ndarray, np.ndarray]:
     return centres[keep], hi[keep]
 
 
+def buf_colour(b: float, bufs) -> object:
+    """One colour per swept value, ordered light->dark along the SWEPT axis.
+
+    Spaced in log2, like the axis itself, so 2 and 4 MiB are as far apart on the
+    colour ramp as 32 and 64 are. The ramp stops short of viridis' bright yellow
+    end, which is unreadable as a thin line on white."""
+    uniq = sorted(set(bufs))
+    if len(uniq) < 2:
+        return BLUE
+    lo, hi = np.log2(min(uniq)), np.log2(max(uniq))
+    f = (np.log2(b) - lo) / (hi - lo)
+    return plt.get_cmap("viridis")(0.05 + 0.78 * f)
+
+
 def plot_series(ax, data: pd.DataFrame, xcol: str, ycol: str, label: str,
                 marker: str = "o", scale: float = 1.0, linestyle: str = "-",
                 color: str | None = None) -> bool:
@@ -101,6 +115,33 @@ def save_fig(fig, outdir: Path, name: str, written: list[Path] | None = None) ->
     if written is not None:
         written.append(path)
     return path
+
+
+# The three knees of utils.measures.knee_scalars, as vertical rules. Drawn on
+# every figure whose curve they explain, with one style each, so the same rule
+# means the same thing in every analyzer. The STYLE is here (drawing mechanics);
+# the knees themselves are a measurement (utils.measures).
+KNEE_STYLE = {
+    "knee_pfc_mb": (CORAL, "PFC knee"),
+    "knee_stall_mb": (VIOLET, "stall onset"),
+    "knee_saturation_mb": (MUTED, "saturation"),
+}
+
+
+def mark_knees(ax, s: pd.DataFrame, which=tuple(KNEE_STYLE),
+               label: bool = True) -> None:
+    """Vertical rules at the knees carried in `s` (constant columns). Silent for
+    a knee the sweep never reached (NaN) -- an absent rule means 'did not
+    happen', which is itself the reading. `s` must already be one sweep's rows
+    (one buffer axis): a multi-topology frame carries several knee values per
+    column and only the first would be drawn."""
+    for col in which:
+        if col not in s.columns or not s[col].notna().any():
+            continue
+        v = float(s[col].dropna().iloc[0])
+        colour, name = KNEE_STYLE[col]
+        ax.axvline(v, color=colour, linestyle="--", lw=1.1, alpha=0.55,
+                   label=(name if label else None), zorder=0)
 
 
 def zoom_y(ax, series, pad: float = 0.15) -> None:

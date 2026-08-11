@@ -77,7 +77,8 @@ KIND = "run"
 COOL, CORAL, AMBER, GREEN, VIOLET, MUTED = (
     "#2b6cb0", "#d1495b", "#d98a00", "#2a9d5c", "#6a4c93", "#6b7280")
 _BASE_COLOR = {"kv": CORAL, "tp": MUTED, "pp_prefill": COOL,
-               "pp_decode": AMBER, "other": VIOLET}
+               "pp_decode": AMBER, "intra_prefill": GREEN, "intra_decode": "#0f766e",
+               "other": VIOLET}
 # A stable palette for switches, so switch N is the same colour in every figure.
 _SW_CYCLE = [COOL, CORAL, GREEN, AMBER, VIOLET, "#0f766e", "#b45309", "#7c3aed"]
 

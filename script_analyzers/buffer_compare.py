@@ -1,119 +1,73 @@
 #!/usr/bin/env python3
 """
-buffer_compare — same buffer sweep, different MODELS: whose causal chain
-(PP skew -> receiving-stage all-reduce -> TTFT) responds the same way to the
-per-switch buffer?
+buffer_compare — same buffer sweep, different MODELS: buffer_sweep's own figure
+set, with one line (or one waterfall block) per model.
 
-The cross-model companion to buffer_sweep. Auto-discovers every workload
-directory under output/ns3 that ran the given sweep (buffer_sweep_T1 by default)
-and overlays them on one figure per metric. Reuses buffer_sweep.analyse_sweep so
-a model is scored here identically to the single-model analysis -- one definition
-of the metrics, two tools.
+Auto-discovers every workload directory under output/ns3 that ran the given
+sweep (buffer_sweep_T1 by default), scores each with buffer_sweep.analyse_sweep
+-- one definition of the metrics, two tools -- and re-draws THE SAME FIGURES
+buffer_sweep draws, same numbers, same quantities, with the model as the line
+family. Reading a single-model analysis and this one is the same experience;
+only the number of lines changes.
 
-What goes on the axes, and why
---------------------------------------------------------------------------------
-Two kinds of quantity, in two blocks.
+The figure numbering mirrors buffer_sweep 1:1:
 
-Block A -- FABRIC-domain magnitudes, plotted RAW (absolute units). A PP arrival
-skew, a queue depth, a PAUSE count, a link utilisation all live in the network
-domain: they are caused by the fabric + buffer, not by how many parameters or
-tokens a model has, so they do NOT carry the model's compute scale the way
-ttft_ns or a tensor collective does. Their raw value is already the physical
-number to compare across models -- no normalisation:
+    01  CAUSAL CHAIN TO TTFT      same stacked panels (PP skew -> gated
+                                  all-reduce bw -> steady bw -> TTFT), one line
+                                  per group. TTFT is x this group's
+                                  largest-buffer run: raw ns would compare
+                                  model size, not fabric effect.
+    03  KV TP-SHARD SKEW          same quantity as the boxplots (per-layer
+                                  |shard 1 - shard 0| within one PP stage),
+                                  reduced to the mean | p99 panels -- the layer
+                                  POPULATIONS are per-run material the
+                                  cross-group summary does not carry.
+    04  FIRST TOKEN TO SECOND     the same waterfall, one block per group:
+                                  handoff in flight | decode awake, KV still
+                                  arriving | first pass completing, PAUSE count
+                                  beside each bar.
+    05  DECODE KV STALL           same two panels; the first pass is drawn in
+                                  units of its own steady ITL (the dimensionless
+                                  twin), and the right panel overlays stall
+                                  (solid) with its cause, the KV tail (dashed),
+                                  per group -- the pairs hugging each other is
+                                  the same finding as in buffer_sweep.
+    06  DECODE ALL-REDUCE         same panel: first (KV-gated) effective bw
+                                  (solid) vs steady mean (dashed), worst stage.
+    09  BOTTLENECK CONGESTION     buffer_sweep 09 restricted to the measured
+                                  bottleneck: delivered %, PAUSE frames
+                                  (symlog), peak queue. The full per-link view
+                                  cannot cross groups -- link labels are
+                                  topology-local.
+    10  BUFFER BLOAT              same two panels: peak & mean occupancy (log)
+                                  against the buffer itself | mean / peak.
+    11  KNEES                     buffer_sweep's three knee rules, cross-group
+                                  form: one row per group, a dot per knee; an
+                                  open marker at the right edge = never reached.
 
-    pp_skew_ms           pp_skew_ns / 1e6: cross-rank arrival misalignment on the
-                         receiving stage. A delta (idle ms), not a workload size,
-                         so directly comparable across models.
-    kv_tp_skew_mean_ms   mean per-(decode stage, layer) spread between the
-                         arrivals of the KV shards feeding the SAME TP group
-                         (buffer_sweep fig 08) -- the decode-side analog of
-                         pp_skew_ms. A congestion-caused delta, so raw ms.
-    dec_ar_first_skew_ms worst decode stage's entry skew into its FIRST TP
-                         all-reduce (buffer_sweep fig 10): how staggered the
-                         shards entered the one collective gated by that
-                         stage's own KV. Also a delta, so raw ms.
-    kv_tp_skew_p99_ms    the p99 of the same per-(stage, layer) shard-skew
-                         population whose mean is plotted above: the tail a
-                         layer's first all-reduce can actually inherit, which
-                         a mean smooths away. A delta, so raw ms.
-    decode_kv_stall_ms   buffer_sweep fig 11 (middle) as one number: the first
-                         decode pass's excess over the steady inter-token gap
-                         (tok2_latency - itl_steady) -- the wall-clock the
-                         pipeline actually spent stalled on KV. Waiting time,
-                         not compute, so raw ms.
-    dec_kv_lateness_ms   fig 11 (right) reduced to the worst stage: KV ready
-                         minus that stage's first-input arrival. >0 = the
-                         stage outruns its KV and stalls; <=0 = the transfer
-                         is fully masked. A signed fabric delta, so raw ms.
-    qpeak_mb             link0_qpeak_bytes / 2^20: peak occupancy at the
-                         bottleneck port, in MB. Absolute bytes -- deliberately
-                         NOT qpeak_pct, whose denominator is the swept buffer
-                         (dividing a queue by the buffer is circular on a buffer
-                         sweep).
-    pause_frames         link0_pause_frames: PFC PAUSE event count at the
-                         bottleneck link. Raw count -- also grows with run
-                         duration, so read alongside the KV window.
-    line_rate_pct        already a % (link0_eff_pct): KV delivered vs the
-                         bottleneck's nominal rate. Absolute bytes cancel.
+    02 / 07 / 08 are time-domain figures (cumulative KV arrival, occupancy(t),
+    per-switch queues(t)); they cannot be rebuilt from sweep scalars and are
+    NOT duplicated here -- they live in each group's own buffer_sweep output
+    (results/sweep_analysis/buffer/<workload>/<sweep>/, or by_oversub/os<N>/
+    for the oversubscription plane).
 
-Block B -- NORMALISED "does the fabric effect reach the user?" quantities. Here
-the raw ns WOULD carry compute scale (a 70B's TTFT and collectives dwarf a
-13B's), so these are made dimensionless -- self-normalised (divided by another
-quantity of the SAME run) or normalised to that model's OWN largest-buffer run:
+One figure set, two grouping dimensions: story_plots is defined once here and
+drawn by two callers -- this script, grouping by MODEL, and oversub2d_sweep,
+grouping by OVERSUBSCRIPTION LEVEL. What is worth comparing across a buffer
+sweep does not depend on which knob the second dimension is.
 
-    rs_ar_first_bw       the first (skew-gated) all-reduce's EFFECTIVE BANDWIDTH
-                         (comm_size / duration, GB/s), from the ASTRA CSV. The
-                         skew stall shows as the bandwidth collapsing -- the early
-                         rank waits idle at the barrier, so bytes-per-wall-time
-                         drops -- with the ungated wire rate as the ceiling. A
-                         rate, not a duration, so it is comparable across models
-                         without normalising. Preferred over the old
-                         ar_first_over_rest, whose "N x slower" framing was really
-                         the idle skew wait (the transfer itself runs at W).
-    ttft_slowdown        ttft_ns / ttft_ns at THIS model's largest buffer: how
-                         much the buffer moves TTFT, relative to the most-relaxed
-                         (largest-buffer) configuration. Flat ~1 across the sweep
-                         means the buffer -> skew -> all-reduce chain does NOT
-                         reach TTFT for that model.
-    dec_ar_first_over_rest
-                         worst decode stage's FIRST all-reduce duration in units
-                         of that same stage's steady-state mean (buffer_sweep
-                         fig 10): does the KV skew the decode pipeline inherits
-                         actually stretch its first collective? Self-normalised
-                         per stage, so dimensionless and comparable.
-    tok2_over_itl        the first decode pass in units of THIS model's steady
-                         inter-token gap (tok2_latency / itl_steady): does the
-                         KV stall reach the user-visible second token? Flat ~1
-                         means the transfer is fully hidden; the excess over 1
-                         is decode_kv_stall_ms made dimensionless, so models of
-                         different compute scale share the axis.
+Raw vs normalised (why TTFT and the first pass are ratios): fabric-domain
+magnitudes (a skew, a queue depth, a PAUSE count, an effective bandwidth) are
+plotted RAW -- they do not carry the model's compute scale. Compute-scaled
+durations (TTFT, the first decode pass) are normalised WITHIN each group:
+ttft_slowdown to the group's largest-buffer run, tok2_over_itl to the group's
+steady inter-token gap. Flat at 1 = the fabric effect does not reach the user.
 
-Kept in summary.csv but no longer plotted: ar_first_over_rest (rs_ar_first_ns /
-rs_ar_rest_mean_ns -- the same stall as a duration multiple, dominated by the
-idle skew wait rather than a slower transfer), skew_over_ar_rest (redundant now
-that pp_skew_ms is shown raw -- it was the same skew in collective-units) and
-kv_gate_over_ttft (decode-start timing, orthogonal to the buffer chain).
-
-Discovery
----------
-    <ROOT>/output/ns3/<workload>/<sweep>/<tag>/{fct,pfc,qlen}.txt
-
-Every sub-directory of output/ns3 that contains a `<sweep>` directory is a
-model; nothing is hard-coded. Run with --list to see what would be picked up
-without analysing anything.
-
-PP=1 models are first-class citizens: they have no PP wave, so pp_skew_ms (and
-the skew-gating story) is NaN and their line drops from that one figure only.
-The all-reduce bandwidths still report (buffer_sweep falls back to the single
-prefill stage -- ungated, so expected flat: the control), and every fabric-
-domain, KV and TTFT metric is measured exactly as for PP>1.
-
-Bottleneck consistency is checked WITHIN each model's sweep (as buffer_sweep
-does), never ACROSS models: different topologies number their switches
-differently, so one 'sw->peer' string cannot be required to match across
-models. --bottleneck is therefore not exposed here; pass it to
-buffer_sweep.py directly if one model's auto-detected bottleneck needs
-overriding.
+PP=1 models are first-class citizens: they have no PP wave, so pp_skew is NaN
+and their line drops from that panel only. Bottleneck consistency is checked
+WITHIN each model's sweep, never ACROSS models (switch numbering is
+topology-local); pass --bottleneck to buffer_sweep.py directly if one model's
+auto-detected bottleneck needs overriding.
 
 Usage
 -----
@@ -128,25 +82,397 @@ import argparse
 import fnmatch
 import sys
 from pathlib import Path
+from typing import Callable
 
+import numpy as np
 import pandas as pd
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+
 from utils import paths, roles
-from utils.plots import lines_by_group
+from utils.cli import Abort, need
+from utils.paths import fresh_dir
+from utils.plots import (BLUE, CORAL, GREEN, MS, MUTED, VIOLET,
+                         logx_pow2, save_fig)
 from utils.roles import Placement
 from buffer_sweep import analyse_sweep
-from utils.cli import Abort, need
 
 NAN = float("nan")
 
 
+# --------------------------------------------------------------------------- #
+# Shared machinery (used by this script and by oversub2d_sweep)
+# --------------------------------------------------------------------------- #
+def group_colours(groups) -> dict:
+    """One colour per group, stable across every figure of a run.
+
+    Numeric groups (oversubscription ratios) are an ORDERED axis: they get the
+    viridis ramp, dark->light with the value, like buffer_sweep's per-buffer
+    colouring. Categorical groups (workload names) have no order to encode:
+    they get the tab10 cycle."""
+    gs = list(groups)
+    if all(isinstance(g, (int, float, np.integer, np.floating)) for g in gs):
+        order = sorted(gs)
+        n = max(len(order) - 1, 1)
+        return {g: plt.get_cmap("viridis")(0.05 + 0.78 * i / n)
+                for i, g in enumerate(order)}
+    cmap = plt.get_cmap("tab10")
+    return {g: cmap(i % 10) for i, g in enumerate(gs)}
+
+
+def short_labels(names: list[str]) -> dict[str, str]:
+    """Legend labels with the longest common '_'-prefix and '_'-suffix removed:
+    with one sweep's workloads sharing 'llama2_13b_p-tp2pp2_..._stream_', only
+    the part that actually differs ('64reqs_512prompt') earns legend space."""
+    if len(names) < 2:
+        return {n: n for n in names}
+    parts = [n.split("_") for n in names]
+    limit = min(len(p) for p in parts) - 1          # keep at least one token
+    pre = 0
+    while pre < limit and len({p[pre] for p in parts}) == 1:
+        pre += 1
+    suf = 0
+    while suf < limit - pre and len({p[-1 - suf] for p in parts}) == 1:
+        suf += 1
+    return {n: ("_".join(p[pre:len(p) - suf]) or n)
+            for n, p in zip(names, parts)}
+
+
+def add_group_norms(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """The two dimensionless 'does it reach the user?' columns, normalised
+    WITHIN each group (each model / each os level is its own reference):
+
+        tok2_over_itl   first decode pass over this group's steady inter-token
+                        gap -- decode_kv_stall made dimensionless.
+        ttft_slowdown   TTFT over this group's largest-buffer TTFT.
+    """
+    df = df.copy()
+    df["tok2_over_itl"] = df["tok2_latency_ns"] / df["itl_steady_ns"]
+    df["ttft_slowdown"] = NAN
+    for _, idx in df.groupby(group_col).groups.items():
+        sub = df.loc[idx].dropna(subset=["ttft_ns"]).sort_values("buffer_mb")
+        ref = float(sub["ttft_ns"].iloc[-1]) if len(sub) else NAN
+        if pd.notna(ref) and ref > 0:
+            df.loc[idx, "ttft_slowdown"] = df.loc[idx, "ttft_ns"] / ref
+    return df
+
+
+# --------------------------------------------------------------------------- #
+# The shared figure set: buffer_sweep's figures, one line family per group
+# --------------------------------------------------------------------------- #
+def _ordered(df: pd.DataFrame, group_col: str) -> list:
+    return sorted(df[group_col].unique(), key=lambda g: (str(type(g)), g))
+
+
+def _lines(ax, df, group_col, groups, colours, label, col, scale=1.0,
+           ls="-", marker="o", labelled=True, alpha=1.0) -> bool:
+    """One line per group for `col`; returns False if nothing was drawn."""
+    if col not in df.columns or not df[col].notna().any():
+        return False
+    drawn = False
+    for g in groups:
+        sub = df[df[group_col] == g].dropna(subset=[col]).sort_values("buffer_mb")
+        if sub.empty:
+            continue
+        ax.plot(sub["buffer_mb"], sub[col] * scale, marker=marker, ms=4.5,
+                ls=ls, color=colours[g], alpha=alpha,
+                label=(label(g) if labelled else None))
+        drawn = True
+    return drawn
+
+
+def _fig01_causal_chain(df, group_col, groups, colours, label, outdir, written):
+    """buffer_sweep 01: the same stacked panels, one line per group. The TTFT
+    panel is x the group's largest-buffer run (see module docstring)."""
+    panels = [
+        ("PP arrival skew (ms)", [("pp_skew_ns", MS, "-", True)]),
+        ("Gated all-reduce\neff. bw (GB/s, n=1)", [("rs_ar_first_bw", 1.0, "-", False)]),
+        # solid = receiving stage steady, dashed = first prefill stage (ungated
+        # reference) -- same colour per group, a style legend disambiguates.
+        ("Steady all-reduce\neff. bw (GB/s)", [("rs_ar_rest_bw", 1.0, "-", False),
+                                               ("rs_ar_first_stage_bw", 1.0, "--", False)]),
+        ("TTFT\n(× largest buffer)", [("ttft_slowdown", 1.0, "-", False)]),
+    ]
+    panels = [(yl, sp) for yl, sp in panels
+              if any(c in df.columns and df[c].notna().any() for c, *_ in sp)]
+    if not panels:
+        return
+    n = len(panels)
+    fig, axes = plt.subplots(n, 1, sharex=True, figsize=(8.5, 2.0 * n + 1.0))
+    axes = np.atleast_1d(axes)
+    for ax, (ylabel, specs) in zip(axes, panels):
+        for col, scale, ls, labelled in specs:
+            _lines(ax, df, group_col, groups, colours, label, col, scale,
+                   ls=ls, labelled=labelled, alpha=0.55 if ls == "--" else 1.0)
+        if col == "ttft_slowdown":
+            ax.axhline(1.0, color="k", ls=":", lw=1.0, alpha=0.5)
+        logx_pow2(ax, df, "buffer_mb", "Per-switch buffer (MiB)")
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.grid(True, alpha=0.3, which="both")
+    for ax in axes[:-1]:
+        ax.set_xlabel("")
+    axes[0].legend(fontsize=7, ncol=2, loc="best")
+    if any(yl.startswith("Steady") for yl, _ in panels):
+        i = next(i for i, (yl, _) in enumerate(panels) if yl.startswith("Steady"))
+        axes[i].legend(handles=[
+            Line2D([], [], color="k", ls="-", label="receiving stage (steady)"),
+            Line2D([], [], color="k", ls="--", alpha=0.55, label="first prefill stage")],
+            fontsize=7, loc="best")
+    fig.suptitle("Does PP skew propagate into TTFT?", y=0.99)
+    save_fig(fig, outdir, "01_causal_chain_to_ttft.png", written)
+
+
+def _fig03_shard_skew(df, group_col, groups, colours, label, outdir, written):
+    """buffer_sweep 03's quantity (per-layer |shard 1 - shard 0| within one PP
+    stage) reduced to mean | p99 -- the layer populations are per-run material
+    the cross-group summary does not carry."""
+    cols = [("kv_tp_skew_mean_ns", "Per-layer shard skew, mean (ms)"),
+            ("kv_tp_skew_p99_ns", "Per-layer shard skew, p99 (ms)")]
+    cols = [(c, yl) for c, yl in cols if c in df.columns and df[c].notna().any()]
+    if not cols:
+        return
+    fig, axes = plt.subplots(1, len(cols), figsize=(5.8 * len(cols), 4.8),
+                             squeeze=False)
+    for ax, (col, ylabel) in zip(axes[0], cols):
+        _lines(ax, df, group_col, groups, colours, label, col, MS)
+        logx_pow2(ax, df, "buffer_mb", "Per-switch buffer (MiB)")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3, which="both")
+    axes[0][0].legend(fontsize=8)
+    fig.suptitle("KV skew between the TP shards of a PP stage", y=1.02)
+    save_fig(fig, outdir, "03_kv_tp_shard_skew.png", written)
+
+
+def _fig04_waterfall(df, group_col, groups, colours, label, outdir, written):
+    """buffer_sweep 04, one block per group: the TTFT -> token-2 interval as
+    three consecutive segments per buffer, PAUSE count beside each bar. Each
+    block keeps its own ms axis -- the absolute scale is the group's own."""
+    needed = ["ttft_ns", "dec_start_ns", "kv_gate_ns", "tok2_ns"]
+    if not all(c in df.columns for c in needed):
+        return
+    blocks = []
+    for g in groups:
+        sub = df[df[group_col] == g].dropna(subset=needed).sort_values("buffer_mb")
+        if len(sub):
+            blocks.append((g, sub))
+    if not blocks:
+        return
+    total_bars = sum(len(sub) for _, sub in blocks)
+    fig, axes = plt.subplots(len(blocks), 1,
+                             figsize=(12.5, 0.42 * total_bars + 1.1 * len(blocks) + 1.2),
+                             squeeze=False)
+    for ax, (g, sub) in zip(axes[:, 0], blocks):
+        end = 0.0
+        for i, r in enumerate(sub.itertuples()):
+            t0 = r.ttft_ns
+            ds = (r.dec_start_ns - t0) * MS
+            kg = (r.kv_gate_ns - t0) * MS
+            t2 = (r.tok2_ns - t0) * MS
+            end = max(end, t2)
+            ax.barh(i, ds, height=0.62, color=BLUE)
+            ax.barh(i, max(kg - ds, 0.0), left=ds, height=0.62, color=CORAL)
+            ax.barh(i, max(t2 - kg, 0.0), left=max(kg, ds), height=0.62, color=GREEN)
+            pf = getattr(r, "link0_pause_frames", NAN)
+            if pd.notna(pf):
+                ax.text(t2 * 1.012, i, f"{pf:,.0f} PAUSE", va="center",
+                        fontsize=8, color=MUTED)
+        ax.set_yticks(range(len(sub)))
+        ax.set_yticklabels([f"{b:g} MiB" for b in sub["buffer_mb"]], fontsize=8)
+        ax.invert_yaxis()
+        ax.set_xlim(0, end * 1.22)
+        ax.grid(True, axis="x", alpha=0.3)
+        ax.set_title(label(g), loc="left", fontsize=10)
+    axes[-1, 0].set_xlabel("ms after the first token")
+    axes[0, 0].legend(handles=[Patch(color=BLUE, label="handoff in flight"),
+                               Patch(color=CORAL, label="decode awake, KV still arriving"),
+                               Patch(color=GREEN, label="first pass completing")],
+                      fontsize=9, ncol=3, loc="lower center",
+                      bbox_to_anchor=(0.5, 1.25), frameon=False)
+    save_fig(fig, outdir, "04_first_token_to_second.png", written)
+
+
+def _fig05_decode_stall(df, group_col, groups, colours, label, outdir, written):
+    """buffer_sweep 05: LEFT the first pass in units of its own steady ITL (the
+    dimensionless twin of the raw-ms panel -- raw ns would compare model size);
+    RIGHT stall (solid) overlaid with its cause, the KV tail (dashed), per
+    group. The pairs hugging each other is buffer_sweep's 'the stall IS the
+    tail' finding, now visible per group."""
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5.2))
+    okL = _lines(axL, df, group_col, groups, colours, label, "tok2_over_itl")
+    axL.axhline(1.0, color="k", ls=":", lw=1.0, alpha=0.5)
+    axL.set_ylabel("First decode pass (× steady ITL)")
+    axL.set_title("First decode pass vs steady state", fontsize=11)
+
+    okR = _lines(axR, df, group_col, groups, colours, label,
+                 "decode_kv_stall_ns", MS, ls="-", labelled=False)
+    _lines(axR, df, group_col, groups, colours, label,
+           "kv_tail_after_dec_start_ns", MS, ls="--", marker="s",
+           labelled=False, alpha=0.6)
+    axR.axhline(0.0, color="k", ls=":", lw=1.0, alpha=0.5)
+    axR.set_ylabel("ms")
+    axR.set_title("Stall (solid) and its cause, the KV tail (dashed)",
+                  fontsize=11)
+    axR.legend(handles=[Line2D([], [], color="k", ls="-", label="first-pass stall"),
+                        Line2D([], [], color="k", ls="--", alpha=0.6,
+                               label="KV tail past decode start")], fontsize=8)
+    if not (okL or okR):
+        plt.close(fig)
+        return
+    for a in (axL, axR):
+        logx_pow2(a, df, "buffer_mb", "Per-switch buffer (MiB)")
+        a.grid(True, alpha=0.3, which="both")
+    axL.legend(fontsize=8)
+    fig.suptitle("How much the decode is stalled by its KV transfer", y=1.02)
+    save_fig(fig, outdir, "05_decode_kv_stall.png", written)
+
+
+def _fig06_decode_ar(df, group_col, groups, colours, label, outdir, written):
+    """buffer_sweep 06: first (KV-gated) effective bw solid vs steady mean
+    dashed, per group -- decode_worst_stage's reduction (worst stage)."""
+    fig, ax = plt.subplots(figsize=(9, 5.2))
+    ok = _lines(ax, df, group_col, groups, colours, label, "dec_ar_first_bw")
+    _lines(ax, df, group_col, groups, colours, label, "dec_ar_rest_bw",
+           ls="--", marker="v", labelled=False, alpha=0.55)
+    if not ok:
+        plt.close(fig)
+        return
+    logx_pow2(ax, df, "buffer_mb", "Per-switch buffer (MiB)")
+    ax.set_ylabel("Effective bandwidth (GB/s)")
+    ax.set_title("Decode first TP all-reduce (solid) vs steady state (dashed), "
+                 "worst stage", fontsize=11)
+    ax.grid(True, alpha=0.3, which="both")
+    ax.legend(fontsize=8)
+    save_fig(fig, outdir, "06_decode_allreduce.png", written)
+
+
+def _fig09_congestion(df, group_col, groups, colours, label, outdir, written):
+    """buffer_sweep 09 restricted to the measured bottleneck (link0): delivered
+    efficiency, PAUSE frames (symlog), peak queue. The full per-link view stays
+    per group -- link labels are topology-local and cannot cross groups."""
+    panels = [("link0_eff_pct", 1.0, "KV bandwidth (% of nominal)", None),
+              ("link0_pause_frames", 1.0, "PAUSE frames (symlog)", "symlog"),
+              ("link0_qpeak_bytes", 1 / 2**20, "Peak occupancy (MiB)", None)]
+    panels = [p for p in panels if p[0] in df.columns and df[p[0]].notna().any()]
+    if not panels:
+        return
+    fig, axes = plt.subplots(1, len(panels), figsize=(5.8 * len(panels), 4.8),
+                             squeeze=False)
+    for ax, (col, scale, ylabel, yscale) in zip(axes[0], panels):
+        _lines(ax, df, group_col, groups, colours, label, col, scale)
+        if yscale == "symlog":
+            ax.set_yscale("symlog", linthresh=1)
+        logx_pow2(ax, df, "buffer_mb", "Per-switch buffer (MiB)")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3, which="both")
+    axes[0][0].legend(fontsize=8)
+    fig.suptitle("Congestion at the measured bottleneck", y=1.02)
+    save_fig(fig, outdir, "09_bottleneck_congestion.png", written)
+
+
+def _fig10_bloat(df, group_col, groups, colours, label, outdir, written):
+    """buffer_sweep 10: peak (solid) & mean (dashed) occupancy on a log axis
+    against the buffer itself, and the mean/peak ratio."""
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
+    ok = _lines(axL, df, group_col, groups, colours, label,
+                "link0_qpeak_bytes", 1 / 2**20)
+    _lines(axL, df, group_col, groups, colours, label,
+           "link0_qmean_bytes", 1 / 2**20, ls="--", marker="v",
+           labelled=False, alpha=0.55)
+    if not ok:
+        plt.close(fig)
+        return
+    bufs = sorted(df["buffer_mb"].unique())
+    axL.plot(bufs, bufs, ":", color=MUTED, lw=1.0, label="the buffer itself")
+    axL.set_yscale("log")
+    axL.set_ylabel("Occupancy at the bottleneck (MiB, log)")
+    axL.set_title("Peak (solid) and mean (dashed) occupancy", fontsize=11)
+    axL.legend(fontsize=8)
+
+    _lines(axR, df, group_col, groups, colours, label, "q_bloat_ratio",
+           labelled=False)
+    axR.set_ylabel("mean ÷ peak occupancy")
+    axR.set_title("Sustained load, or rare excursions?", fontsize=11)
+    for a in (axL, axR):
+        logx_pow2(a, df, "buffer_mb", "Per-switch buffer (MiB)")
+        a.grid(True, alpha=0.3, which="both")
+    fig.suptitle("Buffer bloat at the bottleneck", y=1.02)
+    save_fig(fig, outdir, "10_buffer_bloat.png", written)
+
+
+# buffer_sweep's knee rules, cross-group form. Same colours as its KNEE_STYLE.
+KNEE_COLS = [
+    ("knee_pfc_mb", CORAL, "o", "PFC knee (backpressure gone)"),
+    ("knee_stall_mb", VIOLET, "s", "stall onset (first pass > steady)"),
+    ("knee_saturation_mb", MUTED, "D", "saturation (nothing changes)"),
+]
+
+
+def _fig11_knees(df, group_col, groups, colours, label, outdir, written):
+    """The three regime changes buffer_sweep draws as vertical rules, one row
+    per group, one dot per knee; an OPEN marker parked at the right edge is a
+    knee the sweep never reached -- absence drawn, not omitted."""
+    if not any(c in df.columns and df[c].notna().any() for c, *_ in KNEE_COLS):
+        return
+    bufs = sorted(df["buffer_mb"].unique())
+    edge = bufs[-1] * 2                              # the "never reached" slot
+    fig, ax = plt.subplots(figsize=(9, 0.85 * len(groups) + 2.2))
+    for yi, g in enumerate(groups):
+        row = df[df[group_col] == g].iloc[0]
+        ax.axhline(yi, color=colours[g], lw=0.8, alpha=0.25, zorder=0)
+        for k, (col, c, m, _lab) in enumerate(KNEE_COLS):
+            v = row.get(col, NAN)
+            dy = (k - 1) * 0.18                      # coinciding knees stay visible
+            if pd.notna(v):
+                ax.plot(v, yi + dy, m, color=c, ms=10, zorder=3)
+            else:
+                ax.plot(edge, yi + dy, m, mfc="none", mec=c, mew=1.8, ms=10,
+                        zorder=3)
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(bufs + [edge])
+    ax.set_xticklabels([f"{b:g}" for b in bufs] + ["never"])
+    ax.set_xlabel("Per-switch buffer (MiB)")
+    ax.set_yticks(range(len(groups)))
+    ax.set_yticklabels([label(g) for g in groups])
+    ax.set_ylim(-0.6, len(groups) - 0.4)
+    ax.invert_yaxis()
+    ax.grid(True, axis="x", alpha=0.3, which="major")
+    ax.set_title("Where each regime change sits (open = never reached)",
+                 fontsize=11)
+    ax.legend(handles=[Line2D([], [], marker=m, color=c, ls="none", ms=9,
+                              label=lab) for _col, c, m, lab in KNEE_COLS],
+              fontsize=8, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+    save_fig(fig, outdir, "11_knees.png", written)
+
+
+def story_plots(df: pd.DataFrame, group_col: str, outdir: Path,
+                label: Callable = str) -> list[Path]:
+    """buffer_sweep's figure set with one line family per value of `group_col`.
+    Figure numbers match buffer_sweep's; 02/07/08 (time-domain) are per-group
+    material and deliberately absent -- see the module docstring."""
+    written: list[Path] = []
+    groups = _ordered(df, group_col)
+    colours = group_colours(groups)
+    for fn in (_fig01_causal_chain, _fig03_shard_skew, _fig04_waterfall,
+               _fig05_decode_stall, _fig06_decode_ar, _fig09_congestion,
+               _fig10_bloat, _fig11_knees):
+        fn(df, group_col, groups, colours, label, outdir, written)
+    return written
+
+
+# --------------------------------------------------------------------------- #
+# Cross-model scoring
+# --------------------------------------------------------------------------- #
 def load_workload(root: Path, workload: str, sweep: str,
                   placement: Placement, top_links: int) -> pd.DataFrame:
-    """One row per (workload, buffer) run -- mirrors buffer_sweep.main's call
-    to analyse_sweep so a model is scored identically whether analysed alone or
-    here, then adds only the comparable/normalised columns (see module docstring
-    for why the absolute-ns columns already in `s` are not plotted across
-    models)."""
+    """One row per (workload, buffer) run -- mirrors buffer_sweep.main's call to
+    analyse_sweep so a model is scored identically whether analysed alone or
+    here, then adds only unit conversions for summary.csv readability. The
+    normalised columns (ttft_slowdown, tok2_over_itl) are added over the
+    COMBINED frame by add_group_norms, one definition for both compare tools."""
     p = paths.SweepPaths(sweep=sweep, workload=workload, root=root)
     need(not p.missing_roots(),
          f"{workload}: derived root(s) do not exist:\n    "
@@ -155,54 +481,21 @@ def load_workload(root: Path, workload: str, sweep: str,
     # per-tag queue timelines are never built -- the big saving on qlen.txt reads.
     _, s, _ = analyse_sweep(p, placement, top_links=top_links,
                             bn_force=None, verbose=False, want_series=False)
-
     s = s.copy()
-    # --- Block A: fabric-domain quantities, comparable in ABSOLUTE units ------
-    # These live in the network domain (a delay, a byte count, an event count, a
-    # %), not the compute domain, so they do NOT carry the model's parameter/
-    # token scale the way ttft_ns or a tensor collective does -- their raw value
-    # is already the physical number to compare across runs. No normalisation.
-    s["pp_skew_ms"] = s["pp_skew_ns"] / 1e6          # arrival misalignment (delta)
-    s["line_rate_pct"] = s.get("link0_eff_pct")      # already a %
-    s["pause_frames"] = s.get("link0_pause_frames")  # raw PFC PAUSE event count
-    # normalise the count by the KV window: a raw count also grows with run
-    # duration, so frames/ms is the count made comparable across runs.
-    win = s.get("link0_window_ns")
-    s["pause_rate"] = (s["pause_frames"] / (win / 1e6)
-                       if win is not None else NAN)  # PAUSE frames per ms of window
-    qb = s.get("link0_qpeak_bytes")                  # absolute peak occupancy, MB
-    qm = s.get("link0_qmean_bytes")                  # -- NOT qpeak_pct: dividing by
-    s["qpeak_mb"] = qb / 2**20 if qb is not None else NAN   # the swept buffer is
-    s["qmean_mb"] = qm / 2**20 if qm is not None else NAN   # circular on a buffer
-    # decode-side skews (buffer_sweep figs 08/10): congestion-caused deltas like
-    # pp_skew_ms, so raw ms. The per-stage decN_* columns are stage-numbered per
-    # model (different PP splits); analyse_sweep already reduced them to the
-    # WORST stage (buffer_sweep.decode_worst_stage) -- only units change here.
+    s["pp_skew_ms"] = s["pp_skew_ns"] / 1e6
     s["kv_tp_skew_mean_ms"] = s["kv_tp_skew_mean_ns"] / 1e6
     s["kv_tp_skew_p99_ms"] = s["kv_tp_skew_p99_ns"] / 1e6
-    s["dec_ar_first_skew_ms"] = s["dec_ar_first_skew_ns"] / 1e6
-    # decode-stall family (buffer_sweep fig 11, reduced by decode_worst_stage):
-    # waiting-time deltas, so raw ms like the skews above.
     s["decode_kv_stall_ms"] = s["decode_kv_stall_ns"] / 1e6
     s["dec_kv_lateness_ms"] = s["dec_kv_lateness_ns"] / 1e6
-    # kept in the CSV for continuity, no longer plotted:                  # sweep.
-    s["pause_pct_of_window"] = s.get("link0_pause_pct_of_window")
-    s["qpeak_pct"] = s.get("link0_qpeak_pct")
-    s["skew_over_ar_rest"] = s["pp_skew_ns"] / s["rs_ar_rest_mean_ns"]
-    # --- Block B: normalised "does it propagate to TTFT?" quantities ----------
-    # ar_first_over_rest is self-normalised (first gated all-reduce in units of
-    # this model's own steady-state collective); ttft_slowdown is normalised to
-    # this model's largest-buffer run. These answer the payoff question, not the
-    # fabric magnitude one, so they stay dimensionless.
-    s["ar_first_over_rest"] = s["rs_ar_first_ns"] / s["rs_ar_rest_mean_ns"]
-    # first decode pass in units of this model's own steady inter-token gap:
-    # the dimensionless twin of decode_kv_stall_ms (see module docstring).
-    s["tok2_over_itl"] = s["tok2_latency_ns"] / s["itl_steady_ns"]
-    # normalised to THIS model's largest-buffer (most relaxed) run.
-    tt = s.dropna(subset=["ttft_ns"]).sort_values("buffer_mb")
-    ref = float(tt["ttft_ns"].iloc[-1]) if len(tt) else NAN
-    s["ttft_slowdown"] = (s["ttft_ns"] / ref
-                          if pd.notna(ref) and ref > 0 else NAN)
+    s["kv_tail_ms"] = s["kv_tail_after_dec_start_ns"] / 1e6
+    s["pause_frames"] = s.get("link0_pause_frames")
+    win = s.get("link0_window_ns")
+    s["pause_rate"] = (s["pause_frames"] / (win / 1e6)      # frames per ms of
+                       if win is not None else NAN)         # the KV window
+    s["line_rate_pct"] = s.get("link0_eff_pct")
+    qb, qm = s.get("link0_qpeak_bytes"), s.get("link0_qmean_bytes")
+    s["qpeak_mb"] = qb / 2**20 if qb is not None else NAN
+    s["qmean_mb"] = qm / 2**20 if qm is not None else NAN
     s.insert(0, "workload", workload)
     return s
 
@@ -222,10 +515,10 @@ def main(argv: list[str] | None = None) -> int:
     workloads = paths.discover_workloads(root, a.sweep, "ns3")
     if a.workloads:
         workloads = [w for w in workloads
-                    if any(fnmatch.fnmatch(w, pat) for pat in a.workloads)]
+                     if any(fnmatch.fnmatch(w, pat) for pat in a.workloads)]
     if a.exclude:
         workloads = [w for w in workloads
-                    if not any(fnmatch.fnmatch(w, pat) for pat in a.exclude)]
+                     if not any(fnmatch.fnmatch(w, pat) for pat in a.exclude)]
 
     print(f"sweep    {a.sweep}")
     print(f"root     {root}")
@@ -257,103 +550,24 @@ def main(argv: list[str] | None = None) -> int:
                   f"skew@min_buf="
                   f"{f'{sk:.2f}ms' if pd.notna(sk) else 'n/a (PP=1)'}")
 
-        combined = pd.concat(frames, ignore_index=True)
+        combined = add_group_norms(pd.concat(frames, ignore_index=True),
+                                   "workload")
         front = ["workload", "tag", "bottleneck", "buffer_mb",
+                 "knee_pfc_mb", "knee_stall_mb", "knee_saturation_mb",
                  "pp_skew_ms", "kv_tp_skew_mean_ms", "kv_tp_skew_p99_ms",
-                 "dec_ar_first_skew_ms", "decode_kv_stall_ms",
-                 "dec_kv_lateness_ms",
-                 "qpeak_mb", "qmean_mb", "pause_rate", "pause_frames",
-                 "line_rate_pct", "rs_ar_first_bw", "rs_ar_rest_bw",
-                 "rs_ar_first_stage_bw", "ttft_slowdown", "dec_ar_first_over_rest",
-                 "tok2_over_itl", "ar_first_over_rest",
-                 "pause_pct_of_window", "qpeak_pct", "skew_over_ar_rest",
-                 "kv_gate_over_ttft"]
+                 "decode_kv_stall_ms", "kv_tail_ms", "dec_kv_lateness_ms",
+                 "qpeak_mb", "qmean_mb", "q_bloat_ratio",
+                 "pause_frames", "pause_rate", "line_rate_pct",
+                 "rs_ar_first_bw", "rs_ar_rest_bw", "dec_ar_first_bw",
+                 "ttft_slowdown", "tok2_over_itl", "kv_shard_bias_ns"]
         combined = combined[[c for c in front if c in combined.columns]
                             + [c for c in combined.columns if c not in front]]
-        outdir.mkdir(parents=True, exist_ok=True)
-        combined.to_csv(outdir / "summary.csv", index=False)
+        fresh_dir(outdir)                 # stale figures from a previous figure
+        combined.to_csv(outdir / "summary.csv", index=False)   # set never linger
 
-        written: list[Path] = []
-
-        def line_by_workload(ycol: str, ylabel: str, title: str, fname: str,
-                             hline: float | None = None) -> None:
-            # one line per model, x = buffer, log-2 axis (utils.plots.lines_by_group)
-            lines_by_group(combined, "workload", "buffer_mb", ycol,
-                           "Per-switch buffer (MiB)", ylabel, title, fname,
-                           outdir, written, hline=hline, logx2=True)
-
-        # === Block A: fabric-domain magnitudes, absolute & comparable ========
-        line_by_workload(
-            "pp_skew_ms", "PP arrival skew (ms)",
-            "PP arrival skew",
-            "pp_skew_ms_by_workload.png")
-
-        line_by_workload(
-            "kv_tp_skew_mean_ms", "KV TP-group skew, mean (ms)",
-            "KV shard arrival skew within decode TP groups",
-            "kv_tp_skew_by_workload.png")
-
-        line_by_workload(
-            "dec_ar_first_skew_ms", "Decode first all-reduce entry skew (ms)",
-            "KV skew inherited by the decode pipeline (worst stage)",
-            "decode_ar_first_skew_by_workload.png")
-
-        line_by_workload(
-            "kv_tp_skew_p99_ms", "KV TP-group skew, p99 (ms)",
-            "KV shard arrival skew within decode TP groups — the tail",
-            "kv_tp_skew_p99_by_workload.png")
-
-        line_by_workload(
-            "decode_kv_stall_ms", "First-pass KV stall (ms)",
-            "Decode first pass: excess over the steady inter-token gap",
-            "decode_kv_stall_by_workload.png", hline=0.0)
-
-        line_by_workload(
-            "dec_kv_lateness_ms", "KV ready − first input (ms)",
-            "KV lateness at the decode stages' first input (worst stage)",
-            "dec_kv_lateness_by_workload.png", hline=0.0)
-
-        line_by_workload(
-            "qpeak_mb", "Peak queue occupancy (MB)",
-            "Bottleneck buffer occupancy",
-            "qpeak_occupancy_mb_by_workload.png")
-
-        line_by_workload(
-            "pause_rate", "PFC PAUSE (frames/ms)",
-            "Backpressure intensity",
-            "pause_rate_by_workload.png")
-
-        line_by_workload(
-            "line_rate_pct", "KV bandwidth (% of line-rate)",
-            "KV bandwidth utilisation",
-            "line_rate_efficiency_by_workload.png")
-
-        # === Block B: does the fabric effect propagate to the user? ==========
-        # First (skew-gated) all-reduce as EFFECTIVE BANDWIDTH (bytes/duration),
-        # like buffer_sweep fig 01: the stall shows as the bandwidth COLLAPSING
-        # (the early rank sits idle at the barrier, so bytes/wall-time drops),
-        # bounded above by the ungated wire rate. Honest about what happens --
-        # the transfer is not slower, it waits -- and comparable across models
-        # because it is a rate, not a compute-scaled duration.
-        line_by_workload(
-            "rs_ar_first_bw", "First all-reduce eff. bw (GB/s)",
-            "Skew stall on the first all-reduce (effective bandwidth collapses)",
-            "allreduce_first_bandwidth_by_workload.png")
-
-        line_by_workload(
-            "ttft_slowdown", "TTFT (×largest-buffer)",
-            "TTFT sensitivity to buffer",
-            "ttft_slowdown_by_workload.png", hline=1.0)
-
-        line_by_workload(
-            "dec_ar_first_over_rest", "Decode first all-reduce (×steady-state)",
-            "Does the inherited KV skew stretch the decode first all-reduce?",
-            "decode_ar_first_over_rest_by_workload.png", hline=1.0)
-
-        line_by_workload(
-            "tok2_over_itl", "First decode pass (×steady ITL)",
-            "Does the KV stall reach the second token?",
-            "tok2_over_itl_by_workload.png", hline=1.0)
+        labels = short_labels(list(combined["workload"].unique()))
+        written = story_plots(combined, "workload", outdir,
+                              label=lambda g: labels.get(g, str(g)))
 
         print(f"\nWrote {outdir}:")
         print("  summary.csv")

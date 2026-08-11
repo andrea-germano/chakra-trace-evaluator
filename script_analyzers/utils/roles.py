@@ -35,8 +35,23 @@ Flow classes, derived from the placement and the hop count alone:
     tp           1 hop: a host-to-host link. TP collectives; never crosses a
                  switch, so never congested.
     kv           prefill rank -> decode rank. The transfer the thesis is about.
-    pp_prefill   prefill stage i -> prefill stage j. Activations.
-    pp_decode    decode stage i -> decode stage j. Activations, once per step.
+    pp_prefill   prefill stage i -> prefill stage j, i != j. Activations.
+    pp_decode    decode stage i -> decode stage j, i != j. Activations, once per step.
+    intra_prefill  two prefill ranks of the SAME stage, more than 1 hop apart.
+                 Structurally this is the traffic that stays inside one pipeline
+                 stage: the TP collective whenever the scale-up domain is a
+                 SWITCH rather than a cable (T2.1 and later put an NVSwitch
+                 between the pair, so a TP all-reduce is 2 hops and no longer
+                 lands in 'tp'), plus -- on a MoE model -- the expert
+                 dispatch/combine of the all-to-all. The two cannot be told apart
+                 from (src, dst) alone whenever the expert group coincides with
+                 the TP group, which is exactly the EP = TP case, so they are not
+                 claimed to be: the class says WHERE the traffic goes, and the
+                 ASTRA side (op_class 'TP' vs 'A2A', see utils.astra) is what
+                 says what it IS. On a wide-EP deployment the cross-domain part
+                 of this class is the dispatch, and it is the bulk of the fabric
+                 traffic rather than a corner case.
+    intra_decode the same, inside the decode pool.
     other        anything else; if this is not ~0 the placement is wrong.
     ctrl         suffix on any fabric class: the flow fits in ONE packet, so it
                  carries a notification, not a payload. 'kv_ctrl' on T1 is
@@ -61,7 +76,8 @@ T1 = "p0=0,1 p1=2,3 d0=4,5 d1=6,7"
 _TOK = re.compile(r"^([pd])(\d+)=([\d,]+)$")
 
 FLOW_CLASSES = ("tp", "kv", "kv_ctrl", "pp_prefill", "pp_prefill_ctrl",
-                "pp_decode", "pp_decode_ctrl", "other")
+                "pp_decode", "pp_decode_ctrl", "intra_prefill", "intra_prefill_ctrl",
+                "intra_decode", "intra_decode_ctrl", "other")
 
 
 @dataclass(frozen=True)
@@ -137,9 +153,12 @@ def classify(flows: pd.DataFrame, placement: Placement, mtu: int) -> pd.Series:
         elif a[0] == "prefill" and b[0] == "decode":
             out.append("kv" + suffix)
         elif a[0] == b[0] == "prefill":
-            out.append("pp_prefill" + suffix)
+            # same pool: across stages it is a pipeline activation, within one
+            # stage it stays inside the parallelism group (TP collective over a
+            # switched scale-up domain, and/or a MoE all-to-all)
+            out.append(("pp_prefill" if a[1] != b[1] else "intra_prefill") + suffix)
         elif a[0] == b[0] == "decode":
-            out.append("pp_decode" + suffix)
+            out.append(("pp_decode" if a[1] != b[1] else "intra_decode") + suffix)
         else:
             out.append("other")          # decode -> prefill: should not exist
     return pd.Series(out, index=flows.index, dtype="string")

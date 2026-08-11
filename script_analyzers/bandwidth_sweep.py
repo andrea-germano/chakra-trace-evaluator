@@ -190,6 +190,31 @@ def summarise_run(df: pd.DataFrame) -> dict:
     pp_dec_mask = pp_mask & (df["phase"] == "decode")
 
     out["comp_completion_ns"] = last_end(comp_mask)
+
+    def union_of(mask) -> float:
+        """Wall-clock time during which SOME rank is inside one of these ops."""
+        return (intervals.union_len(zip(df.loc[mask, "start_tick"],
+                                        df.loc[mask, "end_tick"]))
+                if mask.any() else np.nan)
+
+    out["comp_union_ns"] = union_of(comp_mask)
+    # The same union widened to everything that does NOT ride the swept inter-node
+    # links: compute, the TP all-reduce (which runs on the intra-node pair link,
+    # fixed at 4800 Gbps in every topology of the sweep) and the decode feedback.
+    # Every gap left in THIS union is a wait on a link the sweep actually moves,
+    # so the union is the makespan the run would have with that fabric free --
+    # the floor beta should be measured against.
+    #
+    # comp_union_ns alone is the wrong floor and wrong in a way that matters: it
+    # counts the TP stalls as fabric cost. At the top of the sweep those stalls
+    # are 89% of all remaining idle, spread over ~720 sub-2 ms gaps, and blaming
+    # them on the KV transfer says it is half-exposed when it is ~94% hidden.
+    #
+    # Both come out bit-identical across a 16x bandwidth sweep. That invariance
+    # is the check on the partition itself: a class on this side that actually
+    # rode the swept links would make the union move with bandwidth.
+    out["nonfabric_union_ns"] = union_of(
+        df["op_class"].isin(("COMP", "TP", "DECFB")))
     out["kv_completion_ns"] = last_end(kv_mask)
     out["pp_completion_ns"] = last_end(pp_mask)
     out["prefill_comp_completion_ns"] = last_end(comp_mask & (df["phase"] == "prefill"))
@@ -206,6 +231,13 @@ def summarise_run(df: pd.DataFrame) -> dict:
     # ---- KV-cache transfer ------------------------------------------------- #
     kv = astra.sends(df, kv_mask)
     out["kv_count"] = len(kv)                          # transfers, not CSV rows
+    # Distinct sending ranks, not transfers: each rank has ONE uplink, so this is
+    # how many links the KV can occupy at once and therefore the aggregate rate
+    # the transfer can reach (kv_senders x line rate). roofline_compare.py needs
+    # it to turn a per-link bandwidth into an ideal transfer time; kv_count would
+    # be wrong there, since streaming splits the same bytes over many more flows
+    # without adding a link.
+    out["kv_senders"] = int(kv["sys_id"].nunique()) if len(kv) else 0
     # _win_bw's aggregate rate (bytes / global window) is deliberately NOT stored:
     # it sums bytes across every KV flow on every parallel link into one number, so
     # with K concurrent transfers it reads ~K x a single link's rate and looks like

@@ -17,13 +17,18 @@ utils — shared machinery for the MLSynth sweep analyzers.
     intervals  interval-set algebra (union / overlap / subtract / concurrency),
              pure geometry over (start, end) pairs; used by astra and the analyzers.
     measures the per-run measures more than one analyzer reports: TTFT, the KV
-             barrier and skews, the decode-side stall/all-reduce stats, and the
-             per-link score (LinkStat / link_metrics / pause_stats). Measurement
-             only; what a number MEANS stays in the analyzers.
+             barrier and skews (including the per-(stage, layer) shard
+             population), the decode-side stall/all-reduce stats and their
+             worst-stage reduction, and the per-link score (LinkStat /
+             link_metrics / pause_stats). Plus knee_scalars, the one SWEEP-wide
+             reading -- "where does the buffer stop mattering" -- parametrised
+             by the columns each sweep declares. Measurement only; what a number
+             MEANS stays in the analyzers.
     plots    the plotting mechanics (not the plots): series, log-2 axes, save,
-             the max-per-bucket queue-series downsampler, the shared palette,
-             zoom_y, the lossy-run overlay and the one-line-per-group figure
-             both cross-model companions draw.
+             the max-per-bucket queue-series downsampler, the shared palette and
+             swept-axis colour ramp, zoom_y, the knee rules, the lossy-run
+             overlay and the one-line-per-group figure both cross-model
+             companions draw.
 
 The analyzers on top answer different questions and stay separate:
 
@@ -34,6 +39,12 @@ The analyzers on top answer different questions and stay separate:
                          An ns-3 question: at steady state the link drains at line
                          rate whatever the buffer is, so the CSVs say nothing
                          happens. What moves is the congestion REGIME.
+    incast_sweep.py      the same fabric with the KV fan-in as the second axis:
+                         buffer_sweep's readings applied per topology (its knees,
+                         waterfall, distributions, bloat and per-link spread),
+                         plus the two the buffer sweep cannot ask -- how the
+                         handover scales with the incast DEGREE, and what the KV
+                         flow-completion tail looks like.
     ns3_analyzer.py      one run, in the time domain. The sweeps collapse each run
                          to scalars; every question that makes a sweep hard to
                          read ("does the queue peak WHILE PFC pauses?") is a

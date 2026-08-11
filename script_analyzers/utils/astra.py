@@ -18,8 +18,19 @@ Verified against a real stats_sys0.csv. The layout is::
 
     pl   pool: p = prefill, d = decode          L    layer
     ss   source stage      ds   dest stage      it   iteration
-    sh   shard             ssh  source shard    op   attn | ffw
-                           dsh  dest shard
+    sh   shard             ssh  source shard    op   attn | ffw | gate | comb
+                           dsh  dest shard      dp   dp slice (MoE only)
+
+MoE runs add one class, ``A2A`` -- the expert dispatch/combine edges::
+
+    A2A_pl=p_ss=0_se=0_de=1_L=0_op=disp_it=0   COMM   point-to-point, EP mesh
+
+``se``/``de`` are the SOURCE and DEST ranks *inside the expert-parallel group* of
+one pipeline stage (ep_rank = dp * tp_size + sh, the layout MLSynth's
+``_ep_context`` builds), and ``op`` is ``disp`` (dispatch) or ``comb`` (combine).
+Like every other point-to-point edge, a dispatch appears twice -- once per side,
+same name -- so it needs the same send/recv tagging as KV and PP; see
+``tag_comm_role``.
 
 Counting a transfer exactly once
 --------------------------------------------------------------------------------
@@ -34,8 +45,9 @@ Two independent ways the naive count goes wrong, both confirmed on real data:
 
    The direction is NOT in the ``type`` column. It is recovered from the name plus
    the role of the sys that owns the row (``sys_roles`` -> ``tag_comm_role``):
-   KV and FIRSTTOK flow prefill -> decode, KVREQ flows decode -> prefill, and for
-   PP/DECFB the sender is the rank whose own stage equals the name's ``ss``.
+   KV and FIRSTTOK flow prefill -> decode, KVREQ flows decode -> prefill, for
+   PP/DECFB the sender is the rank whose own stage equals the name's ``ss``, and
+   for A2A the sender is the rank whose own EP rank equals the name's ``se``.
 
 2. **Collectives appear once per rank.** A TP all-reduce is one logical operation
    spread over the tp participating ranks: one row per rank, identical apart from
@@ -71,8 +83,9 @@ NUMERIC_COLS = ["comm_size", "start_tick", "end_tick", "duration", "bw_bytes_per
                 "operation_intensity", "compute_utilization", "memory_utilization",
                 "is_memory_bound"]
 
-# Fields of the MLSynth naming scheme, in canonical order.
-FIELD_KEYS = ("pl", "ss", "ds", "sh", "ssh", "dsh", "L", "it", "op")
+# Fields of the MLSynth naming scheme, in canonical order. dp/se/de only appear
+# on MoE runs (dp is omitted whenever dp_size == 1, so dense names are unchanged).
+FIELD_KEYS = ("pl", "ss", "ds", "sh", "dp", "ssh", "dsh", "se", "de", "L", "it", "op")
 
 # TP is the only collective; every other op class is point-to-point (one flow
 # between two ranks). Only the collective set is needed downstream.
@@ -105,7 +118,7 @@ def classify_op(name: str) -> tuple[str, str]:
     rather than the pool of whichever rank owns the row."""
     f = parse_name(name)
     cls = f["cls"]
-    op = cls if cls in {"COMP", "TP", "KV", "KVREQ", "PP", "FIRSTTOK", "DECFB"} else "OTHER"
+    op = cls if cls in {"COMP", "TP", "KV", "KVREQ", "PP", "FIRSTTOK", "DECFB", "A2A"} else "OTHER"
     if op == "KV":
         return op, "kv_transfer"
     if op == "KVREQ":
@@ -136,23 +149,43 @@ def pool_of_role(role) -> str | None:
 
 
 def sys_roles(df: pd.DataFrame) -> dict[int, dict]:
-    """sys_id -> {'role': 'prefill'|'decode'|None, 'ss': stage, 'sh': shard}.
+    """sys_id -> {'role': 'prefill'|'decode'|None, 'ss': stage, 'sh': shard,
+    'dp': slice, 'ep': ep_rank}.
 
     Derived from each rank's own COMP rows: they are the only ones carrying pl=
     for every rank, and under disaggregation a rank computes in exactly one pool.
-    No external file needed."""
+    No external file needed.
+
+    ``ep`` is the rank's position in the expert-parallel group of its pipeline
+    stage, which MLSynth lays out as ``dp * tp_size + sh`` (see
+    DisaggregatedInference._ep_context). tp_size is read back off the data --
+    the number of distinct shards the pool uses -- rather than configured, so it
+    stays right when prefill and decode run at different TP degrees. It is None
+    on dense runs, which have no A2A rows to orient."""
     roles: dict[int, dict] = {}
     comp = df[df["is_compute"]] if "is_compute" in df.columns else df[df["type"] == "GPU"]
+    tp_of_pool = {pl: grp["sh"].dropna().nunique() for pl, grp in comp.groupby("pl")}
     for sid, grp in comp.groupby("sys_id"):
         pls = set(grp["pl"].dropna())
         if len(pls) > 1:
             print(f"  ! sys {sid} computes in more than one pool ({sorted(pls)}): "
                   f"its send/recv tagging is unreliable", file=sys.stderr)
         pl = next(iter(pls)) if len(pls) == 1 else None
-        ss, sh = grp["ss"].dropna(), grp["sh"].dropna()
+        ss, sh, dp = grp["ss"].dropna(), grp["sh"].dropna(), grp["dp"].dropna()
+        # dp is absent from the names when dp_size == 1: a single slice, rank 0.
+        dp_val = dp.iloc[0] if len(dp) else "0"
+        sh_val = sh.iloc[0] if len(sh) else None
+        ep = None
+        if sh_val is not None and pl in tp_of_pool:
+            try:
+                ep = int(dp_val) * int(tp_of_pool[pl]) + int(sh_val)
+            except (TypeError, ValueError):
+                ep = None
         roles[int(sid)] = {"role": role_of_pool(pl),
                            "ss": ss.iloc[0] if len(ss) else None,
-                           "sh": sh.iloc[0] if len(sh) else None}
+                           "sh": sh_val,
+                           "dp": dp_val,
+                           "ep": ep}
     return roles
 
 
@@ -163,7 +196,12 @@ def tag_comm_role(df: pd.DataFrame, roles: dict[int, dict]) -> pd.Series:
       KV, FIRSTTOK   source is the prefill pool            -> prefill side sends
       KVREQ          the pull request goes decode->prefill -> decode side sends
       PP, DECFB      source is the stage whose id is the name's ss
+      A2A            source is the rank whose own EP rank is the name's se
     Collectives have no direction and get ''.
+
+    An A2A edge stays inside one pipeline stage, so its two rows belong to the
+    two ranks whose EP ranks are exactly the name's se and de: comparing the
+    owner's ep against se separates them without ambiguity.
     """
     def role_of(r) -> str:
         if not r.is_comm:
@@ -173,6 +211,11 @@ def tag_comm_role(df: pd.DataFrame, roles: dict[int, dict]) -> pd.Series:
             return "send" if info.get("role") == "prefill" else "recv"
         if r.cls == "KVREQ":
             return "send" if info.get("role") == "decode" else "recv"
+        if r.cls == "A2A":
+            ep = info.get("ep")
+            if r.se is not None and ep is not None:
+                return "send" if str(ep) == str(r.se) else "recv"
+            return ""
         if r.cls in ("PP", "DECFB"):
             ss = info.get("ss")
             if r.ss is not None and ss is not None and str(ss) == str(r.ss):

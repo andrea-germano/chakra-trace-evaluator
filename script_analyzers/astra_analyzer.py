@@ -76,8 +76,11 @@ TIMELINE_CONTROL_MAX_BYTES = 1
 CAT_COLORS = {
     "COMPUTE_attn": "#4f9bff",
     "COMPUTE_ffw":  "#7c5cff",
+    "COMPUTE_gate": "#b39ddb",
+    "COMPUTE_comb": "#8e7cc3",
     "COMPUTE":      "#5b8def",
     "TP":           "#22c08a",
+    "A2A":          "#00b8d4",
     "KV":           "#ff6b6b",
     "KVREQ":        "#ff9f43",
     "PP":           "#f7c948",
@@ -98,16 +101,17 @@ def categorise(row) -> str:
     """Return the analysis category for a row, based on type + name class.
 
     Finer-grained than utils.astra.op_class: GPU compute is split into attn / ffw
-    so the shared colour scheme (and the timeline lanes) can tell them apart."""
+    (plus the MoE-only gate / comb) so the shared colour scheme (and the timeline
+    lanes) can tell them apart."""
     if row["type"] == "GPU":
         op = row.get("op")
-        if op in ("attn", "ffw"):
+        if op in ("attn", "ffw", "gate", "comb"):
             return f"COMPUTE_{op}"
         return "COMPUTE"
     cls = row.get("cls", "OTHER")
     if cls == "FIRSTTOK":
         return "FIRSTTOK"
-    if cls in ("TP", "KV", "KVREQ", "PP", "DECFB"):
+    if cls in ("TP", "KV", "KVREQ", "PP", "DECFB", "A2A"):
         return cls
     return "OTHER"
 
@@ -648,17 +652,21 @@ def aggregate_comm_time(df: pd.DataFrame) -> list:
     transfer exactly once.
 
     The de-dup itself lives in utils.astra.unique_transfers: point-to-point
-    classes (KV / PP / DECFB / KVREQ) are taken on their SEND side (the blocked
-    RECV's duration is upstream wait, not time on the wire), and the TP all-reduce
-    is collapsed to one representative per logical collective (keyed by
+    classes (KV / PP / DECFB / KVREQ / A2A) are taken on their SEND side (the
+    blocked RECV's duration is upstream wait, not time on the wire), and the TP
+    all-reduce is collapsed to one representative per logical collective (keyed by
     pl/ss/L/it/op, slowest rank for the duration) rather than summed once per
     participating rank. Here we only sum what it returns.
+
+    A2A (MoE expert dispatch/combine) is point-to-point like KV: one row per
+    oriented edge of the expert-parallel mesh, deduplicated on the send side.
+    Absent from a dense run, where it simply contributes no row.
 
     Returns a list of dicts {cls, total_dur, total_bytes, count} sorted by
     total_dur ascending."""
     comm = df[df["is_comm"] & ~df["is_control"]]
     rows = []
-    for cls in ("KV", "PP", "DECFB", "KVREQ", "TP"):
+    for cls in ("KV", "PP", "DECFB", "KVREQ", "A2A", "TP"):
         t = astra.unique_transfers(comm, cls)
         if t is None or t.empty:
             continue
@@ -959,8 +967,11 @@ def build_timeline_html(df, metrics, roles, title):
     viz_control = df["is_comm"] & (df["comm_size"] <= TIMELINE_CONTROL_MAX_BYTES)
     vis = df[df["is_compute"] | (df["is_comm"] & ~viz_control)].copy()
 
-    # ---- lane layout: per sys -> [compute, TP, KV, PP, DECFB, OTHER] ----
-    lane_order = ["compute", "TP", "KV", "PP", "KVREQ", "DECFB", "OTHER"]
+    # ---- lane layout: per sys -> [compute, TP, A2A, KV, PP, DECFB, OTHER] ----
+    # A2A sits next to TP because that is what it replaces: on a MoE run it is
+    # the largest class by far (17k bars of 25k on the wide-EP arm), so leaving
+    # it to fall through to OTHER would bury the dispatch in the catch-all lane.
+    lane_order = ["compute", "TP", "A2A", "KV", "PP", "KVREQ", "DECFB", "OTHER"]
 
     def lane_key_of(row):
         if row["is_compute"]:
