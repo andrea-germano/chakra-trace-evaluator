@@ -1,5 +1,0 @@
-../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_bulk_16reqs_512prompt bandwidth_sweep/T2_bx25_dcqcn_buf32
-../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_bulk_16reqs_512prompt bandwidth_sweep/T2_bx50_dcqcn_buf32
-../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_bulk_16reqs_512prompt bandwidth_sweep/T2_bx100_dcqcn_buf32
-../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_bulk_16reqs_512prompt bandwidth_sweep/T2_bx200_dcqcn_buf32
-../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_bulk_16reqs_512prompt bandwidth_sweep/T2_bx400_dcqcn_buf32

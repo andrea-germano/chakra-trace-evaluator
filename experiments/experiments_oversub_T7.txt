@@ -1,0 +1,19 @@
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os1_dcqcn_buf2
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os1_dcqcn_buf4
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os1_dcqcn_buf8
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os1_dcqcn_buf16
+
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os2_dcqcn_buf2
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os2_dcqcn_buf4
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os2_dcqcn_buf8
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os2_dcqcn_buf16
+
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os4_dcqcn_buf2
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os4_dcqcn_buf4
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os4_dcqcn_buf8
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os4_dcqcn_buf16
+
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os8_dcqcn_buf2
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os8_dcqcn_buf4
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os8_dcqcn_buf8
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_64reqs_512prompt oversub_sweep_T7/T7_os8_dcqcn_buf16
