@@ -1,0 +1,49 @@
+# Wide-EP (EP=4 attraverso il piano di scale-out) con router sbilanciato: identico a
+# llama2_13b_moe8e2k_p-tp2dp2_d-tp2dp2_* tranne la distribuzione del routing.
+#
+# Dirichlet(alpha=0.5) su 8 esperti: hotspot persistenti per layer (il blocco popolare ruota
+# da layer a layer, hotspot temporalmente decorrelati). Stesso volume TOTALE dell'arm
+# uniforme, distribuzione diversa sugli edge: e' la combinazione peggiore, perche' lo
+# sbilanciamento del router si paga sul piano di scale-out (edge a2a asimmetrici -> incast
+# sul rank caldo) e nel compute (il gruppo EP corre alla velocita' del suo rank piu' carico).
+# I conteggi sul filo sono una copia per esperto selezionato in entrambe le fasi (DeepEP LL),
+# quindi lo skew arriva intero sul rank caldo anche in prefill, dove il layout HT reale ne
+# attenuerebbe una parte deduplicando per rank di destinazione.
+model:
+  name: "llama2_13b_moe8e2k-skew_p-tp2dp2_d-tp2dp2_stream_16reqs_512prompt"
+  num_layers: 40
+  hidden_size: 5120
+  vocab_size: 32000
+  bytes_per_val: 2          # bf16
+  scale: 1.0
+  num_attention_heads: 40
+  num_kv_heads: 40
+  head_dim: 128
+  intermediate_size: 6912   # per esperto: iso-FLOPs con la FFN densa (13824 = top_k * 6912)
+  ffn_type: "swiglu"
+  moe:
+    num_experts: 8
+    top_k: 2
+
+moe_routing:
+  distribution: dirichlet
+  alpha: 0.5
+  seed: 0
+
+prefill_parallelism:
+  tp_size: 2
+  pp_size: 1
+  dp_size: 2
+
+decode_parallelism:
+  tp_size: 2
+  pp_size: 1
+  dp_size: 2
+
+inference:
+  serialize_decode_iterations: true
+  kv_transfer: streaming
+
+  num_requests: 16
+  prompt_len: 512
+  gen_len: 8

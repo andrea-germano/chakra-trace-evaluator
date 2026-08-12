@@ -1,0 +1,61 @@
+# Stesso modello MoE iso-FLOPs di llama2_13b_moe8e2k_p-tp2pp2_* e stesso hardware (8 NPU),
+# ma dispiegato "alla vLLM wide-EP": niente pipeline, le repliche di attenzione stanno
+# sull'asse dp e gli esperti sono distribuiti su tutto lo stage.
+#
+#   prefill: tp=2, dp=2, pp=1  -> NPU 0-3   (TP = {0,1} e {2,3} = coppie NVLink/NVSwitch)
+#   decode : tp=2, dp=2, pp=1  -> NPU 4-7
+#   EP = tp*dp = 4 per pool    -> il gruppo all-to-all ATTRAVERSA il piano di scale-out,
+#                                 mentre l'all-reduce TP resta nel dominio a 4800 Gbps.
+#
+# Con tp>1 e dp>1 la trace segue vLLM EP + SP-MoE (use_sequence_parallel_moe): reduce-scatter
+# dopo l'attention, gate sulla fetta 1/tp, a2a routed p2p, all-gather di chiusura. I conteggi
+# sul filo sono UNA COPIA PER ESPERTO SELEZIONATO in entrambe le fasi (layout DeepEP
+# low-latency, buffer per-expert): il prefill reale userebbe l'high-throughput, dove un token
+# viaggia una volta per rank di DESTINAZIONE, quindi qui il suo a2a e' sovrastimato (~1.3x).
+# Router BILANCIATO = best case MoE. Non `uniform`: il round-robin deterministico assegna a
+# ogni token top_k expert CONSECUTIVI, che con 2 expert per rank cadono sempre sullo stesso
+# rank di destinazione -- dispatch artificialmente locale (~meta' del traffico reale). Un
+# router bilanciato reale accoppia expert casuali: Dirichlet(alpha=100) e' statisticamente
+# piatto ma con fan-out realistico, cosi' il confronto con l'arm skew isola lo sbilanciamento.
+#
+# E' il regime interessante per la rete: dispatch/combine diventano un incast a 4 vie sul
+# piano di scale-out, esattamente cio' che il denso non ha. Le 16 richieste sono divise
+# round-robin fra le 2 repliche dp (8 per replica).
+model:
+  name: "llama2_13b_moe8e2k_p-tp2dp2_d-tp2dp2_stream_16reqs_512prompt"
+  num_layers: 40
+  hidden_size: 5120
+  vocab_size: 32000
+  bytes_per_val: 2          # bf16
+  scale: 1.0
+  num_attention_heads: 40
+  num_kv_heads: 40
+  head_dim: 128
+  intermediate_size: 6912   # per esperto: iso-FLOPs con la FFN densa (13824 = top_k * 6912)
+  ffn_type: "swiglu"
+  moe:
+    num_experts: 8
+    top_k: 2
+
+moe_routing:
+  distribution: dirichlet
+  alpha: 100.0    # piatta: router bilanciato con accoppiamento expert realistico
+  seed: 0
+
+prefill_parallelism:
+  tp_size: 2
+  pp_size: 1
+  dp_size: 2
+
+decode_parallelism:
+  tp_size: 2
+  pp_size: 1
+  dp_size: 2
+
+inference:
+  serialize_decode_iterations: true
+  kv_transfer: streaming
+
+  num_requests: 16
+  prompt_len: 512
+  gen_len: 8

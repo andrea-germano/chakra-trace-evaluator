@@ -1,0 +1,51 @@
+# Llama-2-13B "upcycled" a Mixture-of-Experts, iso-FLOPs per token rispetto al denso.
+#
+# ARM DI CONTROLLO "MoE senza EP": stessa attenzione (MHA 40 head, hidden 5120), stessi layer
+# e stesso parallelismo (tp2/pp2) del baseline denso llama2_13b_p-tp2pp2_d-tp2pp2_*: cambia
+# SOLO la meta' FFN del blocco. La FFN densa (intermediate 13824, sharded su tp=2) diventa
+# 8 esperti INTERI da 6912 con top_k=2: 2 * 6912 = 13824, quindi ogni token consuma le stesse
+# FLOPs FFN del denso.
+#
+# Con dp=1 vLLM non attiva NESSUN kernel all-to-all (`use_all2all_kernels` richiede dp>1):
+# MLSynth emette fedelmente il path "masked" -- due all-reduce dense-like (op=attn/ffw, stessi
+# nomi del denso), gate replicato su tutti i token, esperti locali mascherati, ZERO traffico
+# a2a. La trace di rete e' quindi identica al denso per costruzione: questo arm dimostra che
+# "essere MoE" non cambia la rete finche' non si accende il wide-EP. Cio' che cambia e' il
+# compute: un rank tiene 4 esperti interi dove il denso teneva mezza FFN (4x i weight bytes a
+# pari FLOPs), e in decode -- pochi token, memory-bound -- si paga.
+model:
+  name: "llama2_13b_moe8e2k_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt"
+  num_layers: 40
+  hidden_size: 5120
+  vocab_size: 32000
+  bytes_per_val: 2          # bf16
+  scale: 1.0
+  num_attention_heads: 40
+  num_kv_heads: 40          # == num_attention_heads -> MHA (kv_dim = 5120)
+  head_dim: 128             # 5120/40
+  intermediate_size: 6912   # per ESPERTO: 13824/top_k -> iso-FLOPs con la FFN densa
+  ffn_type: "swiglu"
+  moe:
+    num_experts: 8
+    top_k: 2
+
+moe_routing:
+  distribution: dirichlet   # irrilevante per la rete qui (niente a2a); stesso router
+  alpha: 100.0              # dell'arm wide-EP bilanciato, per pareggiare il compute
+  seed: 0
+
+prefill_parallelism:
+  tp_size: 2
+  pp_size: 2
+
+decode_parallelism:
+  tp_size: 2
+  pp_size: 2
+
+inference:
+  serialize_decode_iterations: true
+  kv_transfer: streaming
+
+  num_requests: 16
+  prompt_len: 512
+  gen_len: 8

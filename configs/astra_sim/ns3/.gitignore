@@ -3,4 +3,5 @@ buffer_sweep_*/
 incast_sweep/
 cc_sweep/
 oversub_sweep_*/
+moe_compare/
 topology_graphs/*.png
