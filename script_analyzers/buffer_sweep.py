@@ -666,7 +666,8 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
                 a.legend(fontsize=7, loc="best")
             if i != n - 1:
                 a.set_xlabel("")
-        fig.suptitle("Does PP skew propagate into TTFT?", y=0.99)
+        fig.suptitle("PP arrival skew, the gated all-reduce and TTFT "
+                     "vs buffer", y=0.99)
         save_fig(fig, outdir, "01_causal_chain_to_ttft.png", written)
 
     # 02 CUMULATIVE KV ARRIVAL PER DECODE STAGE ------------------------------ #
@@ -807,7 +808,7 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
                   bbox_to_anchor=(0.5, 1.01), frameon=False)
         save_fig(fig, outdir, "04_first_token_to_second.png", written)
 
-    # 05 HOW MUCH THE DECODE IS STALLED BY ITS KV ---------------------------- #
+    # 05 FIRST DECODE PASS, ITS STALL, AND THE KV TAIL ----------------------- #
     # Two panels. (The old "token 2 after token 1" panel duplicated figure 04's
     # bar totals and is gone; the per-stage lateness panel is folded into the
     # right panel as its worst stage -- stage 0's -200 ms of fully-masked slack
@@ -841,7 +842,8 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
             if col in s.columns and s[col].notna().any():
                 axR.plot(x, s[col] * MS, style, color=colour, label=label)
         axR.axhline(0.0, color="k", linestyle=":", alpha=0.5)
-        axR.set_title("The stall and its cause coincide", fontsize=11)
+        axR.set_title("First-pass stall, KV tail and worst-stage lateness",
+                      fontsize=11)
         axR.set_ylabel("ms")
 
         for a in (axL, axR):
@@ -851,7 +853,7 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
             a.legend(fontsize=8)
         save_fig(fig, outdir, "05_decode_kv_stall.png", written)
 
-    # 06 THE DECODE ALL-REDUCE, ANALYSED LIKE THE PREFILL ONE ---------------- #
+    # 06 DECODE FIRST TP ALL-REDUCE vs ITS STEADY STATE ---------------------- #
     # Figure 01 asks of the prefill: does the arrival skew stretch the FIRST
     # (gated) collective while the steady-state ones stay flat? This asks it of
     # the decode, where the gate is the stage's own KV instead of a PP wave.
@@ -992,11 +994,10 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
             a.set_ylabel(yl)
             a.grid(True, alpha=0.3, which="both")
             a.legend(fontsize=7)
-        fig.suptitle("Congestion across every KV-crossed link, not just the "
-                     "bottleneck", y=1.02)
+        fig.suptitle("Congestion per KV-crossed link", y=1.02)
         save_fig(fig, outdir, "09_per_link_congestion.png", written)
 
-    # 10 IS THE ADDED BUFFER ABSORBING LOAD, OR STANDING IDLE? --------------- #
+    # 10 PEAK AND MEAN QUEUE OCCUPANCY AT THE BOTTLENECK --------------------- #
     # LEFT, absolute MB: peak against mean occupancy at the bottleneck. Peak
     # always grows -- it is bounded by the knob being swept, so on its own it
     # says nothing. RIGHT, their ratio: a flat ratio means the extra buffer is
@@ -1023,11 +1024,12 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
             mark_knees(axR, s)
         logx_pow2(axR, s, "buffer_mb", "Per-switch buffer (MiB)")
         axR.set_ylabel("mean ÷ peak occupancy")
-        axR.set_title("Sustained load, or rare excursions?")
+        axR.set_title("Mean ÷ peak occupancy")
         axR.grid(True, alpha=0.3, which="both")
         if axR.get_legend_handles_labels()[0]:
             axR.legend(fontsize=8)
-        fig.suptitle("Buffer bloat at the bottleneck", y=1.02)
+        fig.suptitle("Peak and mean queue occupancy at the bottleneck",
+                     y=1.02)
         save_fig(fig, outdir, "10_buffer_bloat.png", written)
 
     return written

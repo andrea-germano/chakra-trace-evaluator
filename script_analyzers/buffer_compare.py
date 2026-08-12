@@ -222,7 +222,8 @@ def _fig01_causal_chain(df, group_col, groups, colours, label, outdir, written):
             Line2D([], [], color="k", ls="-", label="receiving stage (steady)"),
             Line2D([], [], color="k", ls="--", alpha=0.55, label="first prefill stage")],
             fontsize=7, loc="best")
-    fig.suptitle("Does PP skew propagate into TTFT?", y=0.99)
+    fig.suptitle("PP arrival skew, the gated all-reduce and TTFT vs buffer",
+                 y=0.99)
     save_fig(fig, outdir, "01_causal_chain_to_ttft.png", written)
 
 
@@ -314,7 +315,7 @@ def _fig05_decode_stall(df, group_col, groups, colours, label, outdir, written):
            labelled=False, alpha=0.6)
     axR.axhline(0.0, color="k", ls=":", lw=1.0, alpha=0.5)
     axR.set_ylabel("ms")
-    axR.set_title("Stall (solid) and its cause, the KV tail (dashed)",
+    axR.set_title("First-pass stall (solid) and the KV tail (dashed)",
                   fontsize=11)
     axR.legend(handles=[Line2D([], [], color="k", ls="-", label="first-pass stall"),
                         Line2D([], [], color="k", ls="--", alpha=0.6,
@@ -326,7 +327,8 @@ def _fig05_decode_stall(df, group_col, groups, colours, label, outdir, written):
         logx_pow2(a, df, "buffer_mb", "Per-switch buffer (MiB)")
         a.grid(True, alpha=0.3, which="both")
     axL.legend(fontsize=8)
-    fig.suptitle("How much the decode is stalled by its KV transfer", y=1.02)
+    fig.suptitle("First decode pass, steady inter-token gap and KV stall",
+                 y=1.02)
     save_fig(fig, outdir, "05_decode_kv_stall.png", written)
 
 
@@ -395,11 +397,11 @@ def _fig10_bloat(df, group_col, groups, colours, label, outdir, written):
     _lines(axR, df, group_col, groups, colours, label, "q_bloat_ratio",
            labelled=False)
     axR.set_ylabel("mean ÷ peak occupancy")
-    axR.set_title("Sustained load, or rare excursions?", fontsize=11)
+    axR.set_title("Mean ÷ peak occupancy", fontsize=11)
     for a in (axL, axR):
         logx_pow2(a, df, "buffer_mb", "Per-switch buffer (MiB)")
         a.grid(True, alpha=0.3, which="both")
-    fig.suptitle("Buffer bloat at the bottleneck", y=1.02)
+    fig.suptitle("Peak and mean queue occupancy at the bottleneck", y=1.02)
     save_fig(fig, outdir, "10_buffer_bloat.png", written)
 
 
@@ -440,7 +442,7 @@ def _fig11_knees(df, group_col, groups, colours, label, outdir, written):
     ax.set_ylim(-0.6, len(groups) - 0.4)
     ax.invert_yaxis()
     ax.grid(True, axis="x", alpha=0.3, which="major")
-    ax.set_title("Where each regime change sits (open = never reached)",
+    ax.set_title("Knee buffer size per workload (open = never reached)",
                  fontsize=11)
     ax.legend(handles=[Line2D([], [], marker=m, color=c, ls="none", ms=9,
                               label=lab) for _col, c, m, lab in KNEE_COLS],

@@ -315,13 +315,20 @@ def sends(df: pd.DataFrame, mask=None) -> pd.DataFrame:
 def collapse_collectives(df: pd.DataFrame, mask=None) -> pd.DataFrame:
     """One row per logical collective instead of one per participating rank.
 
-    Keyed by (pl, ss, L, it, op); the slowest rank gives the wall-clock duration,
-    and comm_size is the per-rank payload (identical across the group), so summing
-    the result counts the collective once rather than tp times."""
+    Keyed by (pl, ss, dp, L, it, op); the slowest rank gives the wall-clock
+    duration, and comm_size is the per-rank payload (identical across the group),
+    so summing the result counts the collective once rather than tp times.
+
+    `dp` belongs in the key and its absence used to be invisible: a data-parallel
+    run has one INDEPENDENT collective per dp slice at the same (pl, ss, L, it, op)
+    -- on the wide-EP arm, the TP groups {0,1} and {2,3} -- and without it the two
+    were merged into a single row, halving the collective count and reporting
+    n_ranks = 4 for a group of 2. Nothing caught it before because dp > 1 is
+    MoE-only in inference (dense DP replicas are rejected in Config)."""
     sub = df if mask is None else df[mask]
     if sub.empty:
         return sub
-    keys = [c for c in ("pl", "ss", "L", "it", "op") if c in sub.columns]
+    keys = [c for c in ("pl", "ss", "dp", "L", "it", "op") if c in sub.columns]
     if not keys:
         return sub
     return (sub.groupby(keys, dropna=False)

@@ -168,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
 
         line_by_workload(
             "kv_over_prefill_compute", "KV completion (×prefill-compute)",
-            "Does the fabric gate the prefill→decode handover?",
+            "KV completion relative to prefill compute, vs bandwidth",
             "kv_over_prefill_compute_by_workload.png", hline=1.0)
 
         line_by_workload(

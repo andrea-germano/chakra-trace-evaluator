@@ -776,7 +776,7 @@ def chart_bandwidth(df, out):
     ax.set_xticks(positions)
     ax.set_xticklabels(labels)
     ax.set_ylabel("achieved bandwidth  (GB/s, log)")
-    ax.set_title("Per-transfer achieved bandwidth (send side)  —  congestion indicator")
+    ax.set_title("Per-transfer achieved bandwidth (send side)")
     from matplotlib.lines import Line2D
     proxies = [
         Line2D([0], [0], marker="o", color="w", markerfacecolor="#666",
@@ -812,7 +812,7 @@ def chart_utilisation(util_rows, out):
     ax1.bar(x, idle, bottom=busy, color="#e8edf3", edgecolor="#cfd6dd",
             label="idle (pipeline bubble / waiting)")
     ax1.set_ylabel("time (ms)")
-    ax1.set_title("GPU occupancy per sys  —  idle = stalled on peers / network")
+    ax1.set_title("GPU busy and idle time per sys")
     ax1.legend(loc="upper right")
 
     ax2.bar(x, hidden, color="#22c08a", label="comm hidden behind compute")
