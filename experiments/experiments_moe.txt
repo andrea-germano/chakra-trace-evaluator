@@ -1,0 +1,8 @@
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt moe_compare/T2_bx100_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_moe8e2k_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt moe_compare/T2_bx100_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_moe8e2k_p-tp2dp2_d-tp2dp2_stream_16reqs_512prompt moe_compare/T2_bx100_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_moe8e2k-skew_p-tp2dp2_d-tp2dp2_stream_16reqs_512prompt moe_compare/T2_bx100_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt moe_compare/T2.3_bx400_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_moe8e2k_p-tp2pp2_d-tp2pp2_stream_16reqs_512prompt moe_compare/T2.3_bx400_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_moe8e2k_p-tp2dp2_d-tp2dp2_stream_16reqs_512prompt moe_compare/T2.3_bx400_dcqcn_buf32
+../generate_log_ns3.sh llama2_13b_moe8e2k-skew_p-tp2dp2_d-tp2dp2_stream_16reqs_512prompt moe_compare/T2.3_bx400_dcqcn_buf32
