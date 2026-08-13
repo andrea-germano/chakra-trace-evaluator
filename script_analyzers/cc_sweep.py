@@ -3,12 +3,12 @@
 cc_sweep — the congestion-control comparison on the disaggregated-inference
 fabric: same topologies and KV-cache incast as incast_sweep (T3/T4 = prefill
 TP4/TP8 converging on TP2 decode pools), but the swept knob is the CC ALGORITHM
-(dcqcn / hpcc / hpcc-pint / timely / dctcp), with the per-switch buffer as a
+(dcqcn / hpcc / hpcc-pint / timely), with the per-switch buffer as a
 small secondary axis (8/16/32 MiB) that separates the PFC-storm regime from the
 comfortable one.
 
 Per-CC parameters are the HPCC SIGCOMM'19 artifact set at 100G (vwin variants);
-see configs/astra_sim/ns3/documentation/cc_parameter_provenance.md. The
+see configs/astra_sim/ns3/documentation/cc_sweep_parameters.md. The
 manifest.json of each run carries param_set/cc, and this analyzer cross-checks
 the manifest's cc against the tag so a stale config cannot silently masquerade
 as another algorithm.
@@ -43,7 +43,11 @@ into an argument here rather than left to the reader:
     disagree, the smallest PFC-free/lossless buffer, the queue-vs-time cost);
   * a COVERAGE table over the full (cc x buffer) grid taken from the configs,
     so a cell that is missing, incomplete, lossy or known-unobtainable is
-    reported as such instead of quietly leaving the summary one row short.
+    reported as such instead of quietly leaving the summary one row short;
+  * an ECN-CONFOUND check: could the spread be an artifact of the ECN marking
+    being too restrictive, rather than of the algorithms? Answered structurally
+    (which CCs even read the ECN maps) and empirically (goodput, queue depth,
+    prefill neutrality) -- see ecn_confound_findings.
 
 Output
 --------------------------------------------------------------------------------
@@ -93,7 +97,7 @@ from utils.paths import BUFFER_AXIS, fresh_dir
 from utils.plots import (MS, logx_pow2, loss_proxies, mark_lossy,
                          save_fig, zoom_y)
 
-from incast_sweep import Row, analyse, recover_placement
+from incast_sweep import Row, analyse, canonical_links, recover_placement
 
 NAN = float("nan")
 MIB = 1 / 2**20
@@ -106,16 +110,26 @@ OUT_WORKLOAD = "llama2_13b_16reqs_512prompt_cc_sweep"
 # bx and buf tokens (may contain '-', e.g. hpcc-pint, but never '_').
 _CC = re.compile(r"_bx[^_]+_(.+?)_buf\d", re.IGNORECASE)
 
-# Fixed CC identity: same colour in every figure.
-CC_ORDER = ["dcqcn", "hpcc", "timely", "dctcp", "hpcc-pint"]
+# Fixed CC identity: same colour in every figure. hpcc-pint is orange and
+# dashed, NOT a second green: it sits within a few percent of hpcc on most
+# metrics, and two adjacent greens made the pair unreadable in every line plot.
+CC_ORDER = ["dcqcn", "hpcc", "timely", "hpcc-pint"]
 CC_STYLE = {
     "dcqcn":     dict(color="#1f77b4", ls="-"),
     "hpcc":      dict(color="#2b8a3e", ls="-"),
     "timely":    dict(color="#6a4c93", ls="-"),
-    "dctcp":     dict(color="#d1495b", ls="-"),
-    "hpcc-pint": dict(color="#66a61e", ls="-"),
+    "hpcc-pint": dict(color="#e69f00", ls="--"),
 }
 BUFFER_MARKER = {8: "o", 16: "s", 32: "^"}
+
+# The feedback signal each algorithm's rate control consumes. This is what makes
+# the ECN-confound question answerable structurally: only the ECN-driven CCs can
+# be affected by the KMIN/KMAX/PMAX maps at all.
+CC_SIGNAL = {
+    "dcqcn": "ECN (RED ramp)", "hpcc": "INT",
+    "hpcc-pint": "PINT", "timely": "RTT", "none": "window only",
+}
+ECN_DRIVEN = {"dcqcn"}
 
 # Cells that are known NOT to be obtainable, and why. Without this an absent
 # output directory is indistinguishable from a run that simply has not been
@@ -129,7 +143,7 @@ KNOWN_UNOBTAINABLE = {
         "Simulator::Stop(), and monitor_buffer reschedules unconditionally -- the "
         "process spins at 100% CPU forever. Reproduced twice with byte-identical "
         "output (freezes at tick 202,067,077, 7/20 ranks done, 417,967 drop "
-        "lines). The other four CCs complete at buf8 on T4 with ZERO drops, so "
+        "lines). The other three CCs complete at buf8 on T4 with ZERO drops, so "
         "this is DCQCN collapsing, i.e. a result of the sweep.",
 }
 
@@ -505,7 +519,12 @@ def analyse_level(level: str, root: Path, out_workload: str,
 
     placement = recover_placement(p, tags)
     degree = incast.prefill_tp(placement)
-    print(f"\n===== {level}  (prefill TP{degree}) =====")
+    # The KV-crossed link set, fixed once for the level (incast_sweep's rule):
+    # re-ranking it per run would make the bn_* columns describe a different
+    # physical link at different CCs, which is exactly the comparison this sweep
+    # must not make.
+    links = canonical_links(p, tags, placement, top_links=1)
+    print(f"\n===== {level}  (prefill TP{degree}, bottleneck {links[0]}) =====")
     print(f"  placement {roles.spec_of(placement)}")
 
     runs: list[CcRun] = []
@@ -521,7 +540,7 @@ def analyse_level(level: str, root: Path, out_workload: str,
                  f"STALE CONFIG? Trusting the manifest.")
             cc = man["cc"].lower()
         try:
-            row = analyse(tag, p, placement)
+            row = analyse(tag, p, placement, links)
         except Abort as e:
             warn(f"{level}: run {tag} dropped -- {e}")
             failed[tag] = str(e)
@@ -694,11 +713,45 @@ def worst_cell_table(s: pd.DataFrame) -> pd.DataFrame:
         ["level", "total_pause_frames"], ascending=[True, False])
 
 
+def _ecn_at_fabric(man: dict, key: str) -> float | None:
+    """The KMIN/KMAX/PMAX value that applies to the FABRIC links, pulled out of
+    the manifest's per-rate map ("<n> <rate_bps> <val> <rate_bps> <val> ...").
+    The scale-up entries (1024G/4800G, effectively non-marking) are exactly the
+    ones this must not return, hence the lookup by the fabric's own rate."""
+    ov = man.get("cc_overrides") or {}
+    m = ov.get(key)
+    if not m:
+        return None
+    try:
+        rate = float(man.get("bx_gbps")) * 1e9
+    except (TypeError, ValueError):
+        return None
+    toks = m.split()[1:]
+    for r, v in zip(toks[::2], toks[1::2]):
+        if float(r) == rate:
+            return float(v)
+    return None
+
+
+def ecn_marking_of(man: dict, cc: str) -> str:
+    """One human-readable cell: the ECN marking this run's fabric links carry,
+    and whether the CC even reads it."""
+    kmin = _ecn_at_fabric(man, "KMIN_MAP")
+    kmax = _ecn_at_fabric(man, "KMAX_MAP")
+    pmax = _ecn_at_fabric(man, "PMAX_MAP")
+    if kmin is None or kmax is None:
+        return "template maps"
+    txt = (f"step@{kmin:g}KB" if kmin == kmax
+           else f"{kmin:g}/{kmax:g}KB p={pmax:g}")
+    return txt if cc in ECN_DRIVEN else f"{txt} (ignored)"
+
+
 def cc_parameter_table(levels: list[Level]) -> pd.DataFrame:
     """What each CC actually ran with, taken from the manifests -- so the report
     is self-contained and a parameter set cannot be mis-remembered later. The
-    ECN/threshold maps (KMIN/KMAX/PMAX) are deliberately left in the manifest:
-    they are per-rate tables, not one number, and would swamp the row."""
+    full ECN/threshold maps are per-rate tables and stay in the manifest; the
+    one value that matters for the comparison -- the marking on the FABRIC links,
+    and whether the CC reads it at all -- is extracted into its own column."""
     seen: dict[str, dict] = {}
     for L in levels:
         for r in L.runs:
@@ -709,7 +762,10 @@ def cc_parameter_table(levels: list[Level]) -> pd.DataFrame:
         man = seen[cc]
         ov = {k: v for k, v in (man.get("cc_overrides") or {}).items()
               if not k.endswith("_MAP")}
-        rows.append({"cc": cc, "cc_mode": man.get("cc_mode", "?"),
+        rows.append({"cc": cc,
+                     "signal": CC_SIGNAL.get(cc, "?"),
+                     "ECN @ fabric": ecn_marking_of(man, cc),
+                     "cc_mode": man.get("cc_mode", "?"),
                      "param_set": man.get("param_set", "?"),
                      "overrides (maps omitted)":
                          ", ".join(f"{k}={v}" for k, v in sorted(ov.items())) or "—"})
@@ -873,6 +929,102 @@ def cross_level_findings(s: pd.DataFrame, refs: dict[str, float]) -> list[str]:
     return out
 
 
+def ecn_confound_findings(s: pd.DataFrame, refs: dict[str, float],
+                          levels: list[Level]) -> list[str]:
+    """Could the CC spread be an artifact of the ECN marking being too
+    restrictive (too-early / too-aggressive), rather than of the algorithms?
+    The one methodological objection this sweep invites, answered in the report
+    itself so it cannot be raised against a number quoted from it.
+
+    Over-restrictive marking has ONE empirical signature: the marked senders are
+    throttled below what the fabric could carry -- shallow queues AND
+    under-delivery, on the CCs that read the marking. So the check is
+    structural first (which CCs consume ECN at all: the INT/PINT/RTT algorithms
+    cannot be touched by KMIN/KMAX/PMAX) and then empirical on the ECN-driven
+    ones (their goodput and queue depth relative to the rest, and whether the
+    prefill phase -- where the spread is paid -- differentiates them at all).
+    Every bullet is computed from the rows it is handed; a bullet whose evidence
+    is not on disk is not emitted."""
+    out: list[str] = []
+    if s.empty:
+        return out
+
+    # The thresholds actually applied to the fabric links, from any ECN manifest.
+    man = next((r.manifest for L in levels for r in L.runs
+                if r.cc in ECN_DRIVEN and r.manifest), None)
+    if man:
+        kmin = _ecn_at_fabric(man, "KMIN_MAP")
+        kmax = _ecn_at_fabric(man, "KMAX_MAP")
+        if kmin is not None and kmax is not None:
+            out.append(
+                f"Thresholds on paper: the fabric links mark at "
+                f"KMIN={kmin:g}KB / KMAX={kmax:g}KB (DCQCN RED ramp) — the HPCC "
+                f"SIGCOMM'19 artifact values at "
+                f"{man.get('bx_gbps', '?')}G, i.e. LATER-marking than the NVIDIA "
+                f"100GbE RoCE reference (150/1500KB). 'Too restrictive' is not "
+                f"true of the configuration itself; see "
+                f"documentation/cc_sweep_parameters.md.")
+
+    for lvl, g in s.groupby("level", observed=True):
+        buf = refs.get(lvl)
+        gb = g[g["buffer_mb"] == buf]
+        ecn = gb[gb["cc"].isin(ECN_DRIVEN)]
+        non = gb[~gb["cc"].isin(ECN_DRIVEN)]
+        if ecn.empty or non.empty:
+            continue
+        label = f"{lvl} @ buf{buf:g}"
+
+        # 1) Structural: is the spread carried by CCs that never read ECN?
+        bw = _best_worst(gb, "ttft_ms")
+        if bw and bw[1]["cc"] not in ECN_DRIVEN:
+            b, w = bw
+            out.append(
+                f"{label}: the TTFT spread is carried by {w['cc']} "
+                f"(+{_spread_pct(b['ttft_ms'], w['ttft_ms']):.1f}% vs best), an "
+                f"algorithm that reacts to {CC_SIGNAL.get(w['cc'], '?')} and "
+                f"never reads the ECN maps — no marking threshold can be its "
+                f"cause.")
+
+        # 2) Delivery: over-restrictive marking would throttle the marked CCs'
+        #    goodput below the unmarked ones'. The opposite holding is decisive.
+        if "kv_goodput_gbps" in gb.columns and gb["kv_goodput_gbps"].notna().all():
+            e_hi, n_hi = ecn["kv_goodput_gbps"].max(), non["kv_goodput_gbps"].max()
+            e_cc = ecn.loc[ecn["kv_goodput_gbps"].idxmax(), "cc"]
+            if e_hi >= n_hi:
+                out.append(
+                    f"{label}: the highest KV goodput of the level belongs to an "
+                    f"ECN-driven CC ({e_cc}, {e_hi:.0f} Gb/s vs {n_hi:.0f} Gb/s "
+                    f"best non-ECN) — the marking is not throttling delivery.")
+
+        # 3) Queues: throttled-by-marking means pinned-shallow queues. The
+        #    ECN-driven CCs holding the deepest standing queues is the opposite
+        #    signature (a slow control loop overshooting the ramp).
+        if gb["q_mean_kb"].notna().all():
+            deep = gb.loc[gb["q_mean_kb"].idxmax()]
+            if deep["cc"] in ECN_DRIVEN:
+                out.append(
+                    f"{label}: the deepest standing queues are {deep['cc']}'s "
+                    f"({deep['q_mean_kb']:.0f} kB mean vs "
+                    f"{non['q_mean_kb'].min():.0f} kB for the best non-ECN CC) — "
+                    f"with over-restrictive marking its queues would be pinned "
+                    f"shallow, not the deepest of the sweep.")
+
+        # 4) Prefill neutrality: the spread is paid in TTFT, so the marking
+        #    would have to act during the prefill collectives to explain it.
+        #    The ECN CCs and the RTT one agreeing to a fraction of a percent
+        #    there says it does not.
+        probe = gb[gb["cc"].isin(ECN_DRIVEN | {"timely"})]["ttft_ms"].dropna()
+        if len(probe) >= 2:
+            rel = _spread_pct(probe.min(), probe.max())
+            if pd.notna(rel) and rel < 0.5:
+                out.append(
+                    f"{label}: TTFT agrees to {rel:.2f}% across the ECN-driven "
+                    f"CCs and timely — during prefill the marking never "
+                    f"differentiates them, so whatever TTFT gap the level shows "
+                    f"belongs to CCs reacting to other signals, not to ECN.")
+    return out
+
+
 def coverage_findings(cov: pd.DataFrame) -> tuple[str, list[str]]:
     """(headline, one line per cell that is not plainly 'ok'). A cell that is
     missing, lossy, truncated or known-unobtainable is a caveat on every number
@@ -919,16 +1071,19 @@ def _cc_lines(levels: list[Level], s: pd.DataFrame, ycol: str, ylabel: str,
         logx_pow2(a, g0, "buffer_mb", "Per-switch buffer (MiB)")
         if yscale == "symlog":
             a.set_yscale("symlog", linthresh=10)
+            a.set_ylim(bottom=0)          # a frame count has no negative decades
         elif zoom and ally:
             zoom_y(a, pd.concat(ally))
         else:
             a.set_ylim(bottom=0)
         a.set_title(lv.label, fontsize=10)
         a.grid(True, alpha=0.3, which="both")
-        h, _ = a.get_legend_handles_labels()
-        proxies = loss_proxies(anyl, anyu) if j == 0 else []
-        a.legend(handles=h + proxies, fontsize=8, title="cc")
         if j == 0:
+            # one legend for the figure: every panel draws the same CC set, and
+            # a repeated legend box was covering data in half the panels.
+            h, _ = a.get_legend_handles_labels()
+            a.legend(handles=h + loss_proxies(anyl, anyu), fontsize=8,
+                     title="cc")
             a.set_ylabel(ylabel)
     fig.suptitle(title, y=1.02)
     save_fig(fig, outdir, fname, written)
@@ -943,7 +1098,7 @@ def fig_fct_cdf(levels: list[Level], refs: dict[str, float], outdir: Path,
     hundred KV shards per run, so a percentile is a rank statistic over a small
     sample and two CCs whose p99 differ by 2% can have visibly different bodies.
     The right-hand tail — the last few percent — is what a decode stage's TP
-    barrier waits for, and it is the part a mean would erase; the dotted verticals
+    barrier waits for, and it is the part a mean would erase; the dotted ticks
     mark each CC's p99 so the figure-02 numbers can be located inside it."""
     usable = [lv for lv in levels
               if any(len(r.kv_fct_ns) for r in lv.runs)]
@@ -961,8 +1116,11 @@ def fig_fct_cdf(levels: list[Level], refs: dict[str, float], outdir: Path,
             v = np.sort(r.kv_fct_ns) * MS
             y = (np.arange(len(v)) + 0.5) / len(v)
             a.plot(v, y, label=f"{r.cc} (n={len(v)})", lw=1.6, **_style(r.cc))
-            a.axvline(np.percentile(v, 99), ls=":", lw=1.0, alpha=0.7,
-                      color=_style(r.cc)["color"])
+            # p99 as a short tick in the tail region, not a full-height rule:
+            # five full verticals on top of five CDFs made the tail — the part
+            # the figure exists for — the least readable part of the panel.
+            a.vlines(np.percentile(v, 99), 0.90, 1.02, ls=":", lw=1.4,
+                     alpha=0.9, color=_style(r.cc)["color"])
             drew = True
         if not drew:
             continue
@@ -973,7 +1131,8 @@ def fig_fct_cdf(levels: list[Level], refs: dict[str, float], outdir: Path,
         a.legend(fontsize=8, title="cc", loc="upper left")
         if j == 0:
             a.set_ylabel("Empirical CDF over KV flows")
-    fig.suptitle("KV-flow FCT distribution per CC (dotted = that CC's p99)", y=1.02)
+    fig.suptitle("KV-flow FCT distribution per CC (dotted tick = that CC's p99)",
+                 y=1.02)
     save_fig(fig, outdir, "06_kv_fct_cdf.png", written)
 
 
@@ -1016,8 +1175,8 @@ def fig_queue(levels: list[Level], s: pd.DataFrame, outdir: Path,
             logx_pow2(a, g0, "buffer_mb", "Per-switch buffer (MiB)")
             a.set_title(lv.label if row == 0 else "", fontsize=10)
             a.grid(True, alpha=0.3, which="both")
-            a.legend(fontsize=8, title="cc")
-            if j == 0:
+            if j == 0:                    # one legend per row, not per panel
+                a.legend(fontsize=8, title="cc")
                 a.set_ylabel(ylab)
     fig.suptitle("Switch-buffer occupancy per CC: peak vs the configured ceiling "
                  "(top), standing queue (bottom)", y=1.01)
@@ -1061,16 +1220,16 @@ def fig_tradeoff(levels: list[Level], s: pd.DataFrame, outdir: Path,
             a.set_xlabel("Mean switch queue (kB, log)")
             a.set_title(lv.label if row == 0 else "", fontsize=10)
             a.grid(True, alpha=0.3, which="both")
-            if j == 0:
+            if j == 0:                    # one legend per row, not per panel
                 a.set_ylabel(ylab)
-            h, _ = a.get_legend_handles_labels()
-            shapes = [Line2D([], [], marker=m, ls="none", color="#444444",
-                             label=f"buf{b:g}")
-                      for b, m in sorted(BUFFER_MARKER.items())
-                      if b in set(g0["buffer_mb"])]
-            a.legend(handles=h + shapes, fontsize=7, ncol=2)
-    fig.suptitle("Queueing vs time (down-and-left is better; shape = buffer)",
-                 y=1.01)
+                h, _ = a.get_legend_handles_labels()
+                shapes = [Line2D([], [], marker=m, ls="none", color="#444444",
+                                 label=f"buf{b:g}")
+                          for b, m in sorted(BUFFER_MARKER.items())
+                          if b in set(g0["buffer_mb"])]
+                a.legend(handles=h + shapes, fontsize=7, ncol=2)
+    fig.suptitle("Standing queue against KV FCT p99 (top) and makespan "
+                 "(bottom), per CC (marker = buffer)", y=1.01)
     save_fig(fig, outdir, "08_tradeoff_queue_vs_time.png", written)
 
 
@@ -1131,8 +1290,7 @@ def fig_profile(levels: list[Level], s: pd.DataFrame, refs: dict[str, float],
             a.legend(fontsize=7, title="cc", ncol=2)
             if j == 0:
                 a.set_ylabel("Ratio to the best CC\n(1.0 = best)")
-    fig.suptitle("CC profile: how far each algorithm is from the winner of every "
-                 "metric", y=1.01)
+    fig.suptitle("Per-metric distance from the best CC, normalised", y=1.01)
     save_fig(fig, outdir, "09_cc_profile.png", written)
 
 
@@ -1189,6 +1347,22 @@ def build_report(levels: list[Level], s: pd.DataFrame, cov: pd.DataFrame,
             continue
         rep.h(3, L.label)
         rep.table(sensitivity_table(g))
+
+    rep.h(2, "Is the ECN marking the confound?")
+    rep.p("Whether the CC spread could be an artifact of too-restrictive ECN "
+          "marking rather than of the algorithms. Structurally, only "
+          + " and ".join(sorted(ECN_DRIVEN))
+          + (" reads" if len(ECN_DRIVEN) == 1 else " read")
+          + " the KMIN/KMAX/PMAX maps (see the 'signal' column above); "
+          "empirically, over-restrictive marking would leave the marked CCs "
+          "with shallow queues and under-delivered goodput:")
+    ecn_lines = ecn_confound_findings(s, refs, levels)
+    if ecn_lines:
+        for line in ecn_lines:
+            rep.bullet(line)
+    else:
+        rep.p("No check could be computed on this row set (single-CC data, or "
+              "missing goodput/queue columns).")
 
     hot = worst_cell_table(s)
     rep.h(2, "Runs where the fabric actually hurt (PFC, loss, or peak queue > 25% of buffer)")
@@ -1291,8 +1465,8 @@ def main(argv: list[str] | None = None) -> int:
                   "01_pfc_frames_vs_buffer.png", outdir, written,
                   yscale="symlog")
         _cc_lines(levels, s, "kv_fct_p99_ms", "p99 KV-flow FCT (ms)",
-                  "p99 KV flow-completion time vs buffer, per CC",
-                  "02_kv_fct_p99_vs_buffer.png", outdir, written)
+                  "p99 KV flow-completion time vs buffer, per CC (y fitted to data)",
+                  "02_kv_fct_p99_vs_buffer.png", outdir, written, zoom=True)
         _cc_lines(levels, s, "kv_skew_ms", "Intra-stage KV arrival skew (ms)",
                   "Worst intra-stage KV arrival skew vs buffer, per CC",
                   "03_kv_arrival_skew_vs_buffer.png", outdir, written)

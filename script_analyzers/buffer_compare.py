@@ -22,16 +22,20 @@ The figure numbering mirrors buffer_sweep 1:1:
                                   reduced to the mean | p99 panels -- the layer
                                   POPULATIONS are per-run material the
                                   cross-group summary does not carry.
-    04  FIRST TOKEN TO SECOND     the same waterfall, one block per group:
-                                  handoff in flight | decode awake, KV still
-                                  arriving | first pass completing, PAUSE count
-                                  beside each bar.
+    04  THE KV TRANSFER           buffer_sweep 04's left panel, one block per
+                                  group: the whole transfer per buffer, split
+                                  into behind the prefill | exposed, decode not
+                                  awake | exposed, decode awake, with the PAUSE
+                                  count and the MEASURED stall beside each bar.
+                                  The right panel (the pass's own busy/idle
+                                  timeline) needs per-run interval positions and
+                                  cannot cross groups.
     05  DECODE KV STALL           same two panels; the first pass is drawn in
                                   units of its own steady ITL (the dimensionless
-                                  twin), and the right panel overlays stall
-                                  (solid) with its cause, the KV tail (dashed),
-                                  per group -- the pairs hugging each other is
-                                  the same finding as in buffer_sweep.
+                                  twin), and the right panel puts the measured
+                                  stall (solid) against the KV tail bound
+                                  (dashed) per group -- the distance between
+                                  them is KV that landed late and cost nothing.
     06  DECODE ALL-REDUCE         same panel: first (KV-gated) effective bw
                                   (solid) vs steady mean (dashed), worst stage.
     09  BOTTLENECK CONGESTION     buffer_sweep 09 restricted to the measured
@@ -44,6 +48,17 @@ The figure numbering mirrors buffer_sweep 1:1:
     11  KNEES                     buffer_sweep's three knee rules, cross-group
                                   form: one row per group, a dot per knee; an
                                   open marker at the right edge = never reached.
+    12  PAUSE SEVERITY            the reading 09 cannot give: how LONG the worst
+                                  victim was held (pause_pct_of_window, monotone
+                                  in the congestion) beside how OFTEN it was
+                                  paused (the frame count, which INVERTS). 09
+                                  draws only the count; the inversion used to be
+                                  documented in prose and nowhere on a figure.
+    13  HANDOVER IDLE             idle = window - floor at the bottleneck: the
+                                  time the pinch spent NOT sending, raw ms and
+                                  over each group's own floor. incast_sweep's
+                                  headline framing on the link route (the
+                                  per-rank route needs a private access link).
 
     02 / 07 / 08 are time-domain figures (cumulative KV arrival, occupancy(t),
     per-switch queues(t)); they cannot be rebuilt from sweep scalars and are
@@ -249,10 +264,19 @@ def _fig03_shard_skew(df, group_col, groups, colours, label, outdir, written):
 
 
 def _fig04_waterfall(df, group_col, groups, colours, label, outdir, written):
-    """buffer_sweep 04, one block per group: the TTFT -> token-2 interval as
-    three consecutive segments per buffer, PAUSE count beside each bar. Each
-    block keeps its own ms axis -- the absolute scale is the group's own."""
-    needed = ["ttft_ns", "dec_start_ns", "kv_gate_ns", "tok2_ns"]
+    """buffer_sweep 04's LEFT panel, one block per group: the whole KV transfer
+    per buffer -- first KV send to last arrival, on a clock whose zero is that
+    run's own first token -- split into the part running behind the prefill, the
+    part exposed with the decode not yet awake, and the part exposed with the
+    decode awake. PAUSE count and the MEASURED stall beside each bar. Each block
+    keeps its own ms axis: the absolute scale is the group's own.
+
+    buffer_sweep 04's right panel (the pass's own busy/idle timeline) is NOT
+    mirrored: it needs the per-run interval positions, which are per-run
+    material the cross-group summary does not carry -- only their total does,
+    and that total is the stall printed beside each bar. Same reason 02/07/08
+    are not duplicated here."""
+    needed = ["ttft_ns", "kv_start_ns", "dec_start_ns", "kv_gate_ns"]
     if not all(c in df.columns for c in needed):
         return
     blocks = []
@@ -267,41 +291,64 @@ def _fig04_waterfall(df, group_col, groups, colours, label, outdir, written):
                              figsize=(12.5, 0.42 * total_bars + 1.1 * len(blocks) + 1.2),
                              squeeze=False)
     for ax, (g, sub) in zip(axes[:, 0], blocks):
-        end = 0.0
+        lo_edge, hi_edge = 0.0, 0.0
         for i, r in enumerate(sub.itertuples()):
             t0 = r.ttft_ns
+            a0 = (r.kv_start_ns - t0) * MS            # negative: before the token
             ds = (r.dec_start_ns - t0) * MS
-            kg = (r.kv_gate_ns - t0) * MS
-            t2 = (r.tok2_ns - t0) * MS
-            end = max(end, t2)
-            ax.barh(i, ds, height=0.62, color=BLUE)
-            ax.barh(i, max(kg - ds, 0.0), left=ds, height=0.62, color=CORAL)
-            ax.barh(i, max(t2 - kg, 0.0), left=max(kg, ds), height=0.62, color=GREEN)
+            gate = (r.kv_gate_ns - t0) * MS
+            lo_edge, hi_edge = min(lo_edge, a0), max(hi_edge, gate)
+            for lo, hi, colour in ((a0, 0.0, MUTED), (0.0, ds, BLUE),
+                                   (ds, gate, CORAL)):
+                lo, hi = min(max(lo, a0), gate), min(max(hi, a0), gate)
+                if hi > lo:
+                    ax.barh(i, hi - lo, left=lo, height=0.62, color=colour)
+            note = []
             pf = getattr(r, "link0_pause_frames", NAN)
             if pd.notna(pf):
-                ax.text(t2 * 1.012, i, f"{pf:,.0f} PAUSE", va="center",
-                        fontsize=8, color=MUTED)
+                note.append(f"{pf:,.0f} PAUSE")
+            blocked = getattr(r, "dec_kv_block_ns", NAN) * MS
+            if pd.notna(blocked):
+                note.append("no stall" if blocked <= 0 else
+                            (f"{blocked * 1e3:,.0f} µs stall" if blocked < 1.0
+                             else f"{blocked:,.1f} ms stall"))
+            if note:
+                ax.annotate(" · ".join(note), xy=(0.995, i),
+                            xycoords=("axes fraction", "data"), ha="right",
+                            va="center", fontsize=8, color=MUTED)
+        ax.axvline(0.0, color="k", lw=1.2, zorder=4)
         ax.set_yticks(range(len(sub)))
         ax.set_yticklabels([f"{b:g} MiB" for b in sub["buffer_mb"]], fontsize=8)
         ax.invert_yaxis()
-        ax.set_xlim(0, end * 1.22)
+        span = max(hi_edge - lo_edge, 1e-9)
+        # a right margin for the note column; the bars keep the rest.
+        ax.set_xlim(lo_edge - 0.03 * span, hi_edge + 0.30 * span)
         ax.grid(True, axis="x", alpha=0.3)
         ax.set_title(label(g), loc="left", fontsize=10)
-    axes[-1, 0].set_xlabel("ms after the first token")
-    axes[0, 0].legend(handles=[Patch(color=BLUE, label="handoff in flight"),
-                               Patch(color=CORAL, label="decode awake, KV still arriving"),
-                               Patch(color=GREEN, label="first pass completing")],
+    axes[-1, 0].set_xlabel("ms relative to the first token")
+    axes[0, 0].legend(handles=[Patch(color=MUTED, label="behind the prefill"),
+                               Patch(color=BLUE, label="exposed, decode not awake yet"),
+                               Patch(color=CORAL, label="exposed, decode awake "
+                                                        "(where a stall is possible)")],
                       fontsize=9, ncol=3, loc="lower center",
                       bbox_to_anchor=(0.5, 1.25), frameon=False)
-    save_fig(fig, outdir, "04_first_token_to_second.png", written)
+    save_fig(fig, outdir, "04_kv_transfer_and_handoff.png", written)
 
 
 def _fig05_decode_stall(df, group_col, groups, colours, label, outdir, written):
     """buffer_sweep 05: LEFT the first pass in units of its own steady ITL (the
     dimensionless twin of the raw-ms panel -- raw ns would compare model size);
-    RIGHT stall (solid) overlaid with its cause, the KV tail (dashed), per
-    group. The pairs hugging each other is buffer_sweep's 'the stall IS the
-    tail' finding, now visible per group."""
+    RIGHT the MEASURED stall (solid) against the KV tail (dashed), per group.
+
+    The right panel used to read 'the stall IS the tail' -- the two curves were
+    drawn to be seen hugging each other. They do not: the tail is kv_gate minus
+    the decode start, i.e. the window in which a stall is possible, and the
+    decode consumes its KV layer by layer, so it waits only where it outruns
+    the transfer. The solid curve is now dec_kv_block_ns, the idle measured
+    inside the pass (utils.measures.first_pass_stall); the dashed one is kept
+    because the DISTANCE between them is the reading -- KV that arrived late
+    and cost nothing. On several groups the solid curve is flat at zero under a
+    tail of several ms."""
     fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5.2))
     okL = _lines(axL, df, group_col, groups, colours, label, "tok2_over_itl")
     axL.axhline(1.0, color="k", ls=":", lw=1.0, alpha=0.5)
@@ -309,17 +356,19 @@ def _fig05_decode_stall(df, group_col, groups, colours, label, outdir, written):
     axL.set_title("First decode pass vs steady state", fontsize=11)
 
     okR = _lines(axR, df, group_col, groups, colours, label,
-                 "decode_kv_stall_ns", MS, ls="-", labelled=False)
+                 "dec_kv_block_ns", MS, ls="-", labelled=False)
     _lines(axR, df, group_col, groups, colours, label,
            "kv_tail_after_dec_start_ns", MS, ls="--", marker="s",
            labelled=False, alpha=0.6)
     axR.axhline(0.0, color="k", ls=":", lw=1.0, alpha=0.5)
     axR.set_ylabel("ms")
-    axR.set_title("First-pass stall (solid) and the KV tail (dashed)",
+    axR.set_title("Measured stall (solid) and the KV tail bound (dashed)",
                   fontsize=11)
-    axR.legend(handles=[Line2D([], [], color="k", ls="-", label="first-pass stall"),
+    axR.legend(handles=[Line2D([], [], color="k", ls="-",
+                               label="measured stall (idle a KV arrival ends)"),
                         Line2D([], [], color="k", ls="--", alpha=0.6,
-                               label="KV tail past decode start")], fontsize=8)
+                               label="KV tail past decode start (upper bound)")],
+               fontsize=8)
     if not (okL or okR):
         plt.close(fig)
         return
@@ -450,6 +499,103 @@ def _fig11_knees(df, group_col, groups, colours, label, outdir, written):
     save_fig(fig, outdir, "11_knees.png", written)
 
 
+def _fig12_pause_severity(df, group_col, groups, colours, label, outdir, written):
+    """The PAUSE reading figure 09 cannot give, because the two quantities move
+    in OPPOSITE directions and 09 only draws one of them.
+
+    `link0_pause_frames` is a COUNT of PAUSE events. As congestion worsens the
+    sender is held longer per event, so the events MERGE and the count FALLS
+    (T1 at buf2: 132k -> 67k -> 51k from 2:1 to 8:1, while the backpressure is
+    strictly worsening). Read across lines it says the opposite of the truth.
+
+    `link0_pause_pct_of_window` is the fraction of the KV window the worst
+    upstream victim actually spent held. That one is monotone in the congestion
+    (51% -> 75% -> 85% on the same three points) and it is what a severity claim
+    should quote. It has been a column since the metric existed and has never
+    had a figure; the inversion was documented in prose instead.
+
+    Drawn side by side, on purpose: the point is not that the count is useless,
+    it is that the count answers 'how often' and the percentage answers 'how
+    long', and only the second one orders the runs.
+
+    The two panels have different populations and must not be divided into each
+    other: the percentage is the union over the SINGLE most-paused device, the
+    count sums every ingress victim of the link. A 'mean pause duration' built
+    from them would mix a one-device numerator with an all-device denominator,
+    so it is deliberately not plotted."""
+    panels = [("link0_pause_pct_of_window", None,
+               "Worst victim held (% of KV window)",
+               "How LONG: monotone in the congestion"),
+              ("link0_pause_frames", "symlog", "PAUSE frames (symlog)",
+               "How OFTEN: INVERTS — read per line, not across")]
+    panels = [p for p in panels if p[0] in df.columns and df[p[0]].notna().any()]
+    if not panels:
+        return
+    fig, axes = plt.subplots(1, len(panels), figsize=(6.4 * len(panels), 4.8),
+                             squeeze=False)
+    for ax, (col, yscale, ylabel, title) in zip(axes[0], panels):
+        _lines(ax, df, group_col, groups, colours, label, col)
+        if yscale == "symlog":
+            ax.set_yscale("symlog", linthresh=1)
+        logx_pow2(ax, df, "buffer_mb", "Per-switch buffer (MiB)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontsize=10)
+        ax.grid(True, alpha=0.3, which="both")
+    axes[0][0].legend(fontsize=8)
+    fig.suptitle("Backpressure at the bottleneck: how long vs how often", y=1.02)
+    save_fig(fig, outdir, "12_pause_severity.png", written)
+
+
+def _fig13_link_idle(df, group_col, groups, colours, label, outdir, written):
+    """The handover framing (incast_sweep's headline) applied to the bottleneck
+    LINK: the transfer moves a fixed number of bytes over a fixed rate, so its
+    duration measures nothing. What congestion produces is
+
+        idle = window - floor,   floor = KV bytes / link rate
+
+    the time the link spent NOT sending during the handover. LEFT the raw ms,
+    which drop straight into a latency budget; RIGHT idle over the floor, the
+    dimensionless twin that stays comparable when the groups have different
+    floors (on the oversubscription plane the pinch rate itself is the axis, so
+    the raw ms alone would confound 'more idle' with 'a slower link').
+
+    This is the LINK route, not measures.kv_handover_idle's per-rank route: see
+    buffer_sweep.Row.flat for why a per-rank floor is wrong once the pinch is a
+    shared uplink, and why the starved/incast SPLIT is therefore unavailable
+    here. What is drawn is the total idle, which is well defined either way.
+
+    IDLE IS NOT ALWAYS CONGESTION, and the right panel is what tells them apart.
+    A link idles either because it is BLOCKED (congestion holds its input) or
+    because it is OVERSIZED (its senders cannot fill it). The raw ms cannot
+    distinguish the two and rank them backwards: on the T7 plane the 1:1 point
+    -- an 800 Gb/s uplink that is no longer the bottleneck at all, 2 concurrent
+    flows, 56% busy -- shows the LARGEST idle of the whole plane (103 ms) while
+    being the fastest configuration. Over its own floor it reads 77%, against
+    6-9% for every genuinely congested point, so the ratio separates the regimes
+    that the milliseconds merge. Read the left panel only for links the run
+    actually pinches on; when the right panel is far above the others, the link
+    is idle because it is waiting for work, and no buffer or CC will 'fix' it."""
+    if not ("link0_idle_ns" in df.columns and df["link0_idle_ns"].notna().any()):
+        return
+    d = df.copy()
+    d["_idle_over_floor"] = 100.0 * d["link0_idle_ns"] / d["link0_floor_ns"]
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 4.8))
+    _lines(axL, d, group_col, groups, colours, label, "link0_idle_ns", MS)
+    axL.set_ylabel("Link idle during the handover (ms)")
+    axL.set_title("window − floor: time the pinch spent NOT sending", fontsize=10)
+    _lines(axR, d, group_col, groups, colours, label, "_idle_over_floor",
+           labelled=False)
+    axR.set_ylabel("Idle ÷ serialisation floor (%)")
+    axR.set_title("The same, over each group's own floor", fontsize=10)
+    for a in (axL, axR):
+        a.axhline(0.0, color="k", ls=":", lw=1.0, alpha=0.5)
+        logx_pow2(a, d, "buffer_mb", "Per-switch buffer (MiB)")
+        a.grid(True, alpha=0.3, which="both")
+    axL.legend(fontsize=8)
+    fig.suptitle("Handover idle at the bottleneck link", y=1.02)
+    save_fig(fig, outdir, "13_link_idle.png", written)
+
+
 def story_plots(df: pd.DataFrame, group_col: str, outdir: Path,
                 label: Callable = str) -> list[Path]:
     """buffer_sweep's figure set with one line family per value of `group_col`.
@@ -460,7 +606,8 @@ def story_plots(df: pd.DataFrame, group_col: str, outdir: Path,
     colours = group_colours(groups)
     for fn in (_fig01_causal_chain, _fig03_shard_skew, _fig04_waterfall,
                _fig05_decode_stall, _fig06_decode_ar, _fig09_congestion,
-               _fig10_bloat, _fig11_knees):
+               _fig10_bloat, _fig11_knees, _fig12_pause_severity,
+               _fig13_link_idle):
         fn(df, group_col, groups, colours, label, outdir, written)
     return written
 
@@ -490,6 +637,7 @@ def load_workload(root: Path, workload: str, sweep: str,
     s["decode_kv_stall_ms"] = s["decode_kv_stall_ns"] / 1e6
     s["dec_kv_lateness_ms"] = s["dec_kv_lateness_ns"] / 1e6
     s["kv_tail_ms"] = s["kv_tail_after_dec_start_ns"] / 1e6
+    s["dec_kv_block_ms"] = s["dec_kv_block_ns"] / 1e6
     s["pause_frames"] = s.get("link0_pause_frames")
     win = s.get("link0_window_ns")
     s["pause_rate"] = (s["pause_frames"] / (win / 1e6)      # frames per ms of
@@ -557,7 +705,8 @@ def main(argv: list[str] | None = None) -> int:
         front = ["workload", "tag", "bottleneck", "buffer_mb",
                  "knee_pfc_mb", "knee_stall_mb", "knee_saturation_mb",
                  "pp_skew_ms", "kv_tp_skew_mean_ms", "kv_tp_skew_p99_ms",
-                 "decode_kv_stall_ms", "kv_tail_ms", "dec_kv_lateness_ms",
+                 "dec_kv_block_ms", "decode_kv_stall_ms", "kv_tail_ms",
+                 "dec_kv_lateness_ms",
                  "qpeak_mb", "qmean_mb", "q_bloat_ratio",
                  "pause_frames", "pause_rate", "line_rate_pct",
                  "rs_ar_first_bw", "rs_ar_rest_bw", "dec_ar_first_bw",

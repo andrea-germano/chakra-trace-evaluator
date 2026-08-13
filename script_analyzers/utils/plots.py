@@ -39,6 +39,9 @@ MS = 1e-6                      # ns -> ms, the scale every figure converts with
 # and never used for a data series.
 BLUE, CORAL, GREEN, VIOLET, MUTED = \
     "#1f77b4", "#d1495b", "#2b8a3e", "#6a4c93", "#9aa0a6"
+# AMBER sits between GREEN ("this cost nothing") and CORAL ("this is the cost"):
+# time that is exposed on the user's clock but that nothing is waiting on yet.
+AMBER = "#e0a458"
 LOSS_RED = "#e8000b"
 
 

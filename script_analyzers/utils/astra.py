@@ -379,6 +379,30 @@ def kv_arrivals(df: pd.DataFrame) -> pd.DataFrame:
                          "layer": pd.to_numeric(kv["L"], errors="coerce")})
 
 
+def kv_send_start(df: pd.DataFrame) -> float | None:
+    """When the KV transfer BEGINS: the earliest KV send issue instant.
+
+    The send side, never the recv side: a recv row is pre-posted at the run
+    origin (see kv_arrivals), so its start_tick is 0 and only the sends carry a
+    real beginning. Paired with the barrier's kv_gate (the last arrival) this
+    closes the transfer's own window -- the WHOLE transfer, not the part of it a
+    reader happens to be looking at. In streaming mode the first send leaves as
+    soon as the first layer's KV exists, i.e. tens of ms into the prefill and
+    long before TTFT, so most of that window is hidden behind compute; what the
+    user pays for is only the part past TTFT.
+
+    None when the trace has no KV send row (no disaggregation, or roles
+    unresolved)."""
+    if df is None or df.empty:
+        return None
+    kv = df[df["op_class"] == "KV"]
+    if "comm_role" in kv.columns:
+        kv = kv[kv["comm_role"] == "send"]
+    if kv.empty:
+        return None
+    return float(kv["start_tick"].min())
+
+
 def end_of_prefill(df: pd.DataFrame) -> tuple[float | None, str]:
     """The TTFT instant with its fallback chain, decided in ONE place:
     (instant_ns, source) where source is 'firsttok' (the FIRSTTOK send,

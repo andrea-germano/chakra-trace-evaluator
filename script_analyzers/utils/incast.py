@@ -26,12 +26,20 @@ bending SweepPaths into a shape that would lie for the buffer sweep:
      point buffer_sweep.analyse_sweep can score it unchanged (one definition of
      the metrics, reused — see buffer_compare for the same idea across models).
 
-The swept knob here is the incast degree = the prefill tensor-parallel width
-(T2.1->2, T3->4, T4->8): the number of KV shards that converge on each decode
-rank when the prefill stage hands the KV cache over. That number is not written
-into the directory name (the name carries the topology id T2.1/T3/T4 and the
-buffer, not the TP width), so it is read from the placement per level, not from
-the tag — `prefill_tp(placement)`.
+The swept knob here is the INCAST DEGREE: how many prefill ranks send into each
+decode rank at once. That is NOT the prefill TP width -- it is the resharding
+ratio tp_prefill / tp_decode, because a decode rank owns 1/tp_decode of each
+layer's KV and therefore needs only that fraction of the prefill shards:
+
+    T2.1  prefill TP2 -> decode TP2   fan-in 1   (no incast: the control)
+    T3    prefill TP4 -> decode TP2   fan-in 2
+    T4    prefill TP8 -> decode TP2   fan-in 4
+
+Confirmed against the traces: each decode rank receives 20, 40 and 80 KV shards
+over the 20 layers of its pipeline stage, i.e. 1, 2 and 4 senders per layer.
+Neither number is in the directory name (which carries the topology id and the
+buffer), so both are read from the placement per level: `fan_in(placement)` for
+the degree, `prefill_tp(placement)` for the TP width that names the topology.
 """
 
 from __future__ import annotations
@@ -63,12 +71,33 @@ def level_of(tag: str) -> str | None:
 
 
 def prefill_tp(placement: Placement) -> int:
-    """The incast degree of a level: the tensor-parallel width of its prefill
-    stage = how many prefill ranks shard-and-send the KV cache into each decode
-    rank. Read from the placement (recovered per level from the ASTRA trace),
-    because the tag name does not carry it. All prefill stages share one TP
-    width, so stage 0's is the number."""
+    """The tensor-parallel width of the prefill stage -- the number that names
+    the topology (T3 = prefill TP4). NOT the incast degree: see fan_in. All
+    prefill stages share one TP width, so stage 0's is the number."""
     return len(placement.prefill[0]) if placement.prefill else 0
+
+
+def decode_tp(placement: Placement) -> int:
+    """The tensor-parallel width of a decode stage."""
+    return len(placement.decode[0]) if placement.decode else 0
+
+
+def fan_in(placement: Placement) -> int:
+    """THE INCAST DEGREE: how many prefill ranks converge on ONE decode rank for
+    a given layer = tp_prefill / tp_decode.
+
+    A decode rank owns 1/tp_decode of every layer's KV heads, so it needs that
+    same fraction of the layer's prefill shards and no more: at prefill TP8 into
+    decode TP2, each decode rank is fed by 4 of the 8 prefill shards, not 8.
+    Reading the prefill TP width as the degree overstates it by tp_decode and
+    loses the fact that T2.1 (TP2 -> TP2) has NO incast at all -- it is the
+    fan-in-1 control this sweep is measured against.
+
+    0 when either pool is empty; the ratio is exact for the placements this
+    sweep uses (utils.config rejects a prefill/decode TP pair that is not a
+    multiple), and floor division only guards a malformed placement."""
+    tp_p, tp_d = prefill_tp(placement), decode_tp(placement)
+    return tp_p // tp_d if tp_p and tp_d else 0
 
 
 @dataclass(frozen=True)
@@ -182,7 +211,7 @@ def discover_levels(out_workload: str = OUT_WORKLOAD,
     """Every incast level present under the sweep's output root, e.g.
     ['T2.1', 'T3', 'T4']. Sorted by name, which for Tk ids is also the incast
     order (T2.1 < T3 < T4); the caller annotates the exact degree from each
-    level's recovered placement (prefill_tp), since the name is not the number."""
+    level's recovered placement (fan_in), since the name is not the number."""
     base = root / "output" / _SOURCE_DIR[source] / out_workload
     if not base.is_dir():
         return []

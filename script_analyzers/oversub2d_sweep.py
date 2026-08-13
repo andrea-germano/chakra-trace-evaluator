@@ -26,7 +26,11 @@ What it produces
 2. top level -- the 2D synthesis: buffer_sweep's OWN figure set with one line
    family per oversubscription level (buffer_compare.story_plots -- the same
    figures, same numbers, same quantities the cross-model compare draws, so
-   "across models" and "across oversubscription" read identically). The
+   "across models" and "across oversubscription" read identically), plus
+   figure 14, the per-link view, which is this script's own: story_plots
+   collapses the per-link figure to the measured bottleneck because link labels
+   cannot cross MODELS, a restriction that does not apply when the second
+   dimension is a link rate on one fixed topology. See _fig14_per_link_2d. The
    time-domain figures (02 cumulative arrival, 07/08 occupancy/queues over
    time) are per-level material and are not duplicated at the top level: they
    live in by_oversub/os<N>/. See buffer_compare's module docstring for the
@@ -34,8 +38,10 @@ What it produces
    specific to this plane: the PAUSE-frame count (fig 09, middle panel)
    INVERTS as os rises -- longer continuous pauses mean FEWER pause/resume
    events (132k -> 67k -> 51k at buf2 even though congestion worsens) -- so
-   read it per line, along the buffer axis, not across lines; the monotone
-   severity metric, link0_pause_pct_of_window, stays in summary_2d.csv.
+   read it per line, along the buffer axis, not across lines. The monotone
+   severity metric, link0_pause_pct_of_window (51% -> 75% -> 85% on those same
+   three points), used to live only in summary_2d.csv; it is now drawn beside
+   the count in figure 12, so the inversion is visible rather than described.
 
 Reuse, not reinvention
 ----------------------
@@ -62,6 +68,10 @@ from pathlib import Path
 
 import pandas as pd
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 import buffer_sweep
 from buffer_sweep import analyse_sweep
 from buffer_compare import add_group_norms, story_plots
@@ -69,9 +79,11 @@ from buffer_compare import add_group_norms, story_plots
 from utils import paths, roles
 from utils.cli import Abort, drain_warnings, need
 from utils.paths import OVERSUB_AXIS, fresh_dir
+from utils.plots import logx_pow2, save_fig
 from utils.roles import Placement
 
 KIND = "oversub2d"
+NAN = float("nan")
 
 
 # --------------------------------------------------------------------------- #
@@ -82,7 +94,109 @@ KIND = "oversub2d"
 # --------------------------------------------------------------------------- #
 def make_2d_plots(s: pd.DataFrame, outdir: Path) -> list[Path]:
     outdir.mkdir(parents=True, exist_ok=True)
-    return story_plots(s, "oversub", outdir, label=lambda v: f"{v:g}:1")
+    written = story_plots(s, "oversub", outdir, label=lambda v: f"{v:g}:1")
+    _fig14_per_link_2d(s, outdir, written)
+    return written
+
+
+# --------------------------------------------------------------------------- #
+# 14 PER-LINK CONGESTION ACROSS THE WHOLE PLANE -- oversub2d-local on purpose.
+# --------------------------------------------------------------------------- #
+# buffer_sweep's figure 09 is per-link; story_plots' version of it (figure 09
+# here) collapses to link0, the measured bottleneck, because buffer_compare's
+# grouping dimension is the MODEL and link labels are topology-local -- 'sw12'
+# means a different switch in two different topologies, so the lines cannot be
+# put on one axis.
+#
+# That reason does not hold on this plane. Every run of an oversubscription
+# sweep is the SAME topology with the same node numbering (only link RATES
+# change), and the sweep additionally forces one bottleneck (--bottleneck
+# 8->12), so '8->12' denotes the same link in all 16 runs. Restricting to link0
+# here therefore throws away exactly what buffer_sweep 09 exists to show, and
+# what an oversubscribed tree is most often wrong about:
+#
+#   * a SECOND uplink (9->12) carries comparable backpressure -- the bottleneck
+#     ranking picks one, the fabric congests on both;
+#   * the spine DOWNLINKS (12->10, 12->11) never queue and never pause, which
+#     localises the congestion to the ingress side of the core switch and says
+#     there is no incast on the KV fan-in -- an absence that only a per-link
+#     figure can state.
+#
+# Keyed by LABEL, never by index: analyse_sweep is called once per
+# oversubscription level and ranks each level's links independently, so
+# 'link0_*' is 8->12 at one level and something else at another. The label
+# columns are the join key.
+def _fig14_per_link_2d(s: pd.DataFrame, outdir: Path, written: list[Path]) -> None:
+    idx = [int(c[4:-6]) for c in s.columns
+           if c.startswith("link") and c.endswith("_label")]
+    if not idx:
+        return
+    # The forced bottleneck first (it carries the emphasis weight), then the
+    # rest ALPHABETICALLY rather than in discovery order. Discovery order is
+    # each level's own congestion ranking, so it differs between two sweeps that
+    # cross the identical link set -- the T1 and T7 planes ranked 9->12 and
+    # 12->10 the other way round and the same link came out a different colour
+    # in the two figures, which is exactly the comparison this figure exists to
+    # support. Sorting makes the colour of a link a property of its name.
+    seen: set[str] = set()
+    for i in sorted(idx):
+        seen.update(str(v) for v in s[f"link{i}_label"].dropna().unique() if v)
+    if not seen:
+        return
+    bn = s["bottleneck"].dropna()
+    first = str(bn.iloc[0]) if len(bn) and str(bn.iloc[0]) in seen else None
+    labels = ([first] if first else []) + sorted(seen - {first})
+    levels = sorted(s["oversub"].unique())
+    if not labels or not levels:
+        return
+
+    def series(sub: pd.DataFrame, label: str, field: str):
+        """(buffer, value) for one link on one oversubscription level, gathered
+        across whichever link index carried that label in each run."""
+        out = []
+        for r in sub.sort_values("buffer_mb").itertuples():
+            val = NAN
+            for i in sorted(idx):
+                if getattr(r, f"link{i}_label", None) == label:
+                    val = getattr(r, f"link{i}_{field}", NAN)
+                    break
+            out.append((r.buffer_mb, val))
+        xs = [b for b, v in out if pd.notna(v)]
+        ys = [v for _b, v in out if pd.notna(v)]
+        return xs, ys
+
+    cols = [("eff_pct", 1.0, "Link busy (% of KV window)", None),
+            ("pause_pct_of_window", 1.0, "Worst victim held (%)", None),
+            ("qpeak_bytes", 1 / 2**20, "Peak occupancy (MiB)", None)]
+    cmap = plt.get_cmap("tab10")
+    fig, axes = plt.subplots(len(levels), len(cols), squeeze=False,
+                             sharex=True, sharey="col",
+                             figsize=(5.2 * len(cols), 2.9 * len(levels) + 1.0))
+    for r_i, lvl in enumerate(levels):
+        sub = s[s["oversub"] == lvl]
+        rate = sub["bn_rate_gbps"].dropna()
+        rate_txt = f"pinch {rate.iloc[0]:g} Gb/s" if len(rate) else ""
+        for c_i, (field, scale, ylabel, _yscale) in enumerate(cols):
+            ax = axes[r_i][c_i]
+            for l_i, label in enumerate(labels):
+                xs, ys = series(sub, label, field)
+                if not xs:
+                    continue
+                ax.plot(xs, [y * scale for y in ys], marker="o", ms=4,
+                        lw=2.4 if l_i == 0 else 1.1, color=cmap(l_i % 10),
+                        label=label if (r_i == 0 and c_i == 0) else None)
+            logx_pow2(ax, sub, "buffer_mb", "Per-switch buffer (MiB)")
+            ax.grid(True, alpha=0.3, which="both")
+            if c_i == 0:
+                ax.set_ylabel(f"{lvl:g}:1\n{rate_txt}", fontsize=9)
+            if r_i == 0:
+                ax.set_title(ylabel, fontsize=10)
+            if r_i != len(levels) - 1:
+                ax.set_xlabel("")
+    axes[0][0].legend(fontsize=7, ncol=2, loc="best")
+    fig.suptitle("Congestion per KV-crossed link — rows = oversubscription "
+                 "level", y=1.0)
+    save_fig(fig, outdir, "14_per_link_congestion_2d.png", written)
 
 
 # --------------------------------------------------------------------------- #

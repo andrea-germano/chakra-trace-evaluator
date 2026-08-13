@@ -48,6 +48,7 @@ from matplotlib.ticker import FuncFormatter
 
 from utils import astra, intervals, paths
 from utils.cli import Abort, need
+from utils.measures import first_pass_stall
 
 
 # --------------------------------------------------------------------------- #
@@ -359,8 +360,14 @@ def compute_metrics(df: pd.DataFrame, roles: dict) -> dict:
     # --- KV-cache "tail": how late the last KV chunk *arrives on the decode
     #     side* vs the instant decode actually needs it (= decode start).
     #     Use the receive (decode-pool) arrivals only -- a KV send completing on
-    #     the prefill side is not what decode waits for. Positive => KV exposed
-    #     (decode stalled on a late chunk); negative => KV fully prefetched. -----
+    #     the prefill side is not what decode waits for. Positive => KV still in
+    #     flight while the decode is awake; negative => KV fully prefetched.
+    #
+    #     Positive does NOT mean the decode stalled on it. The decode walks its
+    #     layers and waits only where it outruns the transfer, so this is an
+    #     UPPER BOUND on the stall -- routinely a loose one, and on several runs
+    #     a bound of several ms over a pass that never waits at all. The stall
+    #     itself is measured below as idle inside the first pass. ---------------
     if kv_ready and decode_start_tick is not None:
         last_kv_arrival = max(r["kv_ready_tick"] for r in kv_ready)
         m["kv_last_end"] = int(last_kv_arrival)
@@ -368,6 +375,16 @@ def compute_metrics(df: pd.DataFrame, roles: dict) -> dict:
     else:
         m["kv_last_end"] = None
         m["kv_tail_vs_decode_start_ns"] = None
+
+    # --- and the stall the bound bounds: idle between the decode ranks' own
+    #     first-pass ops that a KV arrival ends, unioned over the ranks
+    #     (utils.measures.first_pass_stall -- one definition, shared with the
+    #     sweeps, so a run analysed alone and the same run inside a sweep cannot
+    #     report different stalls). ---------------------------------------------
+    blocked, _ = first_pass_stall(df, astra.kv_arrivals(df),
+                                  m.get("second_token_tick"))
+    m["dec_kv_block_ns"] = blocked["dec_kv_block_ns"]
+    m["dec_other_idle_ns"] = blocked["dec_other_idle_ns"]
 
     return m
 
@@ -863,6 +880,12 @@ def chart_kv_timeline_impact(df, metrics, out):
     tail_txt = ("last KV completes %s decode start"
                 % (f"{fmt_time(abs(tail))} after" if (tail or 0) > 0
                    else f"{fmt_time(abs(tail or 0))} before")) if tail is not None else ""
+    # ... of which this much actually stopped the decode. The tail bounds the
+    # stall, it is not the stall (see compute_metrics).
+    blk = metrics.get("dec_kv_block_ns")
+    if tail is not None and blk is not None and pd.notna(blk):
+        tail_txt += (" — measured stall: none"
+                     if blk <= 0 else f" — measured stall {fmt_time(blk)}")
     ax.set_title("KV-cache transfers vs. decode-start instant\n" + tail_txt,
                  fontsize=11)
     fig.tight_layout()
@@ -1217,6 +1240,8 @@ def analyse(run_dir: Path, out_dir: Path, title: str, pattern: str = "*.csv") ->
         "makespan_human": fmt_time(metrics["makespan_ns"]),
         "n_decode_iters": metrics["n_decode_iters"],
         "kv_tail_vs_decode_start_ns": metrics["kv_tail_vs_decode_start_ns"],
+        "dec_kv_block_ns": metrics["dec_kv_block_ns"],
+        "dec_other_idle_ns": metrics["dec_other_idle_ns"],
         "comm_time_per_class": aggregate_comm_time(df),
         "per_sys_utilisation": util,
         "kv_ready_per_npu": metrics["kv_ready_per_npu"],
@@ -1241,7 +1266,13 @@ def analyse(run_dir: Path, out_dir: Path, title: str, pattern: str = "*.csv") ->
         f.write(f"Total makespan                : {fmt_time(metrics['makespan_ns'])}\n")
         f.write(f"Decode iterations             : {metrics['n_decode_iters']}\n")
         if metrics["kv_tail_vs_decode_start_ns"] is not None:
-            f.write(f"Last KV chunk vs decode start : {fmt_time(metrics['kv_tail_vs_decode_start_ns'])}\n")
+            f.write(f"Last KV chunk vs decode start : "
+                    f"{fmt_time(metrics['kv_tail_vs_decode_start_ns'])}"
+                    f"   (bounds the stall, is not the stall)\n")
+        if pd.notna(metrics.get("dec_kv_block_ns", float("nan"))):
+            f.write(f"First-pass stall (measured)   : "
+                    f"{fmt_time(metrics['dec_kv_block_ns'])}"
+                    f"   (idle inside the pass that a KV arrival ends)\n")
 
     print(f"\nDone. Outputs in {out_dir}:")
     for p in sorted(out_dir.iterdir()):

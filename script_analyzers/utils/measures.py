@@ -222,6 +222,171 @@ def kv_layer_skew(kv_arr: pd.DataFrame) -> pd.DataFrame:
                          "n_shards": out["count"].astype(int)})
 
 
+# Per-packet wire overhead of the ns-3 RDMA model (RdmaHw::GetNxtPacket):
+# SeqTsHeader(6 + IntHeader) + UdpHeader(8) + Ipv4Header(20) + PppHeader(2).
+# The INT header rides on every data packet and its size is the CC's, so two
+# algorithms moving the same payload do NOT put the same number of bytes on the
+# wire -- ignoring it charges HPCC ~1.6 ms of its own telemetry as if it were
+# idle time. Sizes from src/network/utils/int-header.h: NORMAL is hop[5]*8 + 2,
+# TS is one uint64, PINT is a uint16.
+BASE_HEADER_BYTES = 6 + 8 + 20 + 2
+INT_HEADER_BYTES = {1: 0,      # DCQCN   -> IntHeader::NONE
+                    3: 5 * 8 + 2,   # HPCC      -> NORMAL, the 5-hop stack
+                    7: 8,      # TIMELY  -> TS
+                    8: 0,      # DCTCP   -> NONE
+                    10: 2}     # HPCC-PINT -> PINT
+
+
+def wire_header_bytes(cc_mode: int | None) -> float:
+    """Bytes of header every data packet carries, for this run's CC_MODE. NaN on
+    an unknown mode -- the caller then reports the payload-only floor rather
+    than silently assuming a header size that would bias the measure."""
+    if cc_mode is None or int(cc_mode) not in INT_HEADER_BYTES:
+        return NAN
+    return BASE_HEADER_BYTES + INT_HEADER_BYTES[int(cc_mode)]
+
+
+def kv_handover_idle(kv_arr: pd.DataFrame, kv_sends: pd.DataFrame,
+                     placement: Placement, rate_bps: float, payload: int,
+                     header_bytes: float,
+                     other_sends: pd.DataFrame | None = None) -> tuple[dict, dict]:
+    """How much of the KV handover a decode rank's link spent NOT SENDING.
+
+    The transfer moves a fixed number of bytes over a link of fixed rate, so its
+    DURATION carries no information about congestion: it is bytes/rate whatever
+    the fan-in. What congestion produces is the gap between the window the
+    transfer took and that hard floor, which is delay the decode inherits:
+
+        window = last KV arrival at the rank - first send feeding it
+        floor  = wire bytes / rate,  wire = payload + ceil(payload/MTU) * header
+        idle   = window - floor
+
+    Read entirely from the ASTRA CSV (arrival ticks and comm_size, already
+    labelled by destination stage/shard) plus two declared constants, the link
+    rate and the per-packet header. Verified against the ns-3 path: for the
+    bottleneck link of T2.1/T3/T4 the window and the byte count agree with
+    fct.txt + candidate_links to the NANOSECOND and to the BYTE, with none of
+    the flow classification, path reconstruction or bottleneck-ranking the ns-3
+    route needs -- and it reports every receiver instead of the one link a
+    ranking happened to pick.
+
+    PRECONDITION, which the caller must check: the receiver's own link is the
+    narrowest on the path (rate_bps = min rate from every sender to it). That
+    holds when the fan-in converges on the last hop, as it does here. If the
+    pinch moves to a shared uplink, this measure no longer describes it and the
+    ns-3 per-link route (link_metrics) is the one to use.
+
+    THE IDLE IS NOT ALL INCAST, and `other_sends` is what splits it. A receiving
+    link can only be fed by its own senders, so it is starved whenever EVERY
+    sender feeding it is busy putting something else on its NIC. On a
+    pipeline-parallel prefill that "something else" is the PP activation handed
+    to the next stage, and the senders of one stage emit it simultaneously, so
+    the receiver loses 100% of its supply for the duration however wide the
+    fan-in is. Measured as the intersection, over the senders of a rank, of
+    their non-KV send spans, clipped to the handover window:
+
+        starved_ns = |intersection over senders of (their other transfers)|
+        incast_ns  = idle_ns - starved_ns
+
+    `other_sends` must already exclude control-sized rows: a FIRSTTOK send is a
+    handful of bytes but its row spans tens of milliseconds of waiting, and
+    counting that as "the sender is busy" would wipe the whole measure out.
+    Without `other_sends` the split is not attempted and incast_ns is NaN.
+
+    Returns (scalars, per_rank). Scalars are the WORST receiver by incast_ns --
+    the term the fan-in is responsible for -- plus the means. floor is identical
+    for every rank when the KV is evenly sharded, which is what makes the
+    numbers comparable across topologies."""
+    scal = {"kv_floor_ns": NAN, "kv_window_ns": NAN, "kv_idle_ns": NAN,
+            "kv_idle_mean_ns": NAN, "kv_link_busy_pct": NAN,
+            "kv_starved_ns": NAN, "kv_incast_ns": NAN,
+            "kv_incast_mean_ns": NAN, "kv_starved_mean_ns": NAN}
+    per_rank: dict[int, dict] = {}
+    if (kv_arr is None or kv_arr.empty or kv_sends is None or kv_sends.empty
+            or not rate_bps):
+        return scal, per_rank
+
+    # (stage, shard) -> rank, from the placement: it is what a KV name's ds/dsh
+    # address, and what lets a send row be attributed to a receiver without
+    # touching the topology.
+    rank_of = {(si, sh): r
+               for si, ranks in enumerate(placement.decode)
+               for sh, r in enumerate(ranks)}
+    s = kv_sends.assign(ds=pd.to_numeric(kv_sends.get("ds"), errors="coerce"),
+                        dsh=pd.to_numeric(kv_sends.get("dsh"), errors="coerce"))
+    s = s.dropna(subset=["ds", "dsh"])
+    s["rank"] = [rank_of.get((int(a), int(b))) for a, b in zip(s["ds"], s["dsh"])]
+    s = s.dropna(subset=["rank"])
+    first_send = s.groupby("rank")["start_tick"].min()
+    senders_of = {int(r): sorted(g["sys_id"].unique())
+                  for r, g in s.groupby("rank")}
+    busy_of: dict[int, list] = {}
+    if other_sends is not None and len(other_sends):
+        for sy, g in other_sends.groupby("sys_id"):
+            busy_of[int(sy)] = intervals.merge(
+                [(int(a), int(b)) for a, b in zip(g["start_tick"], g["end_tick"])])
+
+    for d, g in kv_arr.groupby("dst"):
+        d = int(d)
+        if d not in first_send.index:
+            continue
+        payload_bytes = float(g["size"].sum())
+        npkt = float(np.ceil(g["size"].to_numpy() / max(payload, 1)).sum())
+        wire = payload_bytes + (npkt * header_bytes
+                                if pd.notna(header_bytes) else 0.0)
+        floor = wire * 8e9 / rate_bps
+        lo, hi = float(first_send.loc[d]), float(g["arrival"].max())
+        window = hi - lo
+        starved = NAN
+        if other_sends is not None:
+            # every sender of d busy elsewhere at once = d's link has no supply
+            cur = busy_of.get(senders_of.get(d, [None])[0], [])
+            for sy in senders_of.get(d, [])[1:]:
+                cur = _intersect(cur, busy_of.get(int(sy), []))
+            cur = [(max(a, lo), min(b, hi)) for a, b in cur
+                   if min(b, hi) > max(a, lo)]
+            starved = float(intervals.union_len(cur))
+        per_rank[d] = {"floor_ns": floor, "window_ns": window,
+                       "idle_ns": window - floor, "starved_ns": starved,
+                       "incast_ns": (window - floor - starved
+                                     if pd.notna(starved) else NAN),
+                       "payload_bytes": payload_bytes, "packets": npkt,
+                       # the window's two ENDS, not only its length: when a
+                       # receiver's handover starts is a property of the
+                       # pipeline (its layers must be produced first), not of
+                       # the fabric, and separating the two is the only way to
+                       # read a completion time. start = first send feeding it,
+                       # end = its last arrival, i.e. its own KV gate.
+                       "start_ns": lo, "end_ns": hi}
+    if not per_rank:
+        return scal, per_rank
+    key = ("incast_ns" if any(pd.notna(m["incast_ns"]) for m in per_rank.values())
+           else "idle_ns")
+    worst = max(per_rank.values(),
+                key=lambda m: m[key] if pd.notna(m[key]) else -np.inf)
+    scal["kv_floor_ns"] = worst["floor_ns"]
+    scal["kv_window_ns"] = worst["window_ns"]
+    scal["kv_idle_ns"] = worst["idle_ns"]
+    scal["kv_starved_ns"] = worst["starved_ns"]
+    scal["kv_incast_ns"] = worst["incast_ns"]
+    scal["kv_idle_mean_ns"] = float(np.mean([m["idle_ns"]
+                                             for m in per_rank.values()]))
+    inc = [m["incast_ns"] for m in per_rank.values() if pd.notna(m["incast_ns"])]
+    scal["kv_incast_mean_ns"] = float(np.mean(inc)) if inc else NAN
+    stv = [m["starved_ns"] for m in per_rank.values() if pd.notna(m["starved_ns"])]
+    scal["kv_starved_mean_ns"] = float(np.mean(stv)) if stv else NAN
+    if worst["window_ns"] > 0:
+        scal["kv_link_busy_pct"] = 100.0 * worst["floor_ns"] / worst["window_ns"]
+    return scal, per_rank
+
+
+def _intersect(a: list, b: list) -> list:
+    """Intersection of two interval sets, as A minus (A minus B). utils.intervals
+    has union, subtract and overlap length but no set intersection; this is the
+    one line that composes it from what is there."""
+    return intervals.subtract(a, intervals.subtract(a, b))
+
+
 def decode_ar_stats(adf: pd.DataFrame | None) -> dict[int, dict]:
     """First vs steady-state TP all-reduce of each DECODE PP stage, from the
     ASTRA stats CSV: decode stage -> {first_skew_ns, first_dur_ns,
@@ -351,6 +516,157 @@ def decode_stall_stats(adf: pd.DataFrame | None,
         stages[int(st)] = {"input_arrival_ns": arr, "kv_ready_ns": ready,
                            "kv_lateness_ns": ready - arr}
     return scal, stages
+
+
+# A gap is "closed by" a KV delivery when the rank resumes within this much of
+# the arrival. The traces put the two in the same nanosecond (the resumed op's
+# start_tick IS the arrival's end_tick), so the window only has to absorb the
+# scheduler, not a modelling difference.
+KV_RESUME_TOL_NS = 10_000
+
+
+def first_pass_stall(adf: pd.DataFrame | None, kv_arr: pd.DataFrame,
+                     tok2_ns: float) -> tuple[dict, dict[int, dict]]:
+    """What the first decode pass actually WAITS for -- measured as idle inside
+    the pass, not inferred from the KV envelope.
+
+    kv_gate - dec_start ("the KV still in flight when the pipeline wakes") is an
+    UPPER BOUND on the stall and routinely a loose one, because the decode does
+    not need all of its KV at once: it consumes layer by layer and stalls only
+    where it outruns the transfer. On T1/16 requests that bound reads 0.25-4.1 ms
+    while every decode rank runs its first pass strictly back to back -- zero
+    idle, no stall at all. Reporting the bound as the stall would be reporting a
+    cost nobody paid.
+
+    So the stall is measured where it would have to appear: the rank is BUSY for
+    the union of its own first-iteration decode COMP and TP intervals, and every
+    hole between them is time it spent waiting. A hole is attributed to the KV
+    when a KV arrival at that rank lands in it (within KV_RESUME_TOL_NS of the
+    resume) -- that arrival is what let the rank continue. Holes no arrival
+    explains are waits on something else (a slower TP shard, the PP hop) and are
+    counted separately rather than folded into the KV bill.
+
+    Busy = COMP and TP only. PP/DECFB recv rows are pre-posted at the run origin
+    and carry no occupancy; the sends are instantaneous at this scale.
+
+    The pipeline stall is the UNION of the ranks' blocked intervals, not the
+    worst rank's total. TP shards re-synchronise at every layer's all-reduce, so
+    the group advances only when NO shard is blocked, and two shards blocked at
+    different layers hold the pipeline for the sum of both waits. Taking the
+    worst rank instead understates it by 2x on a 64-request run (28.996 ms
+    against a true 36.257 ms), while the union reproduces the makespan
+    arithmetic: the union and the pass's excess over its own steady inter-token
+    gap -- two independent measurements of the same wait, one from the ops' idle
+    and one from the token timestamps -- agree within 0.2% on the buffer sweeps
+    (36.495/36.429, 47.079/47.013, 5.357/5.333 ms, and 0/0 where the pass never
+    waits) and within 3% on the incast levels (36.21/37.33 ms at T3). The
+    residual is one-signed -- the measured value is never the larger -- because
+    a shard that reaches an all-reduce and waits there for a KV-blocked peer
+    spends that wait INSIDE the collective's duration, where this function reads
+    it as busy. It is a floor on the stall, in other words, and a tight one.
+
+    Returns (scalars, detail):
+        scalars
+            dec_kv_block_ns     union of the KV-blocked idle over all decode
+                                ranks: the measured first-pass KV stall
+            dec_other_idle_ns   idle the union leaves unexplained by any KV
+                                arrival (a PP hop, a shard behind its peer)
+            dec_kv_block_max_ns the WORST SINGLE RANK's KV-blocked idle. Kept
+                                because it answers a different question -- how
+                                much one rank personally waited -- and its
+                                distance from the union says whether the shards
+                                stall together or in turn.
+            dec_crit_rank       the rank whose first DECFB send is tok2
+        detail
+            {"per_rank": rank -> {busy_ns, idle_ns, kv_block_ns, other_idle_ns,
+                                  spans, gaps},
+             "kv_blocked_spans": merged [(start, end)] of the KV-blocked idle,
+             "idle_spans":       merged [(start, end)] of ALL idle}
+            The spans are the raw material for a timeline figure, which needs
+            the POSITIONS and not only the totals; gaps = [(start, end, is_kv)].
+    """
+    scal = {"dec_kv_block_ns": NAN, "dec_other_idle_ns": NAN,
+            "dec_kv_block_max_ns": NAN, "dec_crit_rank": NAN}
+    detail: dict = {"per_rank": {}, "kv_blocked_spans": [], "idle_spans": []}
+    per_rank: dict[int, dict] = detail["per_rank"]
+    if adf is None or adf.empty:
+        return scal, detail
+
+    ops = adf[(adf["phase"] == "decode")
+              & (adf["op_class"].isin(("COMP", "TP")))]
+    if ops.empty or "it" not in ops.columns:
+        return scal, detail
+    ops = ops.assign(it=pd.to_numeric(ops["it"], errors="coerce"))
+    ops = ops[ops["it"] == 0]
+    if ops.empty:
+        return scal, detail
+
+    arrivals = {}
+    if kv_arr is not None and len(kv_arr):
+        arrivals = {int(r): np.sort(g["arrival"].to_numpy(dtype=float))
+                    for r, g in kv_arr.groupby("dst")}
+
+    for rank, sub in ops.groupby("sys_id"):
+        iv = sorted(zip(sub["start_tick"].astype(float),
+                        sub["end_tick"].astype(float)))
+        spans: list[list[float]] = []
+        for a, b in iv:
+            if spans and a <= spans[-1][1]:
+                spans[-1][1] = max(spans[-1][1], b)
+            else:
+                spans.append([a, b])
+        arr = arrivals.get(int(rank), np.empty(0))
+        gaps = []
+        for (_, end), (start, _) in zip(spans, spans[1:]):
+            if start - end <= KV_RESUME_TOL_NS:
+                continue
+            hit = arr[(arr >= end) & (arr <= start + KV_RESUME_TOL_NS)]
+            gaps.append((end, start, bool(len(hit))))
+        kv_block = sum(b - a for a, b, is_kv in gaps if is_kv)
+        other = sum(b - a for a, b, is_kv in gaps if not is_kv)
+        per_rank[int(rank)] = {
+            "busy_ns": float(sum(b - a for a, b in spans)),
+            "idle_ns": float(kv_block + other),
+            "kv_block_ns": float(kv_block),
+            "other_idle_ns": float(other),
+            "spans": [(float(a), float(b)) for a, b in spans],
+            "gaps": gaps,
+        }
+    if not per_rank:
+        return scal, detail
+
+    def merge(iv: list) -> list[tuple[float, float]]:
+        out: list[list[float]] = []
+        for a, b in sorted(iv):
+            if out and a <= out[-1][1]:
+                out[-1][1] = max(out[-1][1], b)
+            else:
+                out.append([a, b])
+        return [(a, b) for a, b in out]
+
+    blocked = merge([(a, b) for m in per_rank.values()
+                     for a, b, is_kv in m["gaps"] if is_kv])
+    idle_all = merge([(a, b) for m in per_rank.values() for a, b, _ in m["gaps"]])
+    detail["kv_blocked_spans"] = blocked
+    detail["idle_spans"] = idle_all
+    scal["dec_kv_block_ns"] = float(sum(b - a for a, b in blocked))
+    scal["dec_other_idle_ns"] = float(sum(b - a for a, b in idle_all)
+                                      - scal["dec_kv_block_ns"])
+    scal["dec_kv_block_max_ns"] = max(m["kv_block_ns"] for m in per_rank.values())
+    # The critical rank: the one that emitted token 2. tok2 is the MAX over
+    # shards of the first DECFB send, so the rank whose own first send is that
+    # instant is the one everything else waited for. Reported, not used as the
+    # stall -- see the union above.
+    if pd.notna(tok2_ns):
+        fb = adf[(adf["op_class"] == "DECFB") & (adf["comm_role"] == "send")]
+        if len(fb) and "it" in fb.columns:
+            fb = fb.assign(it=pd.to_numeric(fb["it"], errors="coerce"))
+            fb = fb[(fb["it"] == 0) & (abs(fb["start_tick"] - tok2_ns) <= 1)]
+            cand = [int(r) for r in fb["sys_id"].unique() if int(r) in per_rank]
+            if cand:
+                scal["dec_crit_rank"] = float(max(
+                    cand, key=lambda r: per_rank[r]["kv_block_ns"]))
+    return scal, detail
 
 
 # --------------------------------------------------------------------------- #

@@ -165,6 +165,72 @@ def _win_bw(sub: pd.DataFrame) -> tuple[float, float, float]:
     return (total_bytes, window, agg)
 
 
+def _merge(iv) -> list[tuple[float, float]]:
+    """Overlapping intervals collapsed into disjoint ones, sorted."""
+    out: list[list[float]] = []
+    for s, e in sorted(iv):
+        if out and s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return [(a, b) for a, b in out]
+
+
+def _subtract(a, b) -> list[tuple[float, float]]:
+    """A minus B, as disjoint intervals."""
+    b = _merge(b)
+    out: list[tuple[float, float]] = []
+    for s, e in _merge(a):
+        cur = s
+        for bs, be in b:
+            if be <= cur or bs >= e:
+                continue
+            if bs > cur:
+                out.append((cur, min(bs, e)))
+            cur = max(cur, be)
+            if cur >= e:
+                break
+        if cur < e:
+            out.append((cur, e))
+    return out
+
+
+def _complement(iv, lo: float, hi: float) -> list[tuple[float, float]]:
+    """The parts of [lo, hi] that `iv` does NOT cover -- the idle gaps."""
+    return _subtract([(lo, hi)], iv)
+
+
+def _length(iv) -> float:
+    return float(sum(e - s for s, e in iv))
+
+
+def _mean_concurrency(sends: pd.DataFrame) -> float:
+    """Time-weighted mean number of DISTINCT ranks transmitting at once.
+
+    Distinct ranks, not flows: two flows leaving the same rank share one uplink,
+    so they add no aggregate bandwidth and must not count twice. Averaged only
+    over the time at least one transfer is in flight, so it answers "how wide was
+    the transfer while it was happening" and not "how much of the run did it
+    cover" -- the second is kv_busy_union_ns and they are different questions."""
+    events = []
+    for s, e, r in zip(sends["start_tick"], sends["end_tick"], sends["sys_id"]):
+        events.append((s, 1, r))
+        events.append((e, -1, r))
+    events.sort()
+    depth: dict = {}
+    weighted = span = 0.0
+    prev = None
+    for t, delta, rank in events:
+        if prev is not None and t > prev:
+            n = sum(1 for v in depth.values() if v > 0)
+            if n:
+                weighted += n * (t - prev)
+                span += t - prev
+        depth[rank] = depth.get(rank, 0) + delta
+        prev = t
+    return weighted / span if span else np.nan
+
+
 def summarise_run(df: pd.DataFrame) -> dict:
     """Collapse one run's concatenated trace into a flat dict of metrics."""
     out: dict[str, float] = {}
@@ -199,22 +265,40 @@ def summarise_run(df: pd.DataFrame) -> dict:
 
     out["comp_union_ns"] = union_of(comp_mask)
     # The same union widened to everything that does NOT ride the swept inter-node
-    # links: compute, the TP all-reduce (which runs on the intra-node pair link,
-    # fixed at 4800 Gbps in every topology of the sweep) and the decode feedback.
-    # Every gap left in THIS union is a wait on a link the sweep actually moves,
-    # so the union is the makespan the run would have with that fabric free --
-    # the floor beta should be measured against.
+    # links: compute, plus the TP all-reduce, which runs on the intra-node pair
+    # link fixed at 4800 Gbps in every topology of the sweep. Every gap left in
+    # THIS union is a wait on a link the sweep actually moves, so the union is the
+    # makespan the run would have with that fabric free -- the floor to measure
+    # beta against.
     #
     # comp_union_ns alone is the wrong floor and wrong in a way that matters: it
     # counts the TP stalls as fabric cost. At the top of the sweep those stalls
     # are 89% of all remaining idle, spread over ~720 sub-2 ms gaps, and blaming
-    # them on the KV transfer says it is half-exposed when it is ~94% hidden.
+    # them on the KV transfer says the transfer is half-exposed when it is ~94%
+    # hidden.
     #
-    # Both come out bit-identical across a 16x bandwidth sweep. That invariance
-    # is the check on the partition itself: a class on this side that actually
-    # rode the swept links would make the union move with bandwidth.
-    out["nonfabric_union_ns"] = union_of(
-        df["op_class"].isin(("COMP", "TP", "DECFB")))
+    # DECFB is deliberately NOT here even though it behaves like a fixed cost. Its
+    # payload is 8 bytes -- a control message between decode stages -- so it is
+    # latency-bound and barely moves with bandwidth, but it does cross the swept
+    # links, and with those free it would go away. Including it added 0.087% to
+    # the floor and, more tellingly, was the ENTIRE source of the floor's residual
+    # bandwidth dependence: 378 ns over a 16x sweep, identical in all seven
+    # workloads. Without it both unions are bit-identical across the sweep, so the
+    # partition is exact rather than approximate.
+    #
+    # That invariance is the check on the partition itself: a class left on this
+    # side that actually rode the swept links makes the union move with bandwidth,
+    # which is exactly how DECFB was caught.
+    nonfab = df["op_class"].isin(("COMP", "TP"))
+    out["nonfabric_union_ns"] = union_of(nonfab)
+    # End of prefill, i.e. TTFT, through the shared definition so this sweep
+    # cannot drift from buffer_sweep/incast_sweep on what it means. It is here
+    # because it BOUNDS the KV overlap: under disaggregation the decode pool
+    # cannot compute until the KV has landed, so the transfer has only the
+    # prefill window to hide behind, never the decode one. roofline_compare turns
+    # this into the reachable-overlap bound.
+    _ttft, _ = astra.end_of_prefill(df)
+    out["ttft_ns"] = (float(_ttft) - global_start) if _ttft is not None else np.nan
     out["kv_completion_ns"] = last_end(kv_mask)
     out["pp_completion_ns"] = last_end(pp_mask)
     out["prefill_comp_completion_ns"] = last_end(comp_mask & (df["phase"] == "prefill"))
@@ -238,6 +322,41 @@ def summarise_run(df: pd.DataFrame) -> dict:
     # be wrong there, since streaming splits the same bytes over many more flows
     # without adding a link.
     out["kv_senders"] = int(kv["sys_id"].nunique()) if len(kv) else 0
+    # How many of those senders were actually transmitting AT THE SAME TIME,
+    # averaged over the in-flight window. kv_senders counts who sends over the
+    # whole run; this counts how wide the transfer really was at any instant, and
+    # the two are not the same number: with PP=2 the pipeline emits the KV in two
+    # waves of tp_size ranks, and once the fabric is fast enough to drain a wave
+    # before the next stage produces one, the waves never overlap. Measured 2.00
+    # at 400 Gbps (never 4) against 3.53 at 25 Gbps, where the transfers outlive
+    # the compute and pile up across stages.
+    #
+    # This is what the ideal transfer time of roofline_compare gets wrong when it
+    # divides by kv_senders, and it explains that tool's eta almost exactly:
+    # concurrency/senders is 0.88/0.685/0.50 where eta is 0.85/0.66/0.487. The
+    # residual few percent is the only part that is actual wire inefficiency.
+    out["kv_mean_concurrency"] = _mean_concurrency(kv) if len(kv) else np.nan
+
+    # Split makespan-minus-floor by what was actually on the wire during it. The
+    # whole residual used to be reported as "KV left exposed", which is right to
+    # 0.1% from 25 to 200 Gbps -- and wrong outright at 400, where the KV is fully
+    # hidden and every one of the 1.9 remaining ms is PP. Small in absolute terms,
+    # but it is the entire residual at the fast end, so the label has to earn it.
+    #
+    # PP stays on the FABRIC side rather than joining the floor: its time moves
+    # with bandwidth (54.3 ms at 25 Gbps, 3.4 ms at 400), so folding it into the
+    # floor would destroy the invariance the whole normalisation rests on.
+    _idle = _complement(zip(df.loc[nonfab, "start_tick"], df.loc[nonfab, "end_tick"]),
+                        global_start, global_end)
+    _no_kv = _subtract(_idle, zip(kv["start_tick"], kv["end_tick"]))
+    # Everything on the swept fabric that is NOT the KV: the PP activations, the
+    # first-token handoff and the decode feedback. DECFB is here for the same
+    # reason it is not in the floor -- it crosses the swept links -- and leaving
+    # it out of both left exactly 0.14 ms of every run unaccounted for.
+    _other = astra.sends(df, pp_mask | df["op_class"].isin(("FIRSTTOK", "DECFB")))
+    out["exposed_kv_ns"] = _length(_idle) - _length(_no_kv)
+    out["exposed_other_ns"] = _length(_no_kv) - _length(
+        _subtract(_no_kv, zip(_other["start_tick"], _other["end_tick"])))
     # _win_bw's aggregate rate (bytes / global window) is deliberately NOT stored:
     # it sums bytes across every KV flow on every parallel link into one number, so
     # with K concurrent transfers it reads ~K x a single link's rate and looks like
@@ -356,7 +475,7 @@ def make_plots(summary: pd.DataFrame, outdir: Path) -> list[Path]:
             plot_series(ax, s, "bandwidth", col, lbl, marker=mk, scale=1e-6)
     ax.set_xlabel("Link bandwidth (bx)")
     ax.set_ylabel("Completion time (ms)")
-    ax.set_title("What gates the prefill→decode handover?")
+    ax.set_title("Phase completion times vs link bandwidth")
     ax.grid(True, alpha=0.3)
     ax.legend()
     save(fig, "01_phase_completion_vs_bandwidth.png")

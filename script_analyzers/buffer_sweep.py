@@ -48,12 +48,25 @@ Four things this file measures that the previous version did not
                           250 ms misalignment, when there is nothing to fix.
       xrank_over_tp_skew  the ratio of the two. Kept for continuity only.
 
-2.  THE KV TAIL PAST THE DECODE START (kv_tail_after_dec_start_ns, figs 02/05).
-    kv_gate - dec_start: how much KV is still on the wire when the decode
-    pipeline wakes. This is the CAUSE of decode_kv_stall_ns, which the old
-    figure set reported as an effect with no cause column beside it. It is the
-    same quantity astra_analyzer reports as kv_tail_vs_decode_start_ns, so the
-    time-domain view and the sweep agree.
+2.  THE KV TAIL PAST THE DECODE START (kv_tail_after_dec_start_ns, figs 02/05),
+    AND WHAT IT IS NOT. kv_gate - dec_start: how much KV is still on the wire
+    when the decode pipeline wakes. Same quantity astra_analyzer reports as
+    kv_tail_vs_decode_start_ns, so the time-domain view and the sweep agree.
+
+    It was introduced here as the CAUSE of decode_kv_stall_ns. It is not: it is
+    an UPPER BOUND on it, and on this model a loose one. The decode does not
+    need all of its KV at once -- it walks the layers and waits only where it
+    outruns the transfer -- so the tail counts KV the pipeline was never going
+    to ask for yet. On T1/16 requests the tail reads 0.25-4.1 ms while every
+    decode rank runs its first pass strictly back to back: the true stall is
+    zero at every buffer. The measured quantity is dec_kv_block_ns
+    (utils.measures.first_pass_stall): the idle INSIDE the pass that a KV
+    arrival ends, unioned over the decode ranks. Where a stall does exist it
+    reproduces the makespan arithmetic to 0.2% on this sweep (T1/64 requests at
+    8 MiB: 47.079 ms measured against a 47.013 ms excess over the steady
+    inter-token gap, while the tail claims 53.039). Both are kept and figure 05 draws them
+    together, because the DISTANCE between them is itself the reading: it is
+    the KV that arrived late and cost nothing.
 
 3.  THE STEADY-STATE INTER-TOKEN GAP AS AN EXPLICIT CONTROL (fig 05). itl_steady
     was only ever a denominator. It is invariant across the sweep (T1: 0.08% over
@@ -76,6 +89,20 @@ than T1 at its most congested (292 ms at 2 MiB); and within T1 the gap GROWS
 divided by the bandwidth available to move them -- a serialisation cost that PFC
 modulates by a few percent. Figure 04 plots it against the PAUSE count precisely
 so the non-correlation is on the page instead of being assumed away.
+
+Figure 04's left panel says what that serialisation is a piece OF, which nothing
+in the previous figure set showed: the transfer does not begin at TTFT. The first
+KV send leaves ~1 ms into the run (streaming: a layer's KV goes as soon as that
+layer's prefill is done) and the last lands ~206 ms later, so on T1/16 requests
+the prefill hides ~63% of a ~205 ms transfer and only the remaining ~37% is
+exposed -- of which 0.2-4 ms finds the decode already awake, and (point 2 above)
+none of it actually stalls that pass. Three nested quantities, one bar:
+kv_transfer_ns, kv_gate_after_ttft_ns (kv_exposed_frac of it) and
+kv_tail_after_dec_start_ns, with the measured stall in the row label as the
+fourth number the geometry cannot carry. Reading the exposed tail
+without the masked bulk beside it invites the conclusion that the fabric moves
+KV for 77 ms of user-visible time, when what it moves in that window is the
+last third of a transfer that has been running since the prefill started.
 
 Three knees, and they do not coincide
 --------------------------------------------------------------------------------
@@ -102,17 +129,23 @@ Figures
                                     (the two ungated references) -> TTFT.
     02  KV CUMULATIVE ARRIVAL       one panel per decode STAGE, every buffer
                                     overlaid and colour-graded, each run's decode
-                                    start marked on the baseline: KV drawn right
-                                    of a run's own marker is KV the pipeline is
-                                    already waiting on.
+                                    start drawn as a vertical rule in that run's
+                                    own colour: the curve's height AT the rule is
+                                    how much of the stage's KV had landed when the
+                                    pipeline woke, and everything to the right of
+                                    it is KV the pipeline is already waiting on.
     03  KV TP-SHARD SKEW            per (PP stage, layer): |arrival(shard 1) -
                                     arrival(shard 0)| between the two TP shards
                                     of that stage. Boxplots, one box per
                                     (buffer, stage) over the stage's layers.
-    04  TTFT -> TOKEN 2             a waterfall per buffer: handoff in flight |
-                                    decode awake with its KV still arriving |
-                                    first pass completing, with the PAUSE count
-                                    beside each row.
+    04  THE KV TRANSFER             LEFT the whole transfer per buffer, first KV
+                                    send -> last KV arrival, split into the part
+                                    running behind the prefill | the part exposed
+                                    past TTFT with the decode not yet awake | the
+                                    part that finds the decode already awake (the
+                                    stall), with the three totals spelled out.
+                                    RIGHT the same exposed part zoomed, TTFT ->
+                                    token 2, PAUSE count beside each row.
     05  DECODE GATED BY KV          the first decode pass against the steady
                                     control, and beside it the stall overlaid
                                     with its cause (KV tail past decode start,
@@ -179,8 +212,9 @@ from utils.cli import Abort, drain_warnings, need, warn
 from utils.fabric import parse_ns3_config, parse_topology
 from utils.measures import (LinkStat, barrier, decode_ar_stats,
                             decode_stall_stats, decode_worst_stage,
-                            knee_scalars, kv_layer_skew, kv_skew_stats,
-                            link_metrics, ttft_from, victim_pause_intervals)
+                            first_pass_stall, knee_scalars, kv_layer_skew,
+                            kv_skew_stats, link_metrics, ttft_from,
+                            victim_pause_intervals)
 from utils.plots import (BLUE, CORAL, GREEN, KNEE_STYLE, MS, MUTED, VIOLET,
                          buf_colour, downsample_max, logx_pow2, mark_knees,
                          save_fig, zoom_y)
@@ -240,6 +274,7 @@ class Row:
     rs_ar_n: int = 0                      # receiving-stage prefill TP collectives
 
     # -- 02/03 KV delivery: when it lands, and how unevenly -------------------- #
+    kv_start_ns: float = NAN              # first KV SEND issue: the transfer begins
     kv_gate_ns: float = NAN               # last KV arrival over all decode ranks
     kv_ready_min_ns: float = NAN          # first rank to be fully fed
     kv_gate_over_ttft: float = NAN        # decode-ready instant as a multiple of TTFT
@@ -262,16 +297,40 @@ class Row:
     # buffer-sensitive within-group skew is a small part of the total spread.
     xrank_over_tp_skew: float = NAN
 
-    # -- 04 from the first token to the decode -------------------------------- #
+    # -- 04 the KV transfer, and the part of it the user pays for -------------- #
     dec_start_ns: float = NAN             # first decode COMP start (stage 0 wakes
                                           # on the FIRSTTOK ARRIVAL, not its send)
     dec_start_after_ttft_ns: float = NAN  # dec_start - ttft: the exposed handoff
     kv_gate_after_ttft_ns: float = NAN    # kv_gate - ttft: until the LAST KV lands
+    # The transfer's own window and its three-way split. The three parts PARTITION
+    # kv_transfer_ns (masked + exposed = total; the stall is the tail of the
+    # exposed part, not a fourth part), so a reader can add them and a figure can
+    # stack them without double counting. It is the run's ENVELOPE -- first send
+    # of any request to last arrival of any request -- not one request's own
+    # transfer time, which a 16-request run does not have a single value of:
+    kv_transfer_ns: float = NAN           # kv_gate - kv_start: the WHOLE transfer
+    kv_masked_ns: float = NAN             # kv_start -> TTFT: moved behind the
+                                          # prefill, invisible to the user
+    kv_exposed_frac: float = NAN          # kv_gate_after_ttft / kv_transfer: how
+                                          # much of the transfer the prefill fails
+                                          # to hide (1.0 = nothing is hidden)
 
     # -- 05 decode stalled by KV reception ------------------------------------ #
     kv_tail_after_dec_start_ns: float = NAN  # kv_gate - dec_start: KV still in
-                                          # flight when the pipeline wakes -- the
-                                          # cause of the first-pass stall
+                                          # flight when the pipeline wakes. An
+                                          # UPPER BOUND on the stall, not the
+                                          # stall: the decode consumes layer by
+                                          # layer and waits only where it outruns
+                                          # the transfer (see dec_kv_block_ns).
+    # The stall as measured inside the pass (utils.measures.first_pass_stall):
+    # idle between the decode ranks' own intervals, attributed to the KV arrival
+    # that ends it, unioned over the ranks. On T1/16 requests this is 0 at every
+    # buffer while the bound above reads 0.25-4.1 ms -- the pipeline never
+    # actually waits there.
+    dec_kv_block_ns: float = NAN          # union of the KV-blocked idle
+    dec_other_idle_ns: float = NAN        # idle no KV arrival explains
+    dec_kv_block_max_ns: float = NAN      # worst SINGLE rank's KV-blocked idle
+    dec_crit_rank: float = NAN            # the rank that emitted token 2
     tok2_ns: float = NAN                  # second token: first DECFB send, max
                                           # over shards (slowest shard's send)
     tok2_latency_ns: float = NAN          # tok2 - dec_start: the first decode pass
@@ -291,6 +350,9 @@ class Row:
                                                          # all-reduce skew/dur/bw
     dec_stall: dict = field(default_factory=dict)        # decode stage -> KV readiness
                                                          # vs first-input arrival
+    dec_idle: dict = field(default_factory=dict)         # first-pass busy/idle
+                                                         # spans, per rank and
+                                                         # unioned (figure 04)
     bn_pause_intervals: list = field(default_factory=list)
     qseries: dict = field(default_factory=dict)          # sw -> (ts_ns, bytes)
     qswitch_peak: dict = field(default_factory=dict)
@@ -300,8 +362,8 @@ class Row:
     def flat(self) -> dict:
         d = asdict(self)
         for k in ("links", "kv_stage_series", "kv_layer_skew", "kv_rank_span",
-                  "dec_ar", "dec_stall", "bn_pause_intervals", "qseries",
-                  "qswitch_peak", "qswitch_mean", "pause_intervals"):
+                  "dec_ar", "dec_stall", "dec_idle", "bn_pause_intervals",
+                  "qseries", "qswitch_peak", "qswitch_mean", "pause_intervals"):
             d.pop(k, None)
         for rank in sorted(self.kv_rank_span):
             d[f"kv_rank{rank}_span_ns"] = self.kv_rank_span[rank]
@@ -322,6 +384,30 @@ class Row:
             d[f"link{i}_label"] = ls.label
             d[f"link{i}_window_ns"] = ls.window_ns      # KV window: the normaliser
             d[f"link{i}_eff_pct"] = ls.eff_pct          # for the raw PAUSE count
+            # The handover framing (incast_sweep's headline) on the LINK route:
+            # the transfer cannot beat bytes/rate, so its duration measures
+            # nothing -- what congestion produces is idle = window - floor, the
+            # time the link spent NOT sending. eff_pct is the same reading as a
+            # percentage; the ms are what a reader can add to a latency budget.
+            #
+            # Deliberately the link route and not measures.kv_handover_idle:
+            # that one is per RECEIVING RANK and its stated precondition is that
+            # the receiver's own link is the narrowest on the path. On a tree
+            # the pinch is a SHARED uplink instead (T1/T7: 200 Gb/s uplink, 800
+            # Gb/s access link busy 11.8%, two decode ranks behind it), so a
+            # per-rank floor taken at the uplink rate is ~2x understated and the
+            # whole error lands in idle. Note that kv_handover_idle's caller-side
+            # guard -- "all sender->receiver pairs share one narrowest rate" --
+            # PASSES here, because every path pinches on an identical 200 Gb/s
+            # uplink: the guard cannot tell a shared uplink from a private
+            # access link. The `starved`/`incast` split needs the per-rank route
+            # and is therefore NOT available on a tree; only the total is.
+            d[f"link{i}_rate_gbps"] = ls.rate_gbps
+            d[f"link{i}_kv_bytes"] = ls.kv_bytes
+            d[f"link{i}_floor_ns"] = ls.floor_ns
+            d[f"link{i}_idle_ns"] = (ls.window_ns - ls.floor_ns
+                                     if pd.notna(ls.window_ns)
+                                     and pd.notna(ls.floor_ns) else NAN)
             d[f"link{i}_delivered_gbps"] = ls.delivered_gbps
             d[f"link{i}_conc_peak"] = ls.conc_peak
             d[f"link{i}_conc_mean"] = ls.conc_mean
@@ -543,6 +629,15 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
         setattr(row, k, v)
     row.kv_gate_over_ttft = (row.kv_gate_ns / row.ttft_ns
                              if pd.notna(row.ttft_ns) and row.ttft_ns > 0 else NAN)
+    # The other end of the transfer window. barrier() only sees arrivals (recv
+    # rows are pre-posted at tick 0), so the instant the first KV byte was ISSUED
+    # comes from the send side -- figure 04's left edge.
+    kv_start = astra.kv_send_start(adf)
+    if kv_start is None:
+        warn(f"{tag}: no KV send row in the ASTRA stats; the transfer's start "
+             f"instant is unavailable and figure 04's masked segment is empty.")
+    else:
+        row.kv_start_ns = float(kv_start)
 
     skew_scal, row.kv_rank_span, _layer_delta = kv_skew_stats(kv_arr)
     for k, v in skew_scal.items():
@@ -563,6 +658,16 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
     stall_scal, row.dec_stall = decode_stall_stats(adf, kv_arr)
     for k, v in stall_scal.items():
         setattr(row, k, v)
+    # The same stall measured directly, inside the pass, instead of bounded by
+    # the KV envelope -- the two disagree whenever the decode consumes its KV
+    # faster than the transfer delivers the tail it does not need yet.
+    idle_scal, row.dec_idle = first_pass_stall(adf, kv_arr, row.tok2_ns)
+    for k, v in idle_scal.items():
+        setattr(row, k, v)
+    if not row.dec_idle:
+        warn(f"{tag}: no it=0 decode COMP/TP op in the ASTRA stats; the "
+             f"measured first-pass stall is unavailable (figure 04's right "
+             f"panel falls back to the KV envelope).")
     if pd.notna(row.tok2_ns) and pd.notna(row.ttft_ns):
         row.tok2_after_tok1_ns = row.tok2_ns - row.ttft_ns
     if pd.isna(row.tok2_ns):
@@ -578,6 +683,16 @@ def analyse(tag: str, p: paths.SweepPaths, placement: Placement,
         row.kv_gate_after_ttft_ns = row.kv_gate_ns - row.ttft_ns
     if pd.notna(row.kv_gate_ns) and pd.notna(row.dec_start_ns):
         row.kv_tail_after_dec_start_ns = row.kv_gate_ns - row.dec_start_ns
+    # The transfer as a whole, and how much of it the prefill hides. Clamped at
+    # zero, never negative: a run whose KV lands before TTFT is fully masked
+    # (exposed = 0), not one with a negative exposure.
+    if pd.notna(row.kv_start_ns) and pd.notna(row.kv_gate_ns):
+        row.kv_transfer_ns = row.kv_gate_ns - row.kv_start_ns
+        if pd.notna(row.ttft_ns):
+            row.kv_masked_ns = max(0.0, min(row.ttft_ns, row.kv_gate_ns)
+                                   - row.kv_start_ns)
+        if row.kv_transfer_ns > 0 and pd.notna(row.kv_gate_after_ttft_ns):
+            row.kv_exposed_frac = max(0.0, row.kv_gate_after_ttft_ns) / row.kv_transfer_ns
 
     ppr = pp.measure(adf)
     if not ppr.available:
@@ -675,8 +790,12 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
     # comparison the sweep is about is a comparison between curves in the same
     # axes instead of between neighbouring small panels. Y is % of what that
     # stage eventually receives, so stages of different size share the axis.
-    # The triangle on the baseline is that run's decode START: KV drawn to the
-    # RIGHT of a run's own triangle is KV the pipeline is already waiting on.
+    # The dashed rule is that run's decode START, in that run's own colour: KV
+    # drawn to the RIGHT of a run's own rule is KV the pipeline is already
+    # waiting on. A full-height line and not the old baseline triangle -- the
+    # marker sat below the curves and the reader had to project it upwards to
+    # read off HOW MUCH of the stage's KV was still outstanding at that instant,
+    # which is the whole quantity the panel exists to show.
     stages = sorted({st for r in runs for st in r.kv_stage_series})
     if stages:
         bufs = [r.buffer_mb for r in runs]
@@ -697,15 +816,15 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
                 a.step(t * MS, 100 * cum / total, where="post", color=c,
                        lw=2.0, label=f"{r.buffer_mb:g} MiB")
                 if pd.notna(r.dec_start_ns):
-                    a.plot(r.dec_start_ns * MS, 0, marker="^", color=c, ms=11,
-                           clip_on=False, zorder=5)
+                    a.axvline(r.dec_start_ns * MS, color=c, ls="--", lw=1.5,
+                              alpha=0.85, zorder=5)
             a.set_title(f"decode stage {st}", fontsize=11)
             a.set_xlabel("Time (ms)")
             a.grid(True, alpha=0.3)
         axes[0][0].set_ylabel("KV arrived (%)")
         h, lab = axes[0][0].get_legend_handles_labels()
-        h.append(Line2D([], [], color="k", marker="^", ls="none", ms=9))
-        lab.append("decode start")
+        h.append(Line2D([], [], color="k", ls="--", lw=1.5))
+        lab.append("decode start (per run)")
         axes[0][0].legend(h, lab, fontsize=10, loc="upper left")
         save_fig(fig, outdir, "02_kv_cumulative_arrival_per_stage.png", written)
 
@@ -762,51 +881,153 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
                   fontsize=9)
         save_fig(fig, outdir, "03_kv_tp_shard_skew.png", written)
 
-    # 04 FROM THE FIRST TOKEN TO THE SECOND ---------------------------------- #
-    # The interval TTFT -> token 2 as a waterfall, one bar per buffer, time
-    # measured from the first token. Three consecutive segments, which is the
-    # whole story of this sweep in one row:
+    # 04 THE KV TRANSFER, AND THE PART OF IT THE USER PAYS FOR --------------- #
+    # Both panels share one clock -- ms measured from that run's OWN first token,
+    # so x=0 is TTFT on every row -- and one colour code, because the segments
+    # are literally the same instants read twice:
+    #   MUTED  KV start -> TTFT: the transfer running behind the prefill. It is
+    #          the bulk of the transfer and it costs the user nothing; without it
+    #          on the page the exposed tail looks like the whole handover.
     #   BLUE   TTFT -> decode start: the first-token handoff still in flight,
-    #          queued behind the KV bulk. The decode does not exist yet.
-    #   CORAL  decode start -> KV gate: the pipeline is awake and consuming, and
-    #          its KV is STILL ARRIVING. This is the stall, and it is the segment
-    #          that grows with the buffer.
-    #   GREEN  KV gate -> token 2: KV complete, the first pass finishing.
-    # The PAUSE count is printed at the end of each row: it collapses to zero
-    # from top to bottom while the coral segment grows, which is the whole reason
-    # this figure is a waterfall and not a line plot of the total.
+    #          queued behind the KV bulk. Exposed, but the decode does not exist
+    #          yet, so the KV arriving here is still free.
+    #   CORAL  decode start -> KV gate: the pipeline is awake and its KV is STILL
+    #          ARRIVING. This is the WINDOW IN WHICH A STALL IS POSSIBLE, and it
+    #          is emphatically not the stall: the decode consumes layer by layer
+    #          and waits only where it outruns the transfer. The measured stall
+    #          (dec_kv_block_ns) is in the row label and in the right panel.
+    #
+    # LEFT   the whole transfer, kv_start -> kv_gate, split MUTED | BLUE | CORAL,
+    #        with the totals in each row's label -- transfer, exposed share, and
+    #        the MEASURED stall, which on T1 is zero at every buffer while the
+    #        coral window reads 0.25-4.1 ms.
+    # RIGHT  what the first pass actually did, on the rank that emitted token 2:
+    #        computing (green), idle with a KV arrival ending the wait (coral),
+    #        idle for another reason (violet). PAUSE count beside each row.
     wf = [r for r in runs if all(pd.notna(v) for v in
                                  (r.ttft_ns, r.dec_start_ns, r.kv_gate_ns, r.tok2_ns))]
     if wf:
-        fig, ax = plt.subplots(figsize=(13, 0.8 * len(wf) + 2.4))
+        fig, (axT, axW) = plt.subplots(
+            1, 2, figsize=(16.5, 0.8 * len(wf) + 2.8), sharey=True,
+            gridspec_kw=dict(width_ratios=(1.25, 1.0)))
+
+        # -- LEFT: the transfer as a whole ---------------------------------- #
+        # Each part is clipped to the transfer's own window before it is drawn,
+        # so a fully-masked run (KV complete before TTFT) or one whose decode
+        # wakes after the gate (no stall) loses that segment instead of drawing
+        # a negative one.
+        def seg(lo: float, hi: float, a0: float, gate: float) -> tuple[float, float]:
+            lo, hi = min(max(lo, a0), gate), min(max(hi, a0), gate)
+            return lo, hi - lo
+
+        spans = [(i, (r.kv_start_ns - r.ttft_ns) * MS,   # a0: before the token
+                  (r.dec_start_ns - r.ttft_ns) * MS,     # ds
+                  (r.kv_gate_ns - r.ttft_ns) * MS)       # gate
+                 for i, r in enumerate(wf) if pd.notna(r.kv_start_ns)]
+        left_edge = min([a0 for _, a0, _, _ in spans] + [0.0])
+        right_edge = max([g for _, _, _, g in spans] + [0.0])
+        span = max(right_edge - left_edge, 1e-9)
+        # The three quantities as text, in the ROW LABEL rather than beside the
+        # bar: they are nested (stalling < exposed < total) and the stalling one
+        # is a 0.1-2% slice, so the geometry alone reads as zero -- but a margin
+        # wide enough for ~50 characters is a margin whose width depends on the
+        # figure's dpi and font, and every fixed guess collides with the bars on
+        # some sweep. The tick column cannot collide with anything.
+        detail: dict[int, str] = {}
+        for i, a0, ds, gate in spans:
+            for lo, hi, colour in ((a0, 0.0, MUTED), (0.0, ds, BLUE),
+                                   (ds, gate, CORAL)):
+                x0, w = seg(lo, hi, a0, gate)
+                if w > 0:
+                    axT.barh(i, w, left=x0, height=0.62, color=colour)
+            # the third number is the MEASURED stall, not the coral segment:
+            # the segment is the window in which a stall COULD happen, and on
+            # most of this sweep none does.
+            blocked = wf[i].dec_kv_block_ns * MS
+            detail[i] = (f"{gate - a0:,.0f} ms transfer\n"
+                         f"{100 * max(gate, 0.0) / (gate - a0):.0f}% exposed · "
+                         + ("stall not measured" if pd.isna(blocked) else
+                            ("no stall" if blocked <= 0 else
+                             (f"{blocked * 1e3:,.0f} µs stall" if blocked < 1.0
+                              else f"{blocked:,.1f} ms stall"))))
+        axT.axvline(0.0, color="k", lw=1.4, zorder=4)
+        axT.annotate("first token", xy=(0.0, 1.0),
+                     xycoords=("data", "axes fraction"),
+                     xytext=(3, -3), textcoords="offset points",
+                     ha="left", va="top", fontsize=8.5, color="k")
+        axT.set_xlim(left_edge - 0.03 * span, right_edge + 0.06 * span)
+        axT.set_xlabel("ms relative to the first token")
+        axT.set_title("The whole KV transfer: hidden behind the prefill vs "
+                      "exposed", fontsize=10, loc="left", pad=30)
+        axT.legend(handles=[Patch(color=MUTED, label="behind the prefill"),
+                            Patch(color=BLUE, label="exposed, decode not awake yet"),
+                            Patch(color=CORAL, label="exposed, decode awake "
+                                                     "(where a stall is possible)")],
+                   fontsize=8.5, ncol=3, loc="lower center",
+                   bbox_to_anchor=(0.5, 1.005), frameon=False)
+        if not spans:
+            axT.text(0.5, 0.5, "no KV send instant in this sweep's traces",
+                     transform=axT.transAxes, ha="center", va="center",
+                     fontsize=10, color=MUTED)
+
+        # -- RIGHT: where the first pass actually spends the time ----------- #
+        # NOT the [decode start, KV gate] split the old figure drew: that split
+        # calls every millisecond between the two a stall, and the trace says
+        # otherwise -- the decode consumes its KV layer by layer and on most of
+        # this sweep runs the whole first pass back to back while the tail of
+        # the transfer, which it does not need yet, is still landing.
+        #
+        # The bar is the PIPELINE: green wherever some decode rank is making
+        # progress, coral over the intervals in which a rank sat idle and a KV
+        # arrival is what let it resume (first_pass_stall's union -- the TP
+        # shards re-synchronise every layer, so any blocked shard holds the
+        # group). Green + coral + violet = the pass, and the coral total is the
+        # same number as the pass's excess over its steady inter-token gap.
         end = 0.0
         for i, r in enumerate(wf):
             t0 = r.ttft_ns
             ds = (r.dec_start_ns - t0) * MS
-            kg = (r.kv_gate_ns - t0) * MS
             t2 = (r.tok2_ns - t0) * MS
             end = max(end, t2)
-            ax.barh(i, ds, left=0, height=0.62, color=BLUE)
-            ax.barh(i, max(kg - ds, 0.0), left=ds, height=0.62, color=CORAL)
-            ax.barh(i, max(t2 - kg, 0.0), left=max(kg, ds), height=0.62, color=GREEN)
+            axW.barh(i, ds, left=0, height=0.62, color=BLUE)
+            if not r.dec_idle:
+                # no measured timeline: the whole pass as one undifferentiated
+                # block, so the row is visibly NOT making the finer claim.
+                axW.barh(i, max(t2 - ds, 0.0), left=ds, height=0.62,
+                         color=GREEN, alpha=0.45, hatch="//")
+            else:
+                axW.barh(i, max(t2 - ds, 0.0), left=ds, height=0.62, color=GREEN)
+                for a, b in r.dec_idle["idle_spans"]:
+                    axW.barh(i, (b - a) * MS, left=(a - t0) * MS, height=0.62,
+                             color=VIOLET)
+                for a, b in r.dec_idle["kv_blocked_spans"]:
+                    axW.barh(i, (b - a) * MS, left=(a - t0) * MS, height=0.62,
+                             color=CORAL)
             pf = r.links[0].pause_frames
             if pd.notna(pf):
-                ax.text(t2 * 1.012, i, f"{pf:,.0f} PAUSE", va="center",
-                        fontsize=9, color=MUTED)
-        ax.set_yticks(range(len(wf)))
-        ax.set_yticklabels([f"{r.buffer_mb:g} MiB" for r in wf])
-        ax.invert_yaxis()
-        ax.set_xlim(0, end * 1.20)
-        ax.set_xlabel("ms after the first token")
-        ax.grid(True, axis="x", alpha=0.3)
+                axW.text(t2 * 1.012, i, f"{pf:,.0f} PAUSE", va="center",
+                         fontsize=9, color=MUTED)
+        axW.set_xlim(0, end * 1.28)
+        axW.set_xlabel("ms after the first token")
+        axW.set_title("Zoom: the first decode pass, as measured",
+                      fontsize=10, loc="left", pad=32)
         # outside, above: the bars run the full width and any in-axes corner
         # would sit on top of a row's PAUSE label.
-        ax.legend(handles=[Patch(color=BLUE, label="handoff in flight"),
-                           Patch(color=CORAL, label="decode awake, KV still arriving"),
-                           Patch(color=GREEN, label="first pass completing")],
-                  fontsize=9, ncol=3, loc="lower center",
-                  bbox_to_anchor=(0.5, 1.01), frameon=False)
-        save_fig(fig, outdir, "04_first_token_to_second.png", written)
+        axW.legend(handles=[Patch(color=BLUE, label="handoff in flight"),
+                            Patch(color=GREEN, label="decode progressing"),
+                            Patch(color=CORAL, label="idle, resumed by a KV arrival"),
+                            Patch(color=VIOLET, label="idle, other")],
+                   fontsize=8.5, ncol=4, loc="lower center",
+                   bbox_to_anchor=(0.5, 1.005), frameon=False)
+
+        axT.set_yticks(range(len(wf)))
+        axT.set_yticklabels([f"{r.buffer_mb:g} MiB" + (f"\n{detail[i]}"
+                                                       if i in detail else "")
+                             for i, r in enumerate(wf)], fontsize=8.5)
+        axT.invert_yaxis()
+        for a in (axT, axW):
+            a.grid(True, axis="x", alpha=0.3)
+        save_fig(fig, outdir, "04_kv_transfer_and_handoff.png", written)
 
     # 05 FIRST DECODE PASS, ITS STALL, AND THE KV TAIL ----------------------- #
     # Two panels. (The old "token 2 after token 1" panel duplicated figure 04's
@@ -816,11 +1037,15 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
     #   LEFT   the effect: the first decode pass against the steady inter-token
     #          gap. The control is drawn, not just used as a denominator: its
     #          flatness is what says the buffer touches only the transient.
-    #   RIGHT  the same excess (first pass - control) OVERLAID with its cause,
-    #          the KV tail past the decode start, and with the worst stage's KV
-    #          lateness. Three separately-measured quantities; that the three
-    #          curves lie on top of each other IS the finding -- the first-pass
-    #          stall is the KV still in flight, all of it, nothing else.
+    #   RIGHT  the same excess (first pass - control), the KV tail past the
+    #          decode start, the worst stage's KV lateness -- and the STALL AS
+    #          MEASURED inside the pass (idle a KV arrival ends, on the critical
+    #          rank). The last curve is the one to read: it agrees with the
+    #          excess (T1/32k at 64 MiB: 5.357 vs 5.333 ms, two independent
+    #          measurements) while the KV tail sits 2.5x above both, or 4 ms
+    #          above a pass that never waited at all. The tail is an upper
+    #          bound; the old caption called the three curves coincident, and
+    #          on this sweep they are not.
     if s["tok2_latency_ns"].notna().any():
         fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5.2))
 
@@ -832,15 +1057,22 @@ def make_plots(rows: list[Row], s: pd.DataFrame, outdir: Path,
         axL.set_title("First decode pass vs steady state", fontsize=11)
         axL.set_ylabel("Decode start → token 2 (ms)")
 
-        for col, colour, style, label in (
-                ("decode_kv_stall_ns", CORAL, "o-",
+        # The measured stall is drawn as a WIDE PALE BAND under the excess curve,
+        # not as another line: the two are independent measurements of the same
+        # wait and they land on top of each other, so two thin lines would just
+        # hide one another and the agreement would read as a missing series.
+        for col, colour, style, width, alpha, label in (
+                ("dec_kv_block_ns", BLUE, "-", 6.0, 0.35,
+                 "measured stall (idle a KV arrival ends)"),
+                ("decode_kv_stall_ns", CORAL, "o-", 1.6, 1.0,
                  "first-pass stall (pass − control)"),
-                ("kv_tail_after_dec_start_ns", VIOLET, "s--",
-                 "KV tail past decode start"),
-                ("dec_kv_lateness_ns", GREEN, "^:",
+                ("kv_tail_after_dec_start_ns", VIOLET, "s--", 1.6, 1.0,
+                 "KV tail past decode start (upper bound)"),
+                ("dec_kv_lateness_ns", GREEN, "^:", 1.6, 1.0,
                  "KV lateness, worst stage")):
             if col in s.columns and s[col].notna().any():
-                axR.plot(x, s[col] * MS, style, color=colour, label=label)
+                axR.plot(x, s[col] * MS, style, color=colour, lw=width,
+                         alpha=alpha, label=label)
         axR.axhline(0.0, color="k", linestyle=":", alpha=0.5)
         axR.set_title("First-pass stall, KV tail and worst-stage lateness",
                       fontsize=11)
